@@ -52,9 +52,7 @@ jobs:
 
           HTML1=$(curl -s "https://hihianimeapi.onrender.com/api/v1/stream?type=sub&server=hd-2&id=${LINK_EP}")
           LINK_DL=$(echo "$HTML1" | grep -oP "\"link\":\{\"file\":\"\K[^\"]+")
-          LINK_SUB=$(echo "$HTML1" | grep -oP "\"tracks\":
-
-\[\{\"file\":\"\K[^\"]+")
+          LINK_SUB=$(echo "$HTML1" | grep -oP "\"tracks\":\[\{\"file\":\"\K[^\"]+")
 
           echo "LINK_DL=$LINK_DL" >> $GITHUB_ENV
           echo "LINK_SUB=$LINK_SUB" >> $GITHUB_ENV
