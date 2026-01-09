@@ -1,0 +1,98 @@
+name: AHiHi to CF
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Type"
+        required: true
+      slug:
+        description: "Slug"
+        required: true
+      ss:
+        description: "Season"
+        required: true
+      ep:
+        description: "Ep"
+        required: true
+      hid:
+        description: "Hid"
+        required: true
+      token:
+        description: 'Token'
+        required: true
+      page:
+        description: 'Page'
+        required: true
+      account:
+        description: 'AID'
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Environment
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg curl jq python3
+
+      # =======================
+      # b1: Lấy link từ API
+      # =======================
+      - name: Get download and subtitle link
+        id: getlink
+        run: |
+          HID="${{ github.event.inputs.hid }}"
+          EP="${{ github.event.inputs.ep }}"
+
+          HTML=$(curl -s "https://hihianimeapi.onrender.com/api/v1/episodes/a-${HID}")
+          LINK_EP=$(echo "$HTML" | grep -oP "\"Episode ${EP}\",\"id\":\"\K[^\"]+")
+
+          HTML1=$(curl -s "https://hihianimeapi.onrender.com/api/v1/stream?type=sub&server=hd-2&id=${LINK_EP}")
+          LINK_DL=$(echo "$HTML1" | grep -oP "\"link\":\{\"file\":\"\K[^\"]+")
+          LINK_SUB=$(echo "$HTML1" | grep -oP "\"tracks\":
+
+\[\{\"file\":\"\K[^\"]+")
+
+          echo "LINK_DL=$LINK_DL" >> $GITHUB_ENV
+          echo "LINK_SUB=$LINK_SUB" >> $GITHUB_ENV
+
+      # =======================
+      # b2: Tải file m3u8 bằng ffmpeg + sub
+      # =======================
+      - name: Download video and subtitle
+        run: |
+          NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
+          # tải m3u8 thành mp4
+          ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "${NAME}.mp4"
+          # tải subtitle
+          curl -L "$LINK_SUB" -o "${NAME}.vtt"
+
+      # =======================
+      # b3: Convert sang HLS (segment .png)
+      # =======================
+      - name: Convert to HLS
+        run: |
+          mkdir -p output
+          NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
+          ffmpeg -y -i "${NAME}.mp4" -map 0:v:0 -map 0:a? -c:v copy -c:a aac -b:a 128k \
+            -f hls -start_number 10001 -hls_time 3 -hls_list_size 0 \
+            -hls_segment_type fmp4 -hls_fmp4_init_filename "${NAME}-index.png" \
+            -hls_segment_filename "output/${NAME}-index%d.png" "output/${NAME}.m3u8"
+
+          # copy file sub vào output
+          cp "${NAME}.vtt" output/
+
+      # =======================
+      # b4: Deploy lên Cloudflare Pages
+      # =======================
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          projectName: ${{ github.event.inputs.page }}
+          directory: ./output
+          branch: ${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}
