@@ -64,7 +64,7 @@ jobs:
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           # tải m3u8 thành mp4
-          ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "${NAME}.mp4"
+          ffmpeg -fflags +genpts -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "${NAME}.mp4"
           # tải subtitle
           curl -L "$LINK_SUB" -o "${NAME}.vtt"
 
