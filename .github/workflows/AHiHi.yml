@@ -144,7 +144,7 @@ jobs:
                   f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0:normalize=0[m{i}];")
                   mix_labels.append(f"[m{i}]")
               
-              f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0:normalize=0,volume=2.5[tts_only];")
+              f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0:normalize=0,volume=2.0[tts_only];")
               f.write(f"[0:a]volume=0.75[bg_music];[bg_music][tts_only]amix=inputs=2:duration=first[out_audio];")
               f.write(f"[0:v]subtitles='vi.vtt':force_style='FontSize=24,PrimaryColour=&H00FFFF&,Outline=0.5,Shadow=0.8'[out_video]")
           EOF
