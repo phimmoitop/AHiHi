@@ -1,4 +1,4 @@
-name: AHiHi to CF (AI Anime Master - Fixed 100%)
+name: AHiHi to CF (AI Anime Master - Fixed & Auto Debug)
 
 on:
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
           ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "raw_video.mp4"
           curl -L "$LINK_SUB" -o "eng.vtt"
 
-      - name: AI Contextual Translation (Smart Fallback)
+      - name: AI Translation with Auto Debug
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.key }}
         run: |
@@ -58,65 +58,85 @@ jobs:
           import os, time, re, requests, json
 
           API_KEY = os.environ['GEMINI_API_KEY']
-          
-          # Danh sách các URL có thể hoạt động, script sẽ thử từng cái
-          ENDPOINTS = [
-              f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}",
-              f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}",
-              f"https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key={API_KEY}"
-          ]
 
-          def translate_text(prompt_text):
+          def debug_and_get_model():
+              print("🔍 --- DEBUG: ĐANG KIỂM TRA TÀI KHOẢN ---")
+              url = f"https://generativelanguage.googleapis.com/v1/models?key={API_KEY}"
+              try:
+                  res = requests.get(url)
+                  if res.status_code != 200:
+                      print(f"❌ Không thể lấy danh sách Model. Lỗi: {res.text}")
+                      return None
+                  
+                  models = res.json().get('models', [])
+                  available_names = [m['name'] for m in models if 'generateContent' in m['supportedGenerationMethods']]
+                  
+                  print("✅ Các AI khả dụng trong tài khoản của bạn:")
+                  for name in available_names:
+                      print(f"  - {name}")
+                  
+                  # Ưu tiên chọn
+                  for target in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro', 'gemini-pro']:
+                      for name in available_names:
+                          if target in name:
+                              print(f"🎯 Đã chọn Model tối ưu nhất: {name}")
+                              return name
+                  return available_names[0] if available_names else None
+              except Exception as e:
+                  print(f"❌ Lỗi Debug: {e}")
+                  return None
+
+          def translate_text(model_name, prompt_text):
+              # Sử dụng v1beta cho các model mới, v1 cho model cũ
+              version = "v1beta" if "1.5" in model_name else "v1"
+              url = f"https://generativelanguage.googleapis.com/{version}/{model_name}:generateContent?key={API_KEY}"
+              
+              headers = {"Content-Type": "application/json"}
               payload = {
                   "contents": [{"parts": [{"text": prompt_text}]}],
-                  "generationConfig": {"temperature": 0.1}
+                  "generationConfig": {"temperature": 0.2}
               }
-              headers = {"Content-Type": "application/json"}
-              
-              # Thử từng Endpoint cho đến khi thành công
-              for url in ENDPOINTS:
-                  try:
-                      response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
-                      res_json = response.json()
-                      
-                      if response.status_code == 200 and "candidates" in res_json:
-                          return res_json["candidates"][0]["content"]["parts"][0]["text"]
-                      else:
-                          model_name = url.split('/')[-1].split(':')[0]
-                          print(f"⚠️ Thử {model_name} không được, đang chuyển...")
-                  except:
-                      continue
+
+              try:
+                  response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+                  res_json = response.json()
+                  if response.status_code == 200:
+                      return res_json["candidates"][0]["content"]["parts"][0]["text"]
+                  else:
+                      print(f"⚠️ Lỗi API tại {model_name}: {res_json.get('error', {}).get('message')}")
+              except Exception as e:
+                  print(f"❌ Lỗi kết nối: {e}")
               return None
 
           def process():
               if not os.path.exists('eng.vtt'):
-                  print("❌ Không thấy file eng.vtt")
+                  print("❌ File eng.vtt không tồn tại.")
                   return
 
-              try:
-                  vtt = webvtt.read('eng.vtt')
-              except Exception as e:
-                  print(f"❌ Lỗi đọc VTT: {e}")
+              chosen_model = debug_and_get_model()
+              if not chosen_model:
+                  print("❌ Không tìm thấy Model nào để dịch. Dừng workflow.")
                   return
 
+              vtt = webvtt.read('eng.vtt')
               total = len(vtt)
-              batch_size = 20
+              batch_size = 25
               all_translated_texts = [None] * total
 
-              print(f"🚀 Đang dịch {total} câu bằng phương thức Smart Fallback...")
+              print(f"🚀 Bắt đầu dịch {total} câu bằng {chosen_model}...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
                   en_text = ""
                   for idx, cap in enumerate(batch):
-                      clean_text = cap.text.replace('\n', ' ').strip()
-                      en_text += f"{i+idx}: {clean_text}\n"
+                      # Loại bỏ xuống dòng trong nội dung sub để tránh lỗi định dạng
+                      clean_content = cap.text.replace('\n', ' ').strip()
+                      en_text += f"{i+idx}: {clean_content}\n"
 
-                  prompt = f"Dịch sang tiếng Việt phong cách Anime. BẮT BUỘC giữ định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime. BẮT BUỘC giữ định dạng 'ID: Nội dung'. Không giải thích thêm.\n\n{en_text}"
                   
-                  translated_part = translate_text(prompt)
+                  translated_part = translate_text(chosen_model, prompt)
                   if translated_part:
-                      # Loại bỏ ký tự lạ nếu có
                       clean_res = translated_part.replace('```', '').replace('plaintext', '').strip()
                       for line in clean_res.splitlines():
                           m = re.match(r'^(\d+):\s*(.+)', line.strip())
@@ -126,16 +146,17 @@ jobs:
                               if 0 <= idx < total:
                                   all_translated_texts[idx] = text
                   
-                  print(f"✅ Đã xong batch {i}")
-                  time.sleep(1)
+                  print(f"✅ Hoàn thành batch {i}")
+                  time.sleep(2) # Tránh Rate Limit cho tài khoản Free
 
+              # Lưu file VTT mới
               vi_vtt = webvtt.WebVTT()
               for i, cap in enumerate(vtt):
                   text_vi = all_translated_texts[i] if all_translated_texts[i] else cap.text
                   vi_vtt.captions.append(webvtt.Caption(cap.start, cap.end, text_vi))
               
               vi_vtt.save('vi.vtt')
-              print("✅ Đã tạo file vi.vtt thành công")
+              print("✨ Đã tạo thành công file vi.vtt")
 
           process()
           EOF
@@ -144,7 +165,7 @@ jobs:
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           
-          # Render Hardsub
+          # Render Hardsub với style yêu cầu
           ffmpeg -y -i raw_video.mp4 \
             -vf "subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'" \
             -c:v libx264 -preset superfast -crf 22 \
@@ -152,9 +173,13 @@ jobs:
             "final_video.mp4"
 
           mkdir -p output
+          # Chuyển đổi sang HLS giả lập PNG cho Cloudflare
           ffmpeg -i final_video.mp4 -c copy \
-            -f hls -hls_time 5 -hls_list_size 0 \
-            -hls_playlist_type vod -hls_segment_type fmp4 \
+            -f hls \
+            -hls_time 5 \
+            -hls_list_size 0 \
+            -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
             -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" \
             "output/${NAME}.m3u8"
