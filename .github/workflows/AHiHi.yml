@@ -49,7 +49,7 @@ jobs:
           ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "raw_video.mp4"
           curl -L "$LINK_SUB" -o "eng.vtt"
 
-      - name: AI Contextual Translation (REST API)
+      - name: AI Contextual Translation (Smart Fallback)
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.key }}
         run: |
@@ -58,32 +58,34 @@ jobs:
           import os, time, re, requests, json
 
           API_KEY = os.environ['GEMINI_API_KEY']
-          URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+          
+          # Danh sách các URL có thể hoạt động, script sẽ thử từng cái
+          ENDPOINTS = [
+              f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={API_KEY}",
+              f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}",
+              f"https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key={API_KEY}"
+          ]
 
           def translate_text(prompt_text):
               payload = {
-                  "contents": [{
-                      "parts": [{"text": prompt_text}]
-                  }],
-                  "generationConfig": {
-                      "temperature": 0.2,
-                      "topP": 0.8,
-                      "topK": 40
-                  }
+                  "contents": [{"parts": [{"text": prompt_text}]}],
+                  "generationConfig": {"temperature": 0.1}
               }
               headers = {"Content-Type": "application/json"}
               
-              for _ in range(3): # Thử lại tối đa 3 lần
+              # Thử từng Endpoint cho đến khi thành công
+              for url in ENDPOINTS:
                   try:
-                      response = requests.post(URL, headers=headers, data=json.dumps(payload))
+                      response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=30)
                       res_json = response.json()
-                      if "candidates" in res_json:
+                      
+                      if response.status_code == 200 and "candidates" in res_json:
                           return res_json["candidates"][0]["content"]["parts"][0]["text"]
                       else:
-                          print(f"⚠️ Lỗi API: {res_json}")
-                  except Exception as e:
-                      print(f"❌ Lỗi kết nối: {e}")
-                  time.sleep(2)
+                          model_name = url.split('/')[-1].split(':')[0]
+                          print(f"⚠️ Thử {model_name} không được, đang chuyển...")
+                  except:
+                      continue
               return None
 
           def process():
@@ -91,12 +93,17 @@ jobs:
                   print("❌ Không thấy file eng.vtt")
                   return
 
-              vtt = webvtt.read('eng.vtt')
+              try:
+                  vtt = webvtt.read('eng.vtt')
+              except Exception as e:
+                  print(f"❌ Lỗi đọc VTT: {e}")
+                  return
+
               total = len(vtt)
-              batch_size = 30
+              batch_size = 20
               all_translated_texts = [None] * total
 
-              print(f"🚀 Đang dịch {total} câu bằng REST API...")
+              print(f"🚀 Đang dịch {total} câu bằng phương thức Smart Fallback...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
@@ -105,10 +112,11 @@ jobs:
                       clean_text = cap.text.replace('\n', ' ').strip()
                       en_text += f"{i+idx}: {clean_text}\n"
 
-                  prompt = f"Dịch sang tiếng Việt phong cách Anime. Giữ định dạng ID: Nội dung. Không giải thích.\n\n{en_text}"
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime. BẮT BUỘC giữ định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
                   
                   translated_part = translate_text(prompt)
                   if translated_part:
+                      # Loại bỏ ký tự lạ nếu có
                       clean_res = translated_part.replace('```', '').replace('plaintext', '').strip()
                       for line in clean_res.splitlines():
                           m = re.match(r'^(\d+):\s*(.+)', line.strip())
@@ -118,6 +126,7 @@ jobs:
                               if 0 <= idx < total:
                                   all_translated_texts[idx] = text
                   
+                  print(f"✅ Đã xong batch {i}")
                   time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
@@ -126,7 +135,7 @@ jobs:
                   vi_vtt.captions.append(webvtt.Caption(cap.start, cap.end, text_vi))
               
               vi_vtt.save('vi.vtt')
-              print("✅ Hoàn tất dịch sub Việt")
+              print("✅ Đã tạo file vi.vtt thành công")
 
           process()
           EOF
