@@ -1,4 +1,4 @@
-name: AHiHi to CF (VNRub & Sub)
+name: AHiHi to CF (Anime Style VNRub)
 
 on:
   workflow_dispatch:
@@ -26,44 +26,28 @@ jobs:
           sudo apt install -y ffmpeg curl jq python3 python3-pip
           pip3 install edge-tts deep-translator webvtt-py
 
-      # =======================================================
-      # BƯỚC 1: LẤY LINK TỪ API (Đã sửa lỗi cấu hình JSON)
-      # =======================================================
       - name: Get download and subtitle link
         id: getlink
         run: |
           HID="${{ github.event.inputs.hid }}"
           EP="${{ github.event.inputs.ep }}"
-
           RESP1=$(curl -s "https://hihianimeapi.onrender.com/api/v1/episodes/a-${HID}")
           LINK_EP=$(echo "$RESP1" | jq -r ".data[] | select(.episodeNumber == ($EP|tonumber)) | .id")
-
-          if [ -z "$LINK_EP" ] || [ "$LINK_EP" == "null" ]; then
-            echo "❌ Không tìm thấy Episode ID cho tập $EP"
-            exit 1
-          fi
-
           RESP2=$(curl -s "https://hihianimeapi.onrender.com/api/v1/stream?type=sub&server=hd-2&id=${LINK_EP}")
           LINK_DL=$(echo "$RESP2" | jq -r '.data.link.file')
           LINK_SUB=$(echo "$RESP2" | jq -r '.data.tracks[]? | select(.label == "English") | .file' | head -n 1)
-
           if [ -z "$LINK_SUB" ] || [ "$LINK_SUB" == "null" ]; then
             LINK_SUB=$(echo "$RESP2" | jq -r '.data.tracks[0].file')
           fi
-
           echo "LINK_DL=$LINK_DL" >> $GITHUB_ENV
           echo "LINK_SUB=$LINK_SUB" >> $GITHUB_ENV
-          echo "✅ Đã lấy link video: $LINK_DL"
 
       - name: Download video and subtitle
         run: |
           ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "raw_video.mp4"
           curl -L "$LINK_SUB" -o "eng.vtt"
 
-      # =======================================================
-      # BƯỚC 2: DỊCH PHONG CÁCH ANIME + TTS (GỬI TIẾN ĐỘ)
-      # =======================================================
-      - name: Translate and Generate TTS
+      - name: Anime Style Translation and TTS
         run: |
           python3 <<EOF
           import webvtt
@@ -73,105 +57,123 @@ jobs:
           import os
           import re
 
-          def anime_style_refine(text, original_text):
-              # 1. Giữ nguyên tên riêng (các từ viết hoa trong bản gốc)
-              # Tìm các từ viết hoa trong bản gốc (không tính đầu dòng)
-              proper_nouns = re.findall(r'\b[A-Z][a-z]+\b', original_text)
-              
-              # 2. Thay đổi đại từ nhân xưng cho giống Anime
-              pronouns = {
-                  r"\bbạn\b": "cậu",
-                  r"\btôi\b": "tớ",
-                  r"\banh ấy\b": "anh ta",
-                  r"\bcô ấy\b": "cô ta",
-                  r"\bhọ\b": "chúng",
-                  r"\bvâng\b": "được thôi",
-                  r"\bvâng ạ\b": "đã rõ",
-                  r"\bông\b": "ngài",
-                  r"\bbà\b": "bà ấy"
-              }
-              
-              refined = text.lower()
-              for key, val in pronouns.items():
-                  refined = re.sub(key, val, refined)
-              
-              # 3. Viết hoa những từ quan trọng/tên người đã tìm thấy ở bước 1
-              for name in proper_nouns:
-                  # Tìm tên trong bản dịch (không phân biệt hoa thường) và thay bằng tên gốc
-                  pattern = re.compile(re.escape(name), re.IGNORECASE)
-                  refined = pattern.sub(name, refined)
-                  
-              return refined.strip().capitalize()
+          # TỪ ĐIỂN ANIME FANTASY
+          ANIME_DICT = {
+              r"\bDemon King\b": "Ma Vương",
+              r"\bDemon Lord\b": "Chúa Tể Quỷ",
+              r"\bGod\b": "Thượng Đế",
+              r"\bGoddess\b": "Nữ Thần",
+              r"\bHero\b": "Anh Hùng",
+              r"\bWorld\b": "Vương Quốc",
+              r"\bKingdom\b": "Vương Quốc",
+              r"\bPrincess\b": "Công Chúa",
+              r"\bPrince\b": "Hoàng Tử",
+              r"\bHoly Sword\b": "Thánh Kiếm",
+              r"\bMagic\b": "Ma Pháp",
+              r"\bMaster\b": "Sư Phụ",
+              r"\bSlave\b": "Nô Lệ",
+              r"\bVillage\b": "Ngôi Làng",
+              r"\bMonster\b": "Quái Vật",
+              # Đại từ nhân xưng
+              r"\bI am\b": "Ta là",
+              r"\bI'm\b": "Ta là",
+              r"\bI\b": "Ta",
+              r"\bYou\b": "Ngươi",
+              r"\byou\b": "ngươi",
+              r"\bMy\b": "Của ta",
+              r"\bMe\b": "Ta",
+          }
+
+          def anime_refine(text):
+              for pattern, replacement in ANIME_DICT.items():
+                  text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+              return text
 
           async def process():
-              if not os.path.exists('eng.vtt'): return
-              
               translator = GoogleTranslator(source='en', target='vi')
               vtt = webvtt.read('eng.vtt')
               vi_vtt = webvtt.WebVTT()
               if not os.path.exists('chunks'): os.makedirs('chunks')
               
-              ffmpeg_filter = []
               total = len(vtt)
-              
-              print(f"🚀 Bắt đầu xử lý {total} câu thoại...")
+              print(f"🚀 Bắt đầu dịch {total} câu thoại phong cách Anime...")
 
-              for i, caption in enumerate(vtt):
-                  # Dịch máy
-                  raw_vi = translator.translate(caption.text)
-                  # Tinh chỉnh phong cách
-                  text_vi = anime_style_refine(raw_vi, caption.text)
+              # Dịch theo cụm để giữ ngữ cảnh (5 câu một lần)
+              batch_size = 5
+              for i in range(0, total, batch_size):
+                  batch = vtt[i:i+batch_size]
+                  raw_texts = [cap.text.replace("\n", " ") for cap in batch]
+                  combined_en = " | ".join(raw_texts)
                   
-                  # HIỂN THỊ TIẾN ĐỘ
-                  percent = round(((i + 1) / total) * 100, 1)
-                  print(f"[{percent}%] [{caption.start}] -> {text_vi}")
-                  
-                  vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
-                  
-                  # TẠO AUDIO (Sử dụng giọng HoaiMy mượt mà)
-                  chunk_path = f"chunks/chunk_{i}.mp3"
-                  communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
-                  await communicate.save(chunk_path)
-                  
-                  # Tính thời gian để khớp audio
-                  h, m, s = caption.start.replace(',', '.').split(':')
-                  start_ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
-                  ffmpeg_filter.append(f"[{i+1}:a]adelay={start_ms}|{start_ms}[a{i}];")
+                  try:
+                      translated_vi = translator.translate(combined_en)
+                      vi_lines = translated_vi.split(" | ")
+                  except:
+                      vi_lines = [translator.translate(t) for t in raw_texts]
+
+                  for j, caption in enumerate(batch):
+                      idx = i + j
+                      text_vi = vi_lines[j] if j < len(vi_lines) else ""
+                      # Áp dụng từ điển Anime
+                      text_vi = anime_refine(text_vi)
+                      
+                      # Hiển thị tiến độ
+                      print(f"[{round((idx+1)/total*100, 1)}%] {caption.start} -> {text_vi}")
+                      
+                      vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
+                      
+                      # Tạo Audio
+                      chunk_path = f"chunks/c_{idx}.mp3"
+                      communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
+                      await communicate.save(chunk_path)
 
               vi_vtt.save('vi.vtt')
-              with open('audio_filter.txt', 'w') as f:
-                  f.write("".join(ffmpeg_filter))
-                  mix_ids = "".join([f"[a{j}]" for j in range(len(vtt))])
-                  f.write(f"{mix_ids}amix=inputs={len(vtt)}:dropout_transition=0,volume=3.5[tts];")
 
           asyncio.run(process())
           EOF
 
-      # =======================================================
-      # BƯỚC 3: GHÉP AUDIO + HARD-SUB + RENDER HLS
-      # =======================================================
-      - name: Final Render and HLS
+      - name: Build Audio Filter Script
+        run: |
+          python3 <<EOF
+          import webvtt
+          vtt = webvtt.read('vi.vtt')
+          with open('filter_script.txt', 'w') as f:
+              filter_parts = []
+              for i, cap in enumerate(vtt):
+                  # Chuyển timestamp sang milisec
+                  h, m, s = cap.start.replace(',', '.').split(':')
+                  ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
+                  filter_parts.append(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
+              
+              f.write("".join(filter_parts))
+              mix_labels = "".join([f"[a{i}]" for i in range(len(vtt))])
+              f.write(f"{mix_labels}amix=inputs={len(vtt)}:dropout_transition=0,volume=3.5[tts];")
+          EOF
+
+      - name: Final Render (Hardsub + Audio Mix + 5s Keyframe)
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           
-          # Gom file MP3 làm input
+          # Chuẩn bị danh sách input
           INPUTS="-i raw_video.mp4"
-          COUNT=$(ls chunks/chunk_*.mp3 | wc -l)
-          for i in $(seq 0 $(($COUNT - 1))); do
-            INPUTS="$INPUTS -i chunks/chunk_$i.mp3"
+          for f in $(ls -v chunks/c_*.mp3); do
+            INPUTS="$INPUTS -i $f"
           done
 
-          FILTER_COMPLEX=$(cat audio_filter.txt)
-          
-          # Mix Audio (Giảm nhạc gốc xuống 0.6, tăng TTS lên cao) + Hardsub tiếng Việt
-          ffmpeg -y $INPUTS -filter_complex \
-            "${FILTER_COMPLEX}[0:a]volume=0.6[orig_a];[orig_a][tts]amix=inputs=2:duration=first[out_a];[0:v]subtitles=vi.vtt:force_style='FontSize=18,PrimaryColour=&H00FFFF&,OutlineColour=&H000000&,BorderStyle=1,Outline=2'[out_v]" \
-            -map "[out_v]" -map "[out_a]" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "final_output.mp4"
+          # Encode Video:
+          # - filter_complex_script: nạp filter từ file để tránh lỗi dòng lệnh quá dài
+          # - g 120: ép keyframe mỗi 5 giây (cho video 24fps)
+          ffmpeg -y $INPUTS -filter_complex_script filter_script.txt \
+            -filter_complex "[0:a]volume=0.6[bg];[bg][tts]amix=inputs=2:duration=first[outa];[0:v]subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[outv]" \
+            -map "[outv]" -map "[outa]" \
+            -c:v libx264 -preset superfast -crf 22 \
+            -g 120 -keyint_min 120 -sc_threshold 0 \
+            -c:a aac -b:a 128k "final_video.mp4"
 
-          # Tách HLS (.png)
+          # Tách HLS thành các đoạn PNG dài đúng 5s
           mkdir -p output
-          ffmpeg -y -i "final_output.mp4" -map 0:v:0 -map 0:a? -c:v copy -c:a aac \
-            -f hls -start_number 10001 -hls_time 3 -hls_list_size 0 \
+          ffmpeg -i final_video.mp4 -c copy \
+            -f hls -hls_time 5 -hls_playlist_type static \
             -hls_segment_type fmp4 -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" "output/${NAME}.m3u8"
           
