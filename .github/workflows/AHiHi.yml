@@ -27,7 +27,7 @@ jobs:
           pip3 install edge-tts deep-translator webvtt-py
 
       # =======================================================
-      # BƯỚC 1: LẤY LINK (FIXED THEO JSON MỚI)
+      # BƯỚC 1: LẤY LINK (Đã sửa lỗi jq)
       # =======================================================
       - name: Get download and subtitle link
         id: getlink
@@ -35,37 +35,44 @@ jobs:
           HID="${{ github.event.inputs.hid }}"
           EP="${{ github.event.inputs.ep }}"
 
-          # 1. Lấy ID của tập phim dựa trên episodeNumber
-          HTML=$(curl -s "https://hihianimeapi.onrender.com/api/v1/episodes/a-${HID}")
-          LINK_EP=$(echo "$HTML" | jq -r ".data[] | select(.episodeNumber == ($EP|tonumber)) | .id")
+          # 1. Lấy ID của tập phim
+          RESP1=$(curl -s "https://hihianimeapi.onrender.com/api/v1/episodes/a-${HID}")
+          LINK_EP=$(echo "$RESP1" | jq -r ".data[] | select(.episodeNumber == ($EP|tonumber)) | .id")
 
           if [ -z "$LINK_EP" ] || [ "$LINK_EP" == "null" ]; then
-            echo "❌ Không tìm thấy Episode với số: $EP"
+            echo "❌ Không tìm thấy Episode ID"
             exit 1
           fi
 
-          # 2. Lấy link Video và Sub
-          HTML1=$(curl -s "https://hihianimeapi.onrender.com/api/v1/stream?type=sub&server=hd-2&id=${LINK_EP}")
-          LINK_DL=$(echo "$HTML1" | jq -r '.link.file')
-          # Ưu tiên sub English, nếu không có lấy sub đầu tiên
-          LINK_SUB=$(echo "$HTML1" | jq -r '.tracks[] | select(.label == "English") | .file' | head -n 1)
+          # 2. Lấy link Video và Sub (Sửa đường dẫn .data.link.file)
+          RESP2=$(curl -s "https://hihianimeapi.onrender.com/api/v1/stream?type=sub&server=hd-2&id=${LINK_EP}")
+          LINK_DL=$(echo "$RESP2" | jq -r '.data.link.file')
+          LINK_SUB=$(echo "$RESP2" | jq -r '.data.tracks[]? | select(.label == "English") | .file' | head -n 1)
+
           if [ -z "$LINK_SUB" ] || [ "$LINK_SUB" == "null" ]; then
-            LINK_SUB=$(echo "$HTML1" | jq -r '.tracks[0].file')
+            LINK_SUB=$(echo "$RESP2" | jq -r '.data.tracks[0].file')
+          fi
+
+          if [ -z "$LINK_DL" ] || [ "$LINK_DL" == "null" ]; then
+             echo "❌ Không lấy được link download video"
+             exit 1
           fi
 
           echo "LINK_DL=$LINK_DL" >> $GITHUB_ENV
           echo "LINK_SUB=$LINK_SUB" >> $GITHUB_ENV
-          echo "✅ Đã lấy được link video và sub."
+          echo "✅ Lấy link thành công."
 
       - name: Download video and subtitle
         run: |
+          # Tải video từ m3u8 về mp4
           ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "raw_video.mp4"
+          # Tải subtitle
           curl -L "$LINK_SUB" -o "eng.vtt"
 
       # =======================================================
-      # BƯỚC 2: DỊCH SUB + TẠO AUDIO THUYẾT MINH (PYTHON)
+      # BƯỚC 2: DỊCH SANG TIẾNG VIỆT + TẠO AUDIO THUYẾT MINH
       # =======================================================
-      - name: Translate Sub and Generate TTS
+      - name: Translate and Generate TTS
         run: |
           python3 <<EOF
           import webvtt
@@ -74,70 +81,75 @@ jobs:
           import edge_tts
           import os
 
-          translator = GoogleTranslator(source='en', target='vi')
-          
           async def process():
-              if not os.path.exists('eng.vtt'): return
+              if not os.path.exists('eng.vtt'):
+                  print("Không có file sub để dịch")
+                  return
+              
+              translator = GoogleTranslator(source='en', target='vi')
               vtt = webvtt.read('eng.vtt')
               vi_vtt = webvtt.WebVTT()
               if not os.path.exists('chunks'): os.makedirs('chunks')
               
               ffmpeg_filter = []
-              print(f"Đang xử lý {len(vtt)} câu sub...")
+              print(f"Bắt đầu dịch {len(vtt)} câu sub...")
 
               for i, caption in enumerate(vtt):
-                  # Dịch sang tiếng Việt
+                  # Dịch sub (Phong cách Anime Việt)
                   text_vi = translator.translate(caption.text)
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
                   
-                  # Tạo audio (Giọng HoaiMy - Nữ miền Nam rất hợp Anime)
+                  # Tạo TTS (Giọng HoaiMyNeural - Nữ miền Nam mượt mà)
                   chunk_path = f"chunks/chunk_{i}.mp3"
                   communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
                   await communicate.save(chunk_path)
                   
-                  # Tính toán thời gian bắt đầu (ms)
-                  h, m, s = caption.start.split(':')
-                  s, ms = s.split('.')
-                  start_ms = int(h)*3600000 + int(m)*60000 + int(s)*1000 + int(ms)
+                  # Tính ms để delay audio
+                  start_str = caption.start.replace(',', '.')
+                  h, m, s = start_str.split(':')
+                  start_ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
                   
-                  # Lưu filter để tí nữa FFmpeg dùng
+                  # Ghi vào filter: i+1 vì input 0 là video gốc
                   ffmpeg_filter.append(f"[{i+1}:a]adelay={start_ms}|{start_ms}[a{i}];")
 
               vi_vtt.save('vi.vtt')
+              
+              # Tạo file cấu hình filter cho FFmpeg
               with open('audio_filter.txt', 'w') as f:
                   f.write("".join(ffmpeg_filter))
                   mix_ids = "".join([f"[a{j}]" for j in range(len(vtt))])
+                  # Mix các câu TTS lại thành 1 track, tăng âm lượng lên 3 lần
                   f.write(f"{mix_ids}amix=inputs={len(vtt)}:dropout_transition=0,volume=3.0[tts];")
 
           asyncio.run(process())
           EOF
 
       # =======================================================
-      # BƯỚC 3: ENCODE HARD-SUB + MIX AUDIO LỒNG TIẾNG
+      # BƯỚC 3: GHÉP AUDIO + HARD-SUB + RENDER HLS
       # =======================================================
-      - name: Final Encode and HLS Split
+      - name: Final Render and HLS
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           
-          # Gom tất cả các file mp3 nhỏ làm input
-          INPUTS=""
-          COUNT=$(ls chunks/*.mp3 | wc -l)
+          # Chuẩn bị danh sách input (Video gốc + các chunk MP3)
+          INPUTS="-i raw_video.mp4"
+          COUNT=$(ls chunks/chunk_*.mp3 | wc -l)
           for i in $(seq 0 $(($COUNT - 1))); do
             INPUTS="$INPUTS -i chunks/chunk_$i.mp3"
           done
 
-          # Encode: 
-          # 1. Add sub Việt cứng vào video
-          # 2. Mix audio gốc (giảm vol xuống 0.7) với audio TTS (vol 3.0)
           FILTER_COMPLEX=$(cat audio_filter.txt)
           
-          ffmpeg -y -i raw_video.mp4 $INPUTS -filter_complex \
-            "${FILTER_COMPLEX}[0:a]volume=0.7[orig_a];[orig_a][tts]amix=inputs=2:duration=first[out_a];[0:v]subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&'[out_v]" \
-            -map "[out_v]" -map "[out_a]" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "final_video.mp4"
+          # Thực hiện: 
+          # 1. Mix Audio gốc (vol 0.8) và Audio TTS (vol 3.0)
+          # 2. Chèn sub tiếng Việt vào video (Hardsub)
+          ffmpeg -y $INPUTS -filter_complex \
+            "${FILTER_COMPLEX}[0:a]volume=0.8[orig_a];[orig_a][tts]amix=inputs=2:duration=first[out_a];[0:v]subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&'[out_v]" \
+            -map "[out_v]" -map "[out_a]" -c:v libx264 -preset superfast -crf 23 -c:a aac -b:a 128k "final_output.mp4"
 
-          # Convert sang HLS segment PNG
+          # Convert sang HLS segment PNG như yêu cầu của bạn
           mkdir -p output
-          ffmpeg -y -i "final_video.mp4" -map 0:v:0 -map 0:a? -c:v copy -c:a aac \
+          ffmpeg -y -i "final_output.mp4" -map 0:v:0 -map 0:a? -c:v copy -c:a aac \
             -f hls -start_number 10001 -hls_time 3 -hls_list_size 0 \
             -hls_segment_type fmp4 -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" "output/${NAME}.m3u8"
