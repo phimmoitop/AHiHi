@@ -67,12 +67,12 @@ jobs:
 
               batch_size = 30
               all_translated_texts = [None] * total
-              print(f"🚀 AI đang dịch {total} câu phong cách Anime Fantasy...")
+              print(f"🚀 AI đang dịch {total} câu...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
                   en_text = "\n".join([f"{idx+i}: {cap.text}" for idx, cap in enumerate(batch)])
-                  prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Giữ tên riêng viết hoa. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
                   
                   try:
                       response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
@@ -85,18 +85,19 @@ jobs:
                               if idx < total: all_translated_texts[idx] = content
                   except Exception as e:
                       print(f"Lỗi AI tại batch {i}: {e}")
-                  
                   time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
               for i, caption in enumerate(vtt):
-                  text_vi = all_translated_texts[i] if all_translated_texts[i] else "."
+                  # Nếu dịch lỗi, lấy tạm text gốc để không bị trống
+                  text_vi = all_translated_texts[i] if (all_translated_texts[i] and len(all_translated_texts[i]) > 1) else caption.text
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
+                  chunk_path = f"chunks/c_{i}.mp3"
                   try:
-                      chunk_path = f"chunks/c_{i}.mp3"
                       communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
                       await communicate.save(chunk_path)
                   except:
+                      # Fix lỗi TTS: tạo file im lặng 0.1s nếu edge-tts fail
                       os.system(f"ffmpeg -f lavfi -i anullsrc=r=24000:cl=mono -t 0.1 {chunk_path} -y")
 
               vi_vtt.save('vi.vtt')
@@ -106,27 +107,28 @@ jobs:
       - name: Build Unified Filter Script
         run: |
           python3 <<EOF
-          import webvtt, os
+          import webvtt
           vtt = webvtt.read('vi.vtt')
           with open('master_filter.txt', 'w') as f:
-              # Sửa lỗi f-string: tách dấu :a ra khỏi biểu thức i+1
+              # Sửa cú pháp: [input_index:a] không có dấu cách trước adelay
               for i, cap in enumerate(vtt):
                   h, m, s = cap.start.replace(',', '.').split(':')
                   ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
                   f.write(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
               
-              # Giải quyết giới hạn 32 inputs của amix bằng cách chia batch
+              # Mix audio theo batch để tránh giới hạn 32 inputs của amix
+              batch_size = 20
               labels = [f"[a{i}]" for i in range(len(vtt))]
-              batch_size = 25
               mix_labels = []
               for i in range(0, len(labels), batch_size):
                   batch = labels[i:i+batch_size]
                   f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0[m{i}];")
                   mix_labels.append(f"[m{i}]")
               
-              # Trộn các bản mix trung gian
+              # Trộn các bản mix trung gian lại
               f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0,volume=3.5[tts_only];")
               f.write(f"[0:a]volume=0.6[bg_music];[bg_music][tts_only]amix=inputs=2:duration=first[out_audio];")
+              # Thêm nháy đơn cho vi.vtt
               f.write(f"[0:v]subtitles='vi.vtt':force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[out_video]")
           EOF
 
