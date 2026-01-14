@@ -52,33 +52,34 @@ jobs:
       - name: Build Unified Filter Script
         run: |
           python3 <<EOF
-          import webvtt
+          import webvtt, os
+          if not os.path.exists('vi.vtt'):
+              print("Lỗi: vi.vtt không tồn tại!"); exit(1)
+              
           vtt = webvtt.read('vi.vtt')
           with open('master_filter.txt', 'w') as f:
-              # 1. Tạo delay cho từng đoạn audio (Sửa lỗi cú pháp {i+1}:a)
+              # 1. Tạo delay cho từng chunk (Sửa lỗi cú pháp f-string)
               for i, cap in enumerate(vtt):
                   h, m, s = cap.start.replace(',', '.').split(':')
                   ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
-                  f.write(f"[{i+1}]:a adelay={ms}|{ms} [a{i}];")
+                  # File video gốc là index 0, nên chunk i sẽ là index i+1
+                  f.write(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
               
-              # 2. Gom nhóm để tránh giới hạn 32 inputs của amix
-              # Chia nhỏ các audio chunks thành từng nhóm 30 câu một
-              batch_size = 30
+              # 2. Gom nhóm amix (vì FFmpeg giới hạn 32 inputs một lần mix)
+              batch_size = 20
               labels = [f"[a{i}]" for i in range(len(vtt))]
-              intermediate_mixes = []
-              
+              mix_labels = []
               for i in range(0, len(labels), batch_size):
                   batch = labels[i:i+batch_size]
-                  out_label = f"[mix{i}]"
-                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0{out_label};")
-                  intermediate_mixes.append(out_label)
+                  mix_label = f"[m{i}]"
+                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0{mix_label};")
+                  mix_labels.append(mix_label)
               
-              # Trộn các nhóm lại thành tts_only
-              f.write(f"{''.join(intermediate_mixes)}amix=inputs={len(intermediate_mixes)}:dropout_transition=0,volume=3.5[tts_only];")
-              
-              # 3. Trộn nhạc nền và áp dụng Hardsub
+              # Mix cuối cùng
+              f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0,volume=3.5[tts_only];")
               f.write(f"[0:a]volume=0.6[bg_music];[bg_music][tts_only]amix=inputs=2:duration=first[out_audio];")
-              # Thêm dấu nháy đơn vào vi.vtt để tránh lỗi đường dẫn
+              
+              # Hardsub (Dùng dấu nháy đơn để bảo vệ đường dẫn file)
               f.write(f"[0:v]subtitles='vi.vtt':force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[out_video]")
           EOF
 
