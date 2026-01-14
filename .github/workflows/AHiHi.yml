@@ -25,7 +25,6 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y ffmpeg curl jq python3 python3-pip
-          # Cài đặt thư viện (Sử dụng python3 -m pip để đảm bảo đúng path)
           python3 -m pip install --upgrade pip
           python3 -m pip install edge-tts webvtt-py google-genai
 
@@ -59,7 +58,6 @@ jobs:
           from google import genai
           import os, asyncio, edge_tts, time, re
 
-          # Cấu hình Client Gemini đúng cú pháp mới
           client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
           async def process():
@@ -69,17 +67,14 @@ jobs:
 
               batch_size = 30
               all_translated_texts = [None] * total
-
               print(f"🚀 AI đang dịch {total} câu phong cách Anime Fantasy...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
                   en_text = "\n".join([f"{idx+i}: {cap.text}" for idx, cap in enumerate(batch)])
-                  
                   prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Giữ tên riêng viết hoa. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
                   
                   try:
-                      # Cú pháp gọi Gemini 1.5 mới nhất
                       response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
                       lines = response.text.strip().split('\n')
                       for line in lines:
@@ -96,30 +91,23 @@ jobs:
 
               vi_vtt = webvtt.WebVTT()
               for i, caption in enumerate(vtt):
-                  text_vi = all_translated_texts[i]
-                  if not text_vi or len(str(text_vi)) < 1:
-                      text_vi = "."
-                  
+                  text_vi = all_translated_texts[i] if all_translated_texts[i] else "."
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
-                  
-                  # TTS
                   try:
                       chunk_path = f"chunks/c_{i}.mp3"
                       communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
                       await communicate.save(chunk_path)
-                  except Exception as e:
-                      print(f"Cảnh báo TTS câu {i}: {e}")
+                  except:
                       os.system(f"ffmpeg -f lavfi -i anullsrc=r=24000:cl=mono -t 0.1 -q:a 9 {chunk_path} -y")
 
               vi_vtt.save('vi.vtt')
-
           asyncio.run(process())
           EOF
 
       - name: Build Unified Filter Script
         run: |
           python3 <<EOF
-          import webvtt, os
+          import webvtt
           vtt = webvtt.read('vi.vtt')
           with open('master_filter.txt', 'w') as f:
               for i, cap in enumerate(vtt):
@@ -133,21 +121,34 @@ jobs:
               f.write(f"[0:v]subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[out_video]")
           EOF
 
-      - name: Final Render (Fixed 5s Segment)
+      - name: Final Render & Accurate HLS
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
+          
+          # 1. Gom Inputs
           INPUTS="-i raw_video.mp4"
           for f in $(ls -v chunks/c_*.mp3); do INPUTS="$INPUTS -i $f"; done
 
+          # 2. Render Video & Audio (Ép keyframe đúng 5s)
+          # Sử dụng -force_key_frames để đảm bảo cắt HLS chính xác 5.0s
           ffmpeg -y $INPUTS -filter_complex_script master_filter.txt \
             -map "[out_video]" -map "[out_audio]" \
-            -c:v libx264 -preset fast -crf 22 -g 120 -keyint_min 120 -sc_threshold 0 \
+            -c:v libx264 -preset superfast -crf 22 \
+            -force_key_frames "expr:gte(t,n_forced*5)" \
             -c:a aac -b:a 128k "final_video.mp4"
 
+          # 3. Tách HLS (Fix lỗi thiếu dòng m3u8)
           mkdir -p output
-          ffmpeg -i final_video.mp4 -c copy -f hls -hls_time 5 \
-            -hls_segment_type fmp4 -hls_fmp4_init_filename "${NAME}-index.png" \
-            -hls_segment_filename "output/${NAME}-index%d.png" "output/${NAME}.m3u8"
+          ffmpeg -i final_video.mp4 -c copy \
+            -f hls \
+            -hls_time 5 \
+            -hls_list_size 0 \
+            -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "${NAME}-index.png" \
+            -hls_segment_filename "output/${NAME}-index%d.png" \
+            "output/${NAME}.m3u8"
+          
           cp vi.vtt output/
 
       - name: Deploy to Cloudflare Pages
