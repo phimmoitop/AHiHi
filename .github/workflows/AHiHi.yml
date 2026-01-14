@@ -11,7 +11,7 @@ on:
       token: { description: 'Token', required: true }
       page: { description: 'Page', required: true }
       account: { description: 'AID', required: true }
-      key: { description: 'Key', required: true }
+      key: { description: 'Gemini API Key', required: true }
 
 jobs:
   build-and-deploy:
@@ -25,7 +25,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y ffmpeg curl jq python3 python3-pip
-          pip3 install edge-tts webvtt-py google-generativeai
+          # Cài đặt thư viện AI thế hệ mới
+          pip3 install edge-tts webvtt-py google-genai
 
       - name: Get download and subtitle link
         id: getlink
@@ -54,56 +55,61 @@ jobs:
         run: |
           python3 <<EOF
           import webvtt
-          import google.generativeai as genai
-          import os, asyncio, edge_tts, time
+          from genai import Client
+          import os, asyncio, edge_tts, time, re
 
-          genai.configure(api_key=os.environ['GEMINI_API_KEY'])
-          model = genai.GenerativeModel('gemini-1.5-flash')
+          # Khởi tạo AI thế hệ mới
+          client = Client(api_key=os.environ['GEMINI_API_KEY'])
 
           async def process():
               vtt = webvtt.read('eng.vtt')
               total = len(vtt)
               if not os.path.exists('chunks'): os.makedirs('chunks')
 
-              batch_size = 25
-              all_translated_texts = []
+              batch_size = 30
+              all_translated_texts = [None] * total
 
-              print(f"🚀 AI Gemini đang dịch thuật phong cách Anime Fantasy...")
+              print(f"🚀 AI đang dịch {total} câu phong cách Anime Fantasy...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
                   en_text = "\n".join([f"{idx+i}: {cap.text}" for idx, cap in enumerate(batch)])
                   
-                  prompt = f"""
-                  Dịch đoạn hội thoại Anime sau sang tiếng Việt:
-                  1. Văn phong: Anime Fantasy cổ đại (Vương quốc, Ma Vương, Thượng Đế).
-                  2. Nhân xưng: Dùng 'Ta - Ngươi' cho đối đầu/trang trọng, 'Anh - Em' hoặc 'Tớ - Cậu' cho thân thiết.
-                  3. Tên riêng & Địa danh: GIỮ NGUYÊN tên gốc (ví dụ: Naruto, Liones, Britannia) và viết hoa.
-                  4. Từ quan trọng: Ma Vương, Thần, Vương Quốc, Thánh Kiếm... PHẢI viết hoa.
-                  5. Định dạng: Trả về từng câu theo số thứ tự 'ID: Nội dung'. Không giải thích.
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Giữ tên riêng viết hoa. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
                   
-                  {en_text}
-                  """
                   try:
-                      response = model.generate_content(prompt)
+                      response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
                       lines = response.text.strip().split('\n')
                       for line in lines:
-                          if ': ' in line: all_translated_texts.append(line.split(': ', 1)[1])
-                          else: all_translated_texts.append(line)
-                  except:
-                      all_translated_texts.extend(["..."] * len(batch))
+                          match = re.match(r'^(\d+):\s*(.*)', line)
+                          if match:
+                              idx = int(match.group(1))
+                              content = match.group(2).replace('*', '').strip()
+                              if idx < total: all_translated_texts[idx] = content
+                  except Exception as e:
+                      print(f"Lỗi AI tại batch {i}: {e}")
                   
-                  print(f"Tiến độ: {min(i+batch_size, total)}/{total}")
+                  print(f"Tiến độ dịch: {min(i+batch_size, total)}/{total}")
                   time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
               for i, caption in enumerate(vtt):
-                  text_vi = all_translated_texts[i] if i < len(all_translated_texts) else "..."
+                  text_vi = all_translated_texts[i]
+                  if not text_vi or len(text_vi) < 1:
+                      text_vi = "." # Tránh lỗi NoAudioReceived
+                  
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
-                  # Tạo TTS
-                  communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
-                  await communicate.save(f"chunks/c_{i}.mp3")
-              
+                  
+                  # TTS với xử lý lỗi
+                  try:
+                      chunk_path = f"chunks/c_{i}.mp3"
+                      communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
+                      await communicate.save(chunk_path)
+                  except Exception as e:
+                      print(f"Cảnh báo TTS câu {i}: {e}")
+                      # Tạo file trắng nếu lỗi để FFmpeg không crash
+                      os.system(f"ffmpeg -f lavfi -i anullsrc=r=24000:cl=mono -t 0.1 -q:a 9 {chunk_path} -y")
+
               vi_vtt.save('vi.vtt')
 
           asyncio.run(process())
@@ -112,43 +118,31 @@ jobs:
       - name: Build Unified Filter Script
         run: |
           python3 <<EOF
-          import webvtt
+          import webvtt, os
           vtt = webvtt.read('vi.vtt')
-          
           with open('master_filter.txt', 'w') as f:
-              # 1. Trì hoãn từng câu audio (adelay)
               for i, cap in enumerate(vtt):
                   h, m, s = cap.start.replace(',', '.').split(':')
                   ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
                   f.write(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
               
-              # 2. Mix các câu audio TTS lại thành một dòng
               labels = "".join([f"[a{i}]" for i in range(len(vtt))])
               f.write(f"{labels}amix=inputs={len(vtt)}:dropout_transition=0,volume=3.5[tts_only];")
-              
-              # 3. Mix nhạc nền video (0.6) với audio thuyết minh (tts_only)
               f.write(f"[0:a]volume=0.6[bg_music];[bg_music][tts_only]amix=inputs=2:duration=first[out_audio];")
-              
-              # 4. Add Sub cứng vào video
               f.write(f"[0:v]subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[out_video]")
           EOF
 
       - name: Final Render (Fixed 5s Segment)
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
-          
-          # Gom Inputs: Video (0) + Chunks MP3 (1...N)
           INPUTS="-i raw_video.mp4"
           for f in $(ls -v chunks/c_*.mp3); do INPUTS="$INPUTS -i $f"; done
 
-          # Render sử dụng filter_complex_script đã gộp toàn bộ
           ffmpeg -y $INPUTS -filter_complex_script master_filter.txt \
             -map "[out_video]" -map "[out_audio]" \
-            -c:v libx264 -preset superfast -crf 22 \
-            -g 120 -keyint_min 120 -sc_threshold 0 \
+            -c:v libx264 -preset superfast -crf 22 -g 120 -keyint_min 120 -sc_threshold 0 \
             -c:a aac -b:a 128k "final_video.mp4"
 
-          # Tách HLS 5s segment (.png)
           mkdir -p output
           ffmpeg -i final_video.mp4 -c copy -f hls -hls_time 5 \
             -hls_segment_type fmp4 -hls_fmp4_init_filename "${NAME}-index.png" \
