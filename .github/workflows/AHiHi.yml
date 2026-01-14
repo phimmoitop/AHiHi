@@ -25,8 +25,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y ffmpeg curl jq python3 python3-pip
-          # Cài đặt thư viện AI thế hệ mới
-          pip3 install edge-tts webvtt-py google-genai
+          # Cài đặt thư viện (Sử dụng python3 -m pip để đảm bảo đúng path)
+          python3 -m pip install --upgrade pip
+          python3 -m pip install edge-tts webvtt-py google-genai
 
       - name: Get download and subtitle link
         id: getlink
@@ -55,11 +56,11 @@ jobs:
         run: |
           python3 <<EOF
           import webvtt
-          from genai import Client
+          from google import genai
           import os, asyncio, edge_tts, time, re
 
-          # Khởi tạo AI thế hệ mới
-          client = Client(api_key=os.environ['GEMINI_API_KEY'])
+          # Cấu hình Client Gemini đúng cú pháp mới
+          client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
           async def process():
               vtt = webvtt.read('eng.vtt')
@@ -78,6 +79,7 @@ jobs:
                   prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Giữ tên riêng viết hoa. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
                   
                   try:
+                      # Cú pháp gọi Gemini 1.5 mới nhất
                       response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
                       lines = response.text.strip().split('\n')
                       for line in lines:
@@ -95,19 +97,18 @@ jobs:
               vi_vtt = webvtt.WebVTT()
               for i, caption in enumerate(vtt):
                   text_vi = all_translated_texts[i]
-                  if not text_vi or len(text_vi) < 1:
-                      text_vi = "." # Tránh lỗi NoAudioReceived
+                  if not text_vi or len(str(text_vi)) < 1:
+                      text_vi = "."
                   
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
                   
-                  # TTS với xử lý lỗi
+                  # TTS
                   try:
                       chunk_path = f"chunks/c_{i}.mp3"
                       communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
                       await communicate.save(chunk_path)
                   except Exception as e:
                       print(f"Cảnh báo TTS câu {i}: {e}")
-                      # Tạo file trắng nếu lỗi để FFmpeg không crash
                       os.system(f"ffmpeg -f lavfi -i anullsrc=r=24000:cl=mono -t 0.1 -q:a 9 {chunk_path} -y")
 
               vi_vtt.save('vi.vtt')
@@ -140,7 +141,7 @@ jobs:
 
           ffmpeg -y $INPUTS -filter_complex_script master_filter.txt \
             -map "[out_video]" -map "[out_audio]" \
-            -c:v libx264 -preset superfast -crf 22 -g 120 -keyint_min 120 -sc_threshold 0 \
+            -c:v libx264 -preset fast -crf 22 -g 120 -keyint_min 120 -sc_threshold 0 \
             -c:a aac -b:a 128k "final_video.mp4"
 
           mkdir -p output
