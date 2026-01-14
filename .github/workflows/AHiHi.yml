@@ -60,6 +60,14 @@ jobs:
 
           client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
+          def safe_vi_fallback(en_text: str) -> str:
+              """
+              Fallback cực an toàn:
+              - Giữ sub (dù không hay)
+              - Không để trống
+              """
+              return en_text.strip()
+
           async def process():
               vtt = webvtt.read('eng.vtt')
               total = len(vtt)
@@ -67,21 +75,25 @@ jobs:
               if not os.path.exists('chunks'):
                   os.makedirs('chunks')
 
-              batch_size = 15
+              batch_size = 10  # giảm nữa cho Gemini ổn định
               all_translated_texts = [None] * total
 
               print(f"🚀 AI đang dịch {total} câu subtitle...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
-                  en_text = "\n".join([f"{i+idx}: {cap.text.replace(chr(10),' ')}" for idx, cap in enumerate(batch)])
+
+                  en_text = "\n".join(
+                      f"{i+idx}: {cap.text.replace(chr(10),' ').strip()}"
+                      for idx, cap in enumerate(batch)
+                  )
 
                   prompt = f"""
-          Dịch toàn bộ sang tiếng Việt phong cách Anime Fantasy.
-          BẮT BUỘC giữ nguyên ID, KHÔNG bỏ dòng nào.
-          Định dạng chính xác: ID: Nội dung
-          KHÔNG xuống dòng giữa câu.
-          KHÔNG giải thích.
+          Dịch sang tiếng Việt.
+          BẮT BUỘC giữ nguyên ID.
+          Mỗi dòng đúng 1 dòng.
+          Format: ID: Nội dung
+          KHÔNG markdown, KHÔNG giải thích.
 
           {en_text}
           """
@@ -92,16 +104,18 @@ jobs:
                           contents=prompt
                       )
 
-                      lines = response.text.strip().splitlines()
+                      lines = response.text.splitlines()
                       for line in lines:
-                          m = re.match(r'^(\d+):\s*(.+)', line)
-                          if m:
-                              idx = int(m.group(1))
-                              text = m.group(2).replace('*', '').strip()
-                              if 0 <= idx < total:
-                                  all_translated_texts[idx] = text
+                          m = re.match(r'^(\d+):\s*(.+)', line.strip())
+                          if not m:
+                              continue
+                          idx = int(m.group(1))
+                          text = m.group(2).replace('*', '').strip()
+                          if 0 <= idx < total and text:
+                              all_translated_texts[idx] = text
+
                   except Exception as e:
-                      print(f"❌ Lỗi Gemini batch {i}: {e}")
+                      print(f"❌ Gemini lỗi batch {i}: {e}")
 
                   time.sleep(1)
 
@@ -110,18 +124,18 @@ jobs:
               for i, cap in enumerate(vtt):
                   text_vi = all_translated_texts[i]
 
-                  # ❗ FIX CỐT LÕI:
-                  # TUYỆT ĐỐI KHÔNG fallback sang tiếng Anh
+                  # ✅ ĐẢM BẢO SUB LUÔN CÓ
                   if not text_vi or len(text_vi.strip()) < 2:
-                      text_vi = ""
+                      text_vi = safe_vi_fallback(cap.text)
 
                   vi_vtt.captions.append(
-                      webvtt.Caption(cap.start, cap.end, text_vi if text_vi else " ")
+                      webvtt.Caption(cap.start, cap.end, text_vi)
                   )
 
                   chunk_path = f"chunks/c_{i}.mp3"
 
-                  if text_vi.strip():
+                  # ✅ CHỈ TTS KHI CHẮC CHẮN LÀ TIẾNG VIỆT
+                  if all_translated_texts[i]:
                       try:
                           communicate = edge_tts.Communicate(
                               text_vi,
@@ -130,23 +144,26 @@ jobs:
                           await communicate.save(chunk_path)
                       except:
                           subprocess.run(
-                              ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", "0.1", chunk_path],
+                              ["ffmpeg", "-y", "-f", "lavfi", "-i",
+                               "anullsrc=r=24000:cl=mono", "-t", "0.1", chunk_path],
                               stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL
                           )
                   else:
-                      # Subtitle không có tiếng Việt → tạo audio im lặng
+                      # AI fail → im lặng
                       subprocess.run(
-                          ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", "0.1", chunk_path],
+                          ["ffmpeg", "-y", "-f", "lavfi", "-i",
+                           "anullsrc=r=24000:cl=mono", "-t", "0.1", chunk_path],
                           stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL
                       )
 
               vi_vtt.save('vi.vtt')
-              print("✅ Hoàn tất dịch + TTS")
+              print("✅ Hoàn tất dịch + tạo sub Việt + audio")
 
           asyncio.run(process())
           EOF
+
 
 
       - name: Build Unified Filter Script
