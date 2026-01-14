@@ -61,36 +61,39 @@ jobs:
           client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
 
           async def process():
-              if not os.path.exists('eng.vtt'): return
               vtt = webvtt.read('eng.vtt')
               total = len(vtt)
               if not os.path.exists('chunks'): os.makedirs('chunks')
 
               batch_size = 30
               all_translated_texts = [None] * total
-              print(f"🚀 AI đang dịch {total} câu...")
+              print(f"🚀 AI đang dịch {total} câu phong cách Anime Fantasy...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
                   en_text = "\n".join([f"{idx+i}: {cap.text}" for idx, cap in enumerate(batch)])
-                  prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime Fantasy (Vương Quốc, Ma Vương). Dùng Ta-Ngươi cho đối đầu, Anh-Em cho thân mật. Giữ tên riêng viết hoa. Định dạng 'ID: Nội dung'. Không giải thích.\n\n{en_text}"
+                  
                   try:
                       response = client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-                      for line in response.text.strip().split('\n'):
+                      lines = response.text.strip().split('\n')
+                      for line in lines:
                           match = re.match(r'^(\d+):\s*(.*)', line)
                           if match:
                               idx = int(match.group(1))
-                              if idx < total: all_translated_texts[idx] = match.group(2).replace('*', '').strip()
+                              content = match.group(2).replace('*', '').strip()
+                              if idx < total: all_translated_texts[idx] = content
                   except Exception as e:
                       print(f"Lỗi AI tại batch {i}: {e}")
+                  
                   time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
               for i, caption in enumerate(vtt):
-                  text_vi = all_translated_texts[i] if all_translated_texts[i] else caption.text
+                  text_vi = all_translated_texts[i] if all_translated_texts[i] else "."
                   vi_vtt.captions.append(webvtt.Caption(caption.start, caption.end, text_vi))
-                  chunk_path = f"chunks/c_{i}.mp3"
                   try:
+                      chunk_path = f"chunks/c_{i}.mp3"
                       communicate = edge_tts.Communicate(text_vi, "vi-VN-HoaiMyNeural")
                       await communicate.save(chunk_path)
                   except:
@@ -104,30 +107,25 @@ jobs:
         run: |
           python3 <<EOF
           import webvtt, os
-          if not os.path.exists('vi.vtt'):
-              print("Lỗi: Không tìm thấy vi.vtt"); exit(1)
-          
           vtt = webvtt.read('vi.vtt')
           with open('master_filter.txt', 'w') as f:
-              # 1. Delay từng chunk
+              # Sửa lỗi f-string: tách dấu :a ra khỏi biểu thức i+1
               for i, cap in enumerate(vtt):
                   h, m, s = cap.start.replace(',', '.').split(':')
                   ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
-                  # Sửa lỗi cú pháp f-string ở đây
-                  f.write(f"[{i+1}]:a adelay={ms}|{ms} [a{i}];")
+                  f.write(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
               
-              # 2. Mix audio theo batch 20 câu để tránh lỗi FFmpeg amix limit
-              batch_size = 20
+              # Giải quyết giới hạn 32 inputs của amix bằng cách chia batch
               labels = [f"[a{i}]" for i in range(len(vtt))]
-              intermediate_mixes = []
+              batch_size = 25
+              mix_labels = []
               for i in range(0, len(labels), batch_size):
                   batch = labels[i:i+batch_size]
-                  out_label = f"[m{i}]"
-                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0 {out_label};")
-                  intermediate_mixes.append(out_label)
+                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0[m{i}];")
+                  mix_labels.append(f"[m{i}]")
               
-              # Mix cuối
-              f.write(f"{''.join(intermediate_mixes)}amix=inputs={len(intermediate_mixes)}:dropout_transition=0,volume=3.5[tts_only];")
+              # Trộn các bản mix trung gian
+              f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0,volume=3.5[tts_only];")
               f.write(f"[0:a]volume=0.6[bg_music];[bg_music][tts_only]amix=inputs=2:duration=first[out_audio];")
               f.write(f"[0:v]subtitles='vi.vtt':force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'[out_video]")
           EOF
@@ -135,6 +133,7 @@ jobs:
       - name: Final Render & Accurate HLS
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
+          
           INPUTS="-i raw_video.mp4"
           for f in $(ls -v chunks/c_*.mp3); do INPUTS="$INPUTS -i $f"; done
 
@@ -146,8 +145,11 @@ jobs:
 
           mkdir -p output
           ffmpeg -i final_video.mp4 -c copy \
-            -f hls -hls_time 5 -hls_list_size 0 \
-            -hls_playlist_type vod -hls_segment_type fmp4 \
+            -f hls \
+            -hls_time 5 \
+            -hls_list_size 0 \
+            -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
             -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" \
             "output/${NAME}.m3u8"
