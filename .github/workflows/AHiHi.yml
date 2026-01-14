@@ -1,4 +1,4 @@
-name: AHiHi to CF (AI Anime Master - Sub Only)
+name: AHiHi to CF (AI Anime Master - Fixed)
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
           sudo apt update
           sudo apt install -y ffmpeg curl jq python3 python3-pip
           python3 -m pip install --upgrade pip
-          python3 -m pip install webvtt-py google-genai
+          python3 -m pip install webvtt-py google-generativeai
 
       - name: Get download and subtitle link
         id: getlink
@@ -55,53 +55,61 @@ jobs:
         run: |
           python3 <<EOF
           import webvtt
-          from google import genai
+          import google.generativeai as genai
           import os, time, re
 
-          client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
-
-          def safe_vi_fallback(en_text: str) -> str:
-              return en_text.strip()
+          genai.configure(api_key=os.environ['GEMINI_API_KEY'])
+          model = genai.GenerativeModel('gemini-1.5-flash')
 
           def process():
-              vtt = webvtt.read('eng.vtt')
+              try:
+                  vtt = webvtt.read('eng.vtt')
+              except:
+                  print("Không tìm thấy file eng.vtt")
+                  return
+
               total = len(vtt)
-              batch_size = 15  # Tăng lên một chút vì không cần TTS
+              batch_size = 20
               all_translated_texts = [None] * total
 
               print(f"🚀 AI đang dịch {total} câu subtitle...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
-                  en_text = "\n".join(
-                      f"{i+idx}: {cap.text.replace(chr(10),' ').strip()}"
-                      for idx, cap in enumerate(batch)
-                  )
+                  en_text = ""
+                  for idx, cap in enumerate(batch):
+                      clean_text = cap.text.replace('\n', ' ').strip()
+                      en_text += f"{i+idx}: {clean_text}\n"
 
-                  prompt = f"Dịch sang tiếng Việt phong cách Anime. BẮT BUỘC giữ nguyên ID. Mỗi dòng đúng 1 dòng. Format: ID: Nội dung. KHÔNG markdown.\n\n{en_text}"
+                  prompt = f"""Dịch danh sách sau sang tiếng Việt (phong cách Anime).
+          Yêu cầu:
+          - Giữ nguyên định dạng ID: Nội dung
+          - Mỗi ID một dòng
+          - Không thêm giải thích, không dùng markdown.
+          
+          {en_text}"""
 
                   try:
-                      response = client.models.generate_content(
-                          model="gemini-1.5-flash",
-                          contents=prompt
-                      )
-
-                      lines = response.text.splitlines()
+                      response = model.generate_content(prompt)
+                      # Xóa bỏ các ký tự markdown nếu AI tự ý thêm vào
+                      clean_response = response.text.replace('```', '').replace('plaintext', '').strip()
+                      
+                      lines = clean_response.splitlines()
                       for line in lines:
                           m = re.match(r'^(\d+):\s*(.+)', line.strip())
                           if m:
                               idx = int(m.group(1))
-                              text = m.group(2).replace('*', '').strip()
+                              text = m.group(2).strip()
                               if 0 <= idx < total:
                                   all_translated_texts[idx] = text
                   except Exception as e:
-                      print(f"❌ Gemini lỗi batch {i}: {e}")
+                      print(f"❌ Lỗi batch {i}: {e}")
                   
-                  time.sleep(1) # Tránh rate limit
+                  time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
               for i, cap in enumerate(vtt):
-                  text_vi = all_translated_texts[i] if all_translated_texts[i] else safe_vi_fallback(cap.text)
+                  text_vi = all_translated_texts[i] if all_translated_texts[i] else cap.text
                   vi_vtt.captions.append(webvtt.Caption(cap.start, cap.end, text_vi))
               
               vi_vtt.save('vi.vtt')
@@ -114,16 +122,15 @@ jobs:
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           
-          # Render hardcode subtitle vào video
-          # Giữ nguyên style FontSize=20 và màu vàng PrimaryColour=&H00FFFF& từ code gốc
+          # Render video kèm sub cứng (Hardsub)
           ffmpeg -y -i raw_video.mp4 \
-            -vf "subtitles='vi.vtt':force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'" \
+            -vf "subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'" \
             -c:v libx264 -preset superfast -crf 22 \
             -c:a copy \
             "final_video.mp4"
 
           mkdir -p output
-          # Chuyển sang định dạng HLS với đuôi file giả lập .png
+          # Xuất HLS với định dạng giả lập .png cho Cloudflare
           ffmpeg -i final_video.mp4 -c copy \
             -f hls \
             -hls_time 5 \
