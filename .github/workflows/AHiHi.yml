@@ -1,4 +1,4 @@
-name: AHiHi to CF (AI Anime Master - Fixed)
+name: AHiHi to CF (AI Anime Master - Fixed 100%)
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
           sudo apt update
           sudo apt install -y ffmpeg curl jq python3 python3-pip
           python3 -m pip install --upgrade pip
-          python3 -m pip install webvtt-py google-generativeai
+          python3 -m pip install webvtt-py requests
 
       - name: Get download and subtitle link
         id: getlink
@@ -49,33 +49,54 @@ jobs:
           ffmpeg -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc "raw_video.mp4"
           curl -L "$LINK_SUB" -o "eng.vtt"
 
-      - name: AI Contextual Translation
+      - name: AI Contextual Translation (REST API)
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.key }}
         run: |
           python3 <<'EOF'
           import webvtt
-          import google.generativeai as genai
-          import os, time, re
+          import os, time, re, requests, json
 
-          genai.configure(api_key=os.environ['GEMINI_API_KEY'])
-          model = genai.GenerativeModel('gemini-1.5-flash')
+          API_KEY = os.environ['GEMINI_API_KEY']
+          URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+
+          def translate_text(prompt_text):
+              payload = {
+                  "contents": [{
+                      "parts": [{"text": prompt_text}]
+                  }],
+                  "generationConfig": {
+                      "temperature": 0.2,
+                      "topP": 0.8,
+                      "topK": 40
+                  }
+              }
+              headers = {"Content-Type": "application/json"}
+              
+              for _ in range(3): # Thử lại tối đa 3 lần
+                  try:
+                      response = requests.post(URL, headers=headers, data=json.dumps(payload))
+                      res_json = response.json()
+                      if "candidates" in res_json:
+                          return res_json["candidates"][0]["content"]["parts"][0]["text"]
+                      else:
+                          print(f"⚠️ Lỗi API: {res_json}")
+                  except Exception as e:
+                      print(f"❌ Lỗi kết nối: {e}")
+                  time.sleep(2)
+              return None
 
           def process():
-              try:
-                  if not os.path.exists('eng.vtt'):
-                      print("❌ Không tìm thấy file eng.vtt")
-                      return
-                  vtt = webvtt.read('eng.vtt')
-              except Exception as e:
-                  print(f"❌ Lỗi đọc file vtt: {e}")
+              if not os.path.exists('eng.vtt'):
+                  print("❌ Không thấy file eng.vtt")
                   return
 
+              vtt = webvtt.read('eng.vtt')
               total = len(vtt)
-              batch_size = 20
+              batch_size = 30
               all_translated_texts = [None] * total
 
-              print(f"🚀 AI đang dịch {total} câu subtitle...")
+              print(f"🚀 Đang dịch {total} câu bằng REST API...")
 
               for i in range(0, total, batch_size):
                   batch = vtt[i:i+batch_size]
@@ -84,29 +105,23 @@ jobs:
                       clean_text = cap.text.replace('\n', ' ').strip()
                       en_text += f"{i+idx}: {clean_text}\n"
 
-                  prompt = f"Dịch danh sách sau sang tiếng Việt (phong cách Anime). Yêu cầu: Giữ nguyên định dạng ID: Nội dung. Mỗi ID một dòng. Không thêm giải thích, không dùng markdown.\n\n{en_text}"
-
-                  try:
-                      response = model.generate_content(prompt)
-                      # Loại bỏ các ký tự rác nếu AI trả về
-                      clean_response = response.text.replace('```', '').replace('plaintext', '').strip()
-                      
-                      lines = clean_response.splitlines()
-                      for line in lines:
+                  prompt = f"Dịch sang tiếng Việt phong cách Anime. Giữ định dạng ID: Nội dung. Không giải thích.\n\n{en_text}"
+                  
+                  translated_part = translate_text(prompt)
+                  if translated_part:
+                      clean_res = translated_part.replace('```', '').replace('plaintext', '').strip()
+                      for line in clean_res.splitlines():
                           m = re.match(r'^(\d+):\s*(.+)', line.strip())
                           if m:
                               idx = int(m.group(1))
                               text = m.group(2).strip()
                               if 0 <= idx < total:
                                   all_translated_texts[idx] = text
-                  except Exception as e:
-                      print(f"❌ Lỗi batch {i}: {e}")
                   
                   time.sleep(1)
 
               vi_vtt = webvtt.WebVTT()
               for i, cap in enumerate(vtt):
-                  # Nếu dịch lỗi thì lấy text gốc làm fallback
                   text_vi = all_translated_texts[i] if all_translated_texts[i] else cap.text
                   vi_vtt.captions.append(webvtt.Caption(cap.start, cap.end, text_vi))
               
@@ -120,7 +135,7 @@ jobs:
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
           
-          # Render video kèm sub cứng (Hardsub)
+          # Render Hardsub
           ffmpeg -y -i raw_video.mp4 \
             -vf "subtitles=vi.vtt:force_style='FontSize=20,PrimaryColour=&H00FFFF&,Outline=1,Shadow=1'" \
             -c:v libx264 -preset superfast -crf 22 \
@@ -128,13 +143,9 @@ jobs:
             "final_video.mp4"
 
           mkdir -p output
-          # Xuất HLS với định dạng giả lập .png cho Cloudflare
           ffmpeg -i final_video.mp4 -c copy \
-            -f hls \
-            -hls_time 5 \
-            -hls_list_size 0 \
-            -hls_playlist_type vod \
-            -hls_segment_type fmp4 \
+            -f hls -hls_time 5 -hls_list_size 0 \
+            -hls_playlist_type vod -hls_segment_type fmp4 \
             -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" \
             "output/${NAME}.m3u8"
