@@ -159,7 +159,7 @@ jobs:
           # Encode với Keyframe cố định 5s theo đúng code gốc của bạn
           ffmpeg -y $INPUTS -filter_complex_script master_filter.txt \
             -map "[out_video]" -map "[out_audio]" \
-            -c:v libx264 -preset superfast -crf 22 \
+            -c:v libx264 -preset slow -crf 22 \
             -force_key_frames "expr:gte(t,n_forced*5)" \
             -c:a aac -b:a 128k "final_video.mp4"
 
