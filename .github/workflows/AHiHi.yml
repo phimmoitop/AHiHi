@@ -141,7 +141,7 @@ jobs:
               mix_labels = []
               for i in range(0, len(labels), batch_size):
                   batch = labels[i:i+batch_size]
-                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0[m{i}];")
+                  f.write(f"{''.join(batch)}amix=inputs={len(batch)}:dropout_transition=0:normalize=0[m{i}];")
                   mix_labels.append(f"[m{i}]")
               
               f.write(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:dropout_transition=0:normalize=0,volume=1.5[tts_only];")
