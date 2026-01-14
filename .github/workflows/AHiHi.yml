@@ -53,7 +53,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.key }}
         run: |
-          python3 <<EOF
+          python3 <<'EOF'
           import webvtt
           import google.generativeai as genai
           import os, time, re
@@ -63,9 +63,12 @@ jobs:
 
           def process():
               try:
+                  if not os.path.exists('eng.vtt'):
+                      print("❌ Không tìm thấy file eng.vtt")
+                      return
                   vtt = webvtt.read('eng.vtt')
-              except:
-                  print("Không tìm thấy file eng.vtt")
+              except Exception as e:
+                  print(f"❌ Lỗi đọc file vtt: {e}")
                   return
 
               total = len(vtt)
@@ -81,17 +84,11 @@ jobs:
                       clean_text = cap.text.replace('\n', ' ').strip()
                       en_text += f"{i+idx}: {clean_text}\n"
 
-                  prompt = f"""Dịch danh sách sau sang tiếng Việt (phong cách Anime).
-          Yêu cầu:
-          - Giữ nguyên định dạng ID: Nội dung
-          - Mỗi ID một dòng
-          - Không thêm giải thích, không dùng markdown.
-          
-          {en_text}"""
+                  prompt = f"Dịch danh sách sau sang tiếng Việt (phong cách Anime). Yêu cầu: Giữ nguyên định dạng ID: Nội dung. Mỗi ID một dòng. Không thêm giải thích, không dùng markdown.\n\n{en_text}"
 
                   try:
                       response = model.generate_content(prompt)
-                      # Xóa bỏ các ký tự markdown nếu AI tự ý thêm vào
+                      # Loại bỏ các ký tự rác nếu AI trả về
                       clean_response = response.text.replace('```', '').replace('plaintext', '').strip()
                       
                       lines = clean_response.splitlines()
@@ -109,6 +106,7 @@ jobs:
 
               vi_vtt = webvtt.WebVTT()
               for i, cap in enumerate(vtt):
+                  # Nếu dịch lỗi thì lấy text gốc làm fallback
                   text_vi = all_translated_texts[i] if all_translated_texts[i] else cap.text
                   vi_vtt.captions.append(webvtt.Caption(cap.start, cap.end, text_vi))
               
