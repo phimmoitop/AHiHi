@@ -78,26 +78,39 @@ jobs:
               text = re.sub(r'\s+', ' ', text).strip()
               return text if len(text) <= max_len else text[:max_len] + "..."
 
-          def to_ssml(text):
-              repl = {
-                  ",": "<break time='200ms'/>",
-                  ".": "<break time='400ms'/>",
-                  "?": "<break time='500ms'/>",
-                  "!": "<break time='500ms'/>",
-                  "…": "<break time='600ms'/>"
-              }
-              for k, v in repl.items():
-                  text = text.replace(k, v)
-              return f"<speak>{text}</speak>"
+          # ====== NGẮT HƠI CHUẨN EDGE-TTS (KHÔNG SSML) ======
+          def normalize_for_tts(text):
+              text = re.sub(r'\s+', ' ', text).strip()
+
+              # pause ngắn
+              text = text.replace(",", ", ")
+
+              # pause trung bình
+              text = text.replace(".", ". ")
+              text = text.replace("?", "? ")
+              text = text.replace("!", "! ")
+
+              # pause dài (cảm xúc / suy nghĩ)
+              text = text.replace("…", " ... ")
+              text = text.replace("—", " ... ")
+              text = text.replace(" - ", " ... ")
+
+              # ép ngắt mạnh cuối câu
+              if not text.endswith((".", "!", "?", "...")):
+                  text += "."
+
+              return text
 
           async def generate_tts(text, out, idx):
               try:
-                  ssml = to_ssml(text)
+                  tts_text = normalize_for_tts(text)
+
                   tts = edge_tts.Communicate(
-                      ssml,
+                      tts_text,
                       voice="vi-VN-HoaiMyNeural",
                       rate="+25%"
                   )
+
                   await tts.save(out)
 
                   if not os.path.exists(out) or os.path.getsize(out) < 1000:
@@ -124,6 +137,7 @@ jobs:
               total = len(vtt)
               all_vi = [None] * total
 
+              # ====== DỊCH ======
               for i in range(0, total, 30):
                   batch = vtt[i:i+30]
                   prompt = "Dịch sang tiếng Việt (Anime style). Giữ ID: Nội dung.\n\n"
@@ -164,6 +178,7 @@ jobs:
 
                   time.sleep(1)
 
+              # ====== TTS ======
               os.makedirs("chunks", exist_ok=True)
               vi_vtt = webvtt.WebVTT()
               tasks = []
@@ -171,9 +186,11 @@ jobs:
               for i, c in enumerate(vtt):
                   raw = all_vi[i] if all_vi[i] else c.text.replace('\n', ' ')
                   txt = safe_text(raw)
+
                   vi_vtt.captions.append(
                       webvtt.Caption(c.start, c.end, txt)
                   )
+
                   tasks.append(
                       generate_tts(txt, f"chunks/c_{i}.mp3", i)
                   )
@@ -184,6 +201,7 @@ jobs:
 
           asyncio.run(main())
           EOF
+
 
 
       # ================= FILTER =================
