@@ -105,8 +105,8 @@ jobs:
               total = len(vtt)
               all_vi = [None] * total
 
-              for i in range(0, total, 50):
-                  batch = vtt[i:i+50]
+              for i in range(0, total, 100):
+                  batch = vtt[i:i+100]
                   prompt = "Dịch sang tiếng Việt (Anime style). Giữ định dạng ID: Nội dung.\n\n"
                   prompt += "\n".join(f"{i+j}: {c.text.replace(chr(10),' ')}" for j, c in enumerate(batch))
                   try:
@@ -153,7 +153,7 @@ jobs:
           with open("master_filter.txt","w") as f:
               for i,c in enumerate(vtt):
                   h,m,s = c.start.replace(',','.').split(':')
-                  ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
+                  ms = int(float(h)*3600000 + float(m)*60000 + float(s)*1000) + 500
                   f.write(f"[{i+1}:a]adelay={ms}|{ms}[a{i}];")
               f.write("".join(f"[a{i}]" for i in range(len(vtt))))
               f.write(f"amix=inputs={len(vtt)}:normalize=0,volume=2.0[tts];")
