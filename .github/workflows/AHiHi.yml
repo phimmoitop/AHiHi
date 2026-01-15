@@ -86,28 +86,34 @@ jobs:
                   "!": "<break time='500ms'/>",
                   "…": "<break time='600ms'/>"
               }
-              for k,v in repl.items():
-                  text = text.replace(k,v)
+              for k, v in repl.items():
+                  text = text.replace(k, v)
               return f"<speak>{text}</speak>"
 
           async def generate_tts(text, out, idx):
               try:
+                  ssml = to_ssml(text)
                   tts = edge_tts.Communicate(
-                      to_ssml(text),
-                      "vi-VN-HoaiMyNeural",
-                      rate="+25%",
-                      is_ssml=True
+                      ssml,
+                      voice="vi-VN-HoaiMyNeural",
+                      rate="+25%"
                   )
                   await tts.save(out)
+
                   if not os.path.exists(out) or os.path.getsize(out) < 1000:
                       raise Exception("Empty audio")
+
                   print(f"[TTS OK] #{idx}")
+
               except Exception as e:
                   print(f"[TTS FAIL] #{idx}: {e}")
                   subprocess.run(
-                      ["ffmpeg","-y","-f","lavfi","-i",
-                       "anullsrc=r=24000:cl=mono","-t","0.2",out],
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                      [
+                          "ffmpeg","-y","-f","lavfi","-i",
+                          "anullsrc=r=24000:cl=mono","-t","0.2",out
+                      ],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
                   )
 
           async def main():
@@ -116,14 +122,14 @@ jobs:
 
               vtt = webvtt.read("eng.vtt")
               total = len(vtt)
-              all_vi = [None]*total
+              all_vi = [None] * total
 
-              for i in range(0,total,30):
+              for i in range(0, total, 30):
                   batch = vtt[i:i+30]
                   prompt = "Dịch sang tiếng Việt (Anime style). Giữ ID: Nội dung.\n\n"
                   prompt += "\n".join(
                       f"{i+j}: {c.text.replace(chr(10),' ')}"
-                      for j,c in enumerate(batch)
+                      for j, c in enumerate(batch)
                   )
 
                   url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={API_KEY}"
@@ -141,7 +147,7 @@ jobs:
 
                       candidates = data.get("candidates")
                       if not candidates:
-                          print("[GEMINI EMPTY]", data)
+                          print("[GEMINI EMPTY]")
                           continue
 
                       txt = candidates[0]["content"]["parts"][0]["text"]
@@ -162,11 +168,15 @@ jobs:
               vi_vtt = webvtt.WebVTT()
               tasks = []
 
-              for i,c in enumerate(vtt):
-                  raw = all_vi[i] if all_vi[i] else c.text.replace('\n',' ')
+              for i, c in enumerate(vtt):
+                  raw = all_vi[i] if all_vi[i] else c.text.replace('\n', ' ')
                   txt = safe_text(raw)
-                  vi_vtt.captions.append(webvtt.Caption(c.start,c.end,txt))
-                  tasks.append(generate_tts(txt,f"chunks/c_{i}.mp3",i))
+                  vi_vtt.captions.append(
+                      webvtt.Caption(c.start, c.end, txt)
+                  )
+                  tasks.append(
+                      generate_tts(txt, f"chunks/c_{i}.mp3", i)
+                  )
 
               await asyncio.gather(*tasks)
               vi_vtt.save("vi.vtt")
@@ -174,6 +184,7 @@ jobs:
 
           asyncio.run(main())
           EOF
+
 
       # ================= FILTER =================
       - name: Build Filter
