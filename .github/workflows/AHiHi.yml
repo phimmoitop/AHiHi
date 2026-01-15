@@ -28,16 +28,13 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install webvtt-py requests edge-tts
 
-      # ================= FONT =================
       - name: Setup Subtitle Font (Oswald)
         run: |
           mkdir -p fonts
           curl -L https://github.com/phimmoitop/AHiHi/raw/main/Oswald.zip -o oswald.zip
           unzip -o oswald.zip -d fonts
           fc-cache -f fonts
-          fc-list | grep -i oswald || true
 
-      # ================= GET LINKS =================
       - name: Get download & subtitle link
         run: |
           HID="${{ github.event.inputs.hid }}"
@@ -48,14 +45,12 @@ jobs:
           echo "LINK_DL=$(echo "$RESP2" | jq -r '.data.link.file')" >> $GITHUB_ENV
           echo "LINK_SUB=$(echo "$RESP2" | jq -r '.data.tracks[]? | select(.label=="English") | .file' | head -n1)" >> $GITHUB_ENV
 
-      # ================= DOWNLOAD =================
       - name: Download Video & Subtitle
         run: |
           ffmpeg -y -i "$LINK_DL" -c copy -bsf:a aac_adtstoasc raw_video.mp4
           curl -L "$LINK_SUB" -o eng.vtt
 
-      # ================= TRANSLATE + TTS =================
-      - name: AI Translate + TTS (STABLE)
+      - name: AI Translate + TTS (FIXED STABILITY)
         env:
           GEMINI_API_KEY: ${{ github.event.inputs.key }}
         run: |
@@ -63,148 +58,88 @@ jobs:
           import webvtt, os, time, re, requests, asyncio, edge_tts, subprocess
 
           API_KEY = os.environ['GEMINI_API_KEY']
+          # Giới hạn số lượng TTS chạy cùng lúc để tránh bị block (Semaphore)
+          MAX_CONCURRENT_TTS = 5 
 
           def get_model():
-              res = requests.get(
-                  f"https://generativelanguage.googleapis.com/v1/models?key={API_KEY}"
-              ).json()
-              for t in ['gemini-2.5-flash','gemini-2.0-flash','gemini-1.5-flash']:
-                  for m in res.get('models', []):
-                      if t in m['name']:
-                          return m['name']
-              return res['models'][0]['name']
+              try:
+                  res = requests.get(f"https://generativelanguage.googleapis.com/v1/models?key={API_KEY}").json()
+                  for t in ['gemini-2.0-flash','gemini-1.5-flash']:
+                      for m in res.get('models', []):
+                          if t in m['name']: return m['name']
+                  return res['models'][0]['name']
+              except: return "gemini-1.5-flash"
 
           def safe_text(text, max_len=450):
               text = re.sub(r'\s+', ' ', text).strip()
               return text if len(text) <= max_len else text[:max_len] + "..."
 
-          # ====== NGẮT HƠI CHUẨN EDGE-TTS (KHÔNG SSML) ======
           def normalize_for_tts(text):
               text = re.sub(r'\s+', ' ', text).strip()
-
-              # pause ngắn
-              text = text.replace(",", ", ")
-
-              # pause trung bình
-              text = text.replace(".", ". ")
-              text = text.replace("?", "? ")
-              text = text.replace("!", "! ")
-
-              # pause dài (cảm xúc / suy nghĩ)
-              text = text.replace("…", " ... ")
-              text = text.replace("—", " ... ")
-              text = text.replace(" - ", " ... ")
-
-              # ép ngắt mạnh cuối câu
-              if not text.endswith((".", "!", "?", "...")):
-                  text += "."
-
+              text = text.replace(",", ", ").replace(".", ". ").replace("?", "? ").replace("!", "! ")
+              text = text.replace("…", " ... ").replace("—", " ... ")
+              if not text.endswith((".", "!", "?", "...")): text += "."
               return text
 
-          async def generate_tts(text, out, idx):
-              try:
-                  tts_text = normalize_for_tts(text)
-
-                  tts = edge_tts.Communicate(
-                      tts_text,
-                      voice="vi-VN-HoaiMyNeural",
-                      rate="+25%"
-                  )
-
-                  await tts.save(out)
-
-                  if not os.path.exists(out) or os.path.getsize(out) < 1000:
-                      raise Exception("Empty audio")
-
-                  print(f"[TTS OK] #{idx}")
-
-              except Exception as e:
-                  print(f"[TTS FAIL] #{idx}: {e}")
-                  subprocess.run(
-                      [
-                          "ffmpeg","-y","-f","lavfi","-i",
-                          "anullsrc=r=24000:cl=mono","-t","0.2",out
-                      ],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL
-                  )
+          async def generate_tts(text, out, idx, semaphore):
+              async with semaphore: # Chế độ xếp hàng
+                  try:
+                      tts_text = normalize_for_tts(text)
+                      tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+25%")
+                      await tts.save(out)
+                      if not os.path.exists(out) or os.path.getsize(out) < 100: raise Exception("Fail")
+                      print(f"[TTS OK] #{idx}")
+                  except Exception as e:
+                      print(f"[TTS RETRY] #{idx}")
+                      await asyncio.sleep(2) # Nghỉ 2s nếu lỗi rồi thử lại lần cuối
+                      try:
+                          tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+25%")
+                          await tts.save(out)
+                      except:
+                          subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=24000:cl=mono","-t","0.2",out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
           async def main():
               model = get_model()
-              print("Using model:", model)
-
               vtt = webvtt.read("eng.vtt")
               total = len(vtt)
               all_vi = [None] * total
 
-              # ====== DỊCH ======
+              # DỊCH (Giữ nguyên logic batch 50)
               for i in range(0, total, 50):
                   batch = vtt[i:i+50]
-                  prompt = "Dịch sang tiếng Việt (Anime style). Giữ ID: Nội dung.\n\n"
-                  prompt += "\n".join(
-                      f"{i+j}: {c.text.replace(chr(10),' ')}"
-                      for j, c in enumerate(batch)
-                  )
-
-                  url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={API_KEY}"
+                  prompt = "Dịch sang tiếng Việt (Anime style). Giữ định dạng ID: Nội dung.\n\n"
+                  prompt += "\n".join(f"{i+j}: {c.text.replace(chr(10),' ')}" for j, c in enumerate(batch))
                   try:
-                      r = requests.post(
-                          url,
-                          json={"contents":[{"parts":[{"text":prompt}]}]},
-                          timeout=60
-                      )
-                      data = r.json()
-
-                      if "error" in data:
-                          print("[GEMINI ERROR]", data["error"])
-                          continue
-
-                      candidates = data.get("candidates")
-                      if not candidates:
-                          print("[GEMINI EMPTY]")
-                          continue
-
-                      txt = candidates[0]["content"]["parts"][0]["text"]
-
+                      url = f"https://generativelanguage.googleapis.com/v1beta/{model}:generateContent?key={API_KEY}"
+                      r = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=60)
+                      txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                       for line in txt.splitlines():
                           m = re.match(r'^(\d+):\s*(.+)', line.strip())
                           if m:
                               idx = int(m.group(1))
-                              if 0 <= idx < total:
-                                  all_vi[idx] = m.group(2)
-
-                  except Exception as e:
-                      print("[GEMINI FAIL]", e)
-
+                              if 0 <= idx < total: all_vi[idx] = m.group(2)
+                  except: pass
                   time.sleep(1)
 
-              # ====== TTS ======
               os.makedirs("chunks", exist_ok=True)
               vi_vtt = webvtt.WebVTT()
+              semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
               tasks = []
 
               for i, c in enumerate(vtt):
                   raw = all_vi[i] if all_vi[i] else c.text.replace('\n', ' ')
                   txt = safe_text(raw)
-
-                  vi_vtt.captions.append(
-                      webvtt.Caption(c.start, c.end, txt)
-                  )
-
-                  tasks.append(
-                      generate_tts(txt, f"chunks/c_{i}.mp3", i)
-                  )
+                  vi_vtt.captions.append(webvtt.Caption(c.start, c.end, txt))
+                  tasks.append(generate_tts(txt, f"chunks/c_{i}.mp3", i, semaphore))
 
               await asyncio.gather(*tasks)
               vi_vtt.save("vi.vtt")
-              print("DONE")
+              # Lưu số lượng caption để bước sau dùng vòng lặp chính xác
+              with open("count.txt", "w") as f: f.write(str(total))
 
           asyncio.run(main())
           EOF
 
-
-
-      # ================= FILTER =================
       - name: Build Filter
         run: |
           python3 <<EOF
@@ -221,12 +156,17 @@ jobs:
               f.write("[0:v]subtitles=vi.vtt:fontsdir=fonts:force_style='FontName=Oswald,PrimaryColour=&H00FFFF&,FontSize=30,Outline=0.8,Shadow=0.5'[out_video]")
           EOF
 
-      # ================= RENDER =================
       - name: Render & HLS
         run: |
           NAME="${{ github.event.inputs.type }}-${{ github.event.inputs.slug }}-${{ github.event.inputs.ss }}-${{ github.event.inputs.ep }}"
+          COUNT=$(cat count.txt)
+          
+          # FIX QUAN TRỌNG: Tạo danh sách input theo đúng thứ tự số học c_0, c_1, c_2...
+          # Không dùng chunks/*.mp3 vì nó bị sai thứ tự
           INPUTS="-i raw_video.mp4"
-          for f in chunks/*.mp3; do INPUTS="$INPUTS -i $f"; done
+          for ((i=0; i<COUNT; i++)); do
+            INPUTS="$INPUTS -i chunks/c_$i.mp3"
+          done
 
           ffmpeg -y $INPUTS -filter_complex_script master_filter.txt \
             -map "[out_video]" -map "[out_audio]" \
@@ -241,10 +181,8 @@ jobs:
             -hls_fmp4_init_filename "${NAME}-index.png" \
             -hls_segment_filename "output/${NAME}-index%d.png" \
             "output/${NAME}.m3u8"
-
           cp vi.vtt output/
 
-      # ================= DEPLOY =================
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/pages-action@v1
         with:
