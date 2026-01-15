@@ -124,8 +124,8 @@ jobs:
               total = len(vtt)
               all_vi = [None] * total
 
-              for i in range(0, total, 30):
-                  batch = vtt[i:i+30]
+              for i in range(0, total, 50):
+                  batch = vtt[i:i+50]
                   prompt = "Dịch sang tiếng Việt (Anime style). Giữ ID: Nội dung.\n\n"
                   prompt += "\n".join(
                       f"{i+j}: {c.text.replace(chr(10),' ')}"
