@@ -53,7 +53,7 @@ jobs:
           MAX_RETRY=5
           COUNT=1
 
-          while [ $COUNT -le $MAX_RETRY ]; do
+          while[ $COUNT -le $MAX_RETRY ]; do
             echo "=============================="
             echo "Attempt $COUNT / $MAX_RETRY"
             echo "=============================="
@@ -62,8 +62,7 @@ jobs:
 
             echo "Downloading..."
             
-            # Xuất log theo dòng (--newline)
-            # Dùng đoạn script Python thu nhỏ để lọc: Log lỗi/Retrying hiển thị lập tức. Log tiến trình chỉ hiện mỗi 30 giây.
+            # Khắc phục lỗi thụt lề bằng textwrap.dedent, log lỗi/retry hiển thị ngay, log % tải hiện mỗi 30s
             export PYTHONUNBUFFERED=1
             yt-dlp \
             --newline \
@@ -73,7 +72,7 @@ jobs:
             --skip-unavailable-fragments \
             --retry-sleep fragment:60 \
             -o "input_video.mp4" \
-            "$URL" 2>&1 | python3 -c '
+            "$URL" 2>&1 | python3 -c 'import sys, time, textwrap; exec(textwrap.dedent("""
             import sys, time
             last = 0
             for line in sys.stdin:
@@ -89,34 +88,34 @@ jobs:
                 else:
                     sys.stdout.write(line)
                     sys.stdout.flush()
-            '
-            
-                        if [ ! -f "input_video.mp4" ]; then
-                          echo "Download failed."
-                          COUNT=$((COUNT+1))
-                          continue
-                        fi
-            
-                        echo "Checking video integrity..."
-                        if ! ffmpeg -v error -i input_video.mp4 -f null - 2>error.log; then
-                          echo "Video corrupted"
-                          cat error.log
-                          COUNT=$((COUNT+1))
-                          continue
-                        fi
-            
-                        echo "Getting duration from file..."
-                        ACTUAL=$(ffprobe -v error \
-                          -show_entries format=duration \
-                          -of default=noprint_wrappers=1:nokey=1 \
-                          input_video.mp4)
-            
-                        ACTUAL=${ACTUAL%.*}
-            
-                        echo "Expected: $EXPECTED"
-                        echo "Actual: $ACTUAL"
-            
-                        DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
+            """))'
+
+            if [ ! -f "input_video.mp4" ]; then
+              echo "Download failed."
+              COUNT=$((COUNT+1))
+              continue
+            fi
+
+            echo "Checking video integrity..."
+            if ! ffmpeg -v error -i input_video.mp4 -f null - 2>error.log; then
+              echo "Video corrupted"
+              cat error.log
+              COUNT=$((COUNT+1))
+              continue
+            fi
+
+            echo "Getting duration from file..."
+            ACTUAL=$(ffprobe -v error \
+              -show_entries format=duration \
+              -of default=noprint_wrappers=1:nokey=1 \
+              input_video.mp4)
+
+            ACTUAL=${ACTUAL%.*}
+
+            echo "Expected: $EXPECTED"
+            echo "Actual: $ACTUAL"
+
+            DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
 
             echo "Difference: $DIFF seconds"
 
