@@ -73,7 +73,7 @@ jobs:
             -o "input_video.mp4" \
             "$URL"
 
-            if[ ! -f "input_video.mp4" ]; then
+            if [ ! -f "input_video.mp4" ]; then
               echo "Download failed."
               COUNT=$((COUNT+1))
               continue
