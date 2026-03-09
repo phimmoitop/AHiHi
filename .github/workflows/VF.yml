@@ -96,14 +96,6 @@ jobs:
               continue
             fi
 
-            echo "Checking video integrity..."
-            if ! ffmpeg -v error -i input_video.mp4 -f null - 2>error.log; then
-              echo "Video corrupted"
-              cat error.log
-              COUNT=$((COUNT+1))
-              continue
-            fi
-
             echo "Getting duration from file..."
             ACTUAL=$(ffprobe -v error \
               -show_entries format=duration \
