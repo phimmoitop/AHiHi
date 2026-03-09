@@ -134,10 +134,10 @@ jobs:
           # -g 150 -keyint_min 150 : Buộc tạo Keyframe mỗi 150 hình (Chính xác 5 giây sẽ có 1 điểm cắt)
           # -ar 48000 : Ép audio sample rate để cắt file không bị lệch nhịp
           
-          ffmpeg -y -i input_video.mp4 \
+          ffmpeg -y -stats_period 30 -i input_video.mp4 \
             -map 0:v:0 -map 0:a? \
-            -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 -crf 23 -preset medium \
-            -maxrate 2000k -bufsize 3000k \
+            -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 -crf 21 -preset medium \
+            -maxrate 2500k -bufsize 3500k \
             -r 30 -g 150 -keyint_min 150 -sc_threshold 0 \
             -c:a aac -b:a 96k -ac 2 -ar 48000 -threads 0 \
             -f hls \
