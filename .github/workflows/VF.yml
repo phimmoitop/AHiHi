@@ -53,7 +53,7 @@ jobs:
           MAX_RETRY=5
           COUNT=1
 
-          while[ $COUNT -le $MAX_RETRY ]; do
+          while [ $COUNT -le $MAX_RETRY ]; do
             echo "=============================="
             echo "Attempt $COUNT / $MAX_RETRY"
             echo "=============================="
