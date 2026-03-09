@@ -120,7 +120,7 @@ jobs:
             COUNT=$((COUNT+1))
           done
 
-          if [ ! -f "input_video.mp4" ] ||[ "$DIFF" -gt 3 ]; then
+          if [ ! -f "input_video.mp4" ] || [ "$DIFF" -gt 3 ]; then
             echo "Failed after $MAX_RETRY attempts"
             exit 1
           fi
@@ -179,7 +179,8 @@ jobs:
 
           check () {
             code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
-            echo "HTTP CODE: $code"[ "$code" = "200" ]
+            echo "HTTP CODE: $code"
+            [ "$code" = "200" ]
           }
 
           echo "[WAIT] Waiting 1 minutes for Pages propagation..."
