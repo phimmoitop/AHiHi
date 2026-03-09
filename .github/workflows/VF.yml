@@ -62,43 +62,61 @@ jobs:
 
             echo "Downloading..."
             
-            # Ẩn thanh load, log chỉ báo lúc bắt đầu, lúc lỗi và kết quả lúc xong
+            # Xuất log theo dòng (--newline)
+            # Dùng đoạn script Python thu nhỏ để lọc: Log lỗi/Retrying hiển thị lập tức. Log tiến trình chỉ hiện mỗi 30 giây.
+            export PYTHONUNBUFFERED=1
             yt-dlp \
-            --no-progress \
+            --newline \
             --concurrent-fragments 1 \
             --retries infinite \
             --fragment-retries 100 \
             --skip-unavailable-fragments \
             --retry-sleep fragment:60 \
             -o "input_video.mp4" \
-            "$URL"
-
-            if [ ! -f "input_video.mp4" ]; then
-              echo "Download failed."
-              COUNT=$((COUNT+1))
-              continue
-            fi
-
-            echo "Checking video integrity..."
-            if ! ffmpeg -v error -i input_video.mp4 -f null - 2>error.log; then
-              echo "Video corrupted"
-              cat error.log
-              COUNT=$((COUNT+1))
-              continue
-            fi
-
-            echo "Getting duration from file..."
-            ACTUAL=$(ffprobe -v error \
-              -show_entries format=duration \
-              -of default=noprint_wrappers=1:nokey=1 \
-              input_video.mp4)
-
-            ACTUAL=${ACTUAL%.*}
-
-            echo "Expected: $EXPECTED"
-            echo "Actual: $ACTUAL"
-
-            DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
+            "$URL" 2>&1 | python3 -c '
+            import sys, time
+            last = 0
+            for line in sys.stdin:
+                if "Got error" in line or "Retrying" in line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                elif line.startswith("[download]") and "%" in line:
+                    now = time.time()
+                    if now - last >= 30 or "100%" in line:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        last = now
+                else:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+            '
+            
+                        if [ ! -f "input_video.mp4" ]; then
+                          echo "Download failed."
+                          COUNT=$((COUNT+1))
+                          continue
+                        fi
+            
+                        echo "Checking video integrity..."
+                        if ! ffmpeg -v error -i input_video.mp4 -f null - 2>error.log; then
+                          echo "Video corrupted"
+                          cat error.log
+                          COUNT=$((COUNT+1))
+                          continue
+                        fi
+            
+                        echo "Getting duration from file..."
+                        ACTUAL=$(ffprobe -v error \
+                          -show_entries format=duration \
+                          -of default=noprint_wrappers=1:nokey=1 \
+                          input_video.mp4)
+            
+                        ACTUAL=${ACTUAL%.*}
+            
+                        echo "Expected: $EXPECTED"
+                        echo "Actual: $ACTUAL"
+            
+                        DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
 
             echo "Difference: $DIFF seconds"
 
@@ -111,7 +129,7 @@ jobs:
             COUNT=$((COUNT+1))
           done
 
-          if [ ! -f "input_video.mp4" ] || [ "$DIFF" -gt 3 ]; then
+          if [ ! -f "input_video.mp4" ] ||[ "$DIFF" -gt 3 ]; then
             echo "Failed after $MAX_RETRY attempts"
             exit 1
           fi
@@ -141,7 +159,7 @@ jobs:
             "output/${{ github.event.inputs.slug }}.m3u8"
           
           # Kiểm tra xem file m3u8 có được tạo không
-          if[ ! -f "output/${{ github.event.inputs.slug }}.m3u8" ]; then
+          if [ ! -f "output/${{ github.event.inputs.slug }}.m3u8" ]; then
             echo "FFmpeg failed to create m3u8"
             exit 1
           fi
@@ -170,8 +188,7 @@ jobs:
 
           check () {
             code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
-            echo "HTTP CODE: $code"
-            [ "$code" = "200" ]
+            echo "HTTP CODE: $code"[ "$code" = "200" ]
           }
 
           echo "[WAIT] Waiting 1 minutes for Pages propagation..."
