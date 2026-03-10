@@ -268,8 +268,8 @@ jobs:
           -map 0:v:0 -map 0:a? \
           -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 \
           -b:v ${TARGET_BITRATE}k \
-          -maxrate ${MAXRATE}k \
-          -bufsize ${BUFSIZE}k \
+          -maxrate 3500k \
+          -bufsize 4500k \
           -preset medium \
           -r "$TARGET_FPS" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 \
           -c:a aac -b:a 128k -ac 2 -ar 48000 \
