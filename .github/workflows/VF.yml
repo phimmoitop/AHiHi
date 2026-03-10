@@ -240,6 +240,19 @@ jobs:
           if [ -z "$TARGET_FPS" ] || [ "$TARGET_FPS" -eq 0 ]; then
             TARGET_FPS=30
           fi
+
+          # 2. ĐỌC BITRATE VIDEO GỐC
+          RAW_BITRATE=$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 input_video.mp4 | head -n1)
+          
+          # nếu bitrate không tồn tại thì fallback
+          if [ -z "$RAW_BITRATE" ] || [ "$RAW_BITRATE" -eq 0 ]; then
+            RAW_BITRATE=2000000
+          fi
+          
+          # đổi sang kbps
+          TARGET_BITRATE=$(( RAW_BITRATE / 1000 ))
+          MAXRATE=$TARGET_BITRATE*1.2
+          BUFSIZE=$(( TARGET_BITRATE * 2 ))
           
           # 3. TÍNH TOÁN ĐIỂM CẮT KEYFRAME CHO CHUẨN 5.00 GIÂY
           GOP=$(( TARGET_FPS * 5 ))
@@ -252,20 +265,23 @@ jobs:
           
           # 4. CHẠY FFMPEG VỚI CÁC THÔNG SỐ ĐỘNG ĐÃ TÍNH TOÁN
           ffmpeg -y -stats_period 30 -i input_video.mp4 \
-            -map 0:v:0 -map 0:a? \
-            -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 \
-            -crf 18 -preset medium \
-            -maxrate 4500k -bufsize 9000k \
-            -r "$TARGET_FPS" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 \
-            -c:a aac -b:a 128k -ac 2 -ar 48000 -threads 0 \
-            -f hls \
-            -start_number 10001 \
-            -hls_time 5 \
-            -hls_list_size 0 \
-            -hls_segment_type fmp4 \
-            -hls_fmp4_init_filename "${{ github.event.inputs.slug }}-index.png" \
-            -hls_segment_filename "output/${{ github.event.inputs.slug }}-index%d.png" \
-            "output/${{ github.event.inputs.slug }}.m3u8"
+          -map 0:v:0 -map 0:a? \
+          -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 \
+          -b:v ${TARGET_BITRATE}k \
+          -maxrate ${MAXRATE}k \
+          -bufsize ${BUFSIZE}k \
+          -preset medium \
+          -r "$TARGET_FPS" -g "$GOP" -keyint_min "$GOP" -sc_threshold 0 \
+          -c:a aac -b:a 128k -ac 2 -ar 48000 \
+          -threads 0 \
+          -f hls \
+          -start_number 10001 \
+          -hls_time 5 \
+          -hls_list_size 0 \
+          -hls_segment_type fmp4 \
+          -hls_fmp4_init_filename "${{ github.event.inputs.slug }}-index.png" \
+          -hls_segment_filename "output/${{ github.event.inputs.slug }}-index%d.png" \
+          "output/${{ github.event.inputs.slug }}.m3u8"
           
           # Kiểm tra xem file m3u8 có được tạo không
           if [ ! -f "output/${{ github.event.inputs.slug }}.m3u8" ]; then
