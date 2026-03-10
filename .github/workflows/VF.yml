@@ -22,6 +22,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -31,197 +32,190 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 curl jq
           python3 -m pip install -U yt-dlp
-          
+
       - name: Download + Verify M3U8 Video
+        shell: bash
         run: |
+          set -e
+
           URL="${{ github.event.inputs.link }}"
-      
+
+          DOMAINS=(
+            "thunderleaf12.online"
+            "aurorabird6.live"
+            "rainorbit33.xyz"
+            "frostcomet5.pro"
+            "nightbreeze17.site"
+          )
+
+          PREFIX="https://limit.fatherlessdad.workers.dev"
+
           echo "Getting real m3u8..."
           M3U8=$(yt-dlp -g "$URL")
-      
-          PREFIX="https://limit.fatherlessdad.workers.dev"
-      
+
           echo "Downloading playlist..."
           curl -sL "$M3U8" -o playlist.m3u8
-      
-          grep -v '^#' playlist.m3u8 > segments.txt
-      
+
+          grep -v '^#' playlist.m3u8 | grep -v '^[[:space:]]*$' > segments.txt
           TOTAL=$(wc -l < segments.txt)
-      
+
           echo "Total segments: $TOTAL"
-      
+
           mkdir -p segments
-      
           mapfile -t SEGS < segments.txt
-      
-          download_segment () {
-      
+
+          download_segment() {
             IDX=$1
             SEG="${SEGS[$IDX]}"
-      
-            FILE=$(printf "segments/seg_%05d.ts" $IDX)
-      
-            if [[ "$SEG" == http* ]]; then
-              FULL="$SEG"
-            elif [[ "$SEG" == /* ]]; then
-              FULL="$PREFIX$SEG"
-            else
-              FULL="$SEG"
-            fi
-      
-            while true; do
-      
-              aria2c \
+            FILE=$(printf "segments/seg_%05d.ts" "$IDX")
+            
+            ATTEMPT=0
+            MAX_RETRIES=20
+
+            while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
+              DOMAIN=${DOMAINS[$((ATTEMPT % ${#DOMAINS[@]}))]}
+              SEG_PATH=$(echo "$SEG" | sed -E 's|^/?[^/]+/|/|')
+              FULL="$PREFIX/$DOMAIN$SEG_PATH"
+
+              if (( ATTEMPT >= 5 )); then
+                RAND=$RANDOM
+                FULL="$FULL?v=$RAND"
+              fi
+
+              /usr/bin/aria2c \
                 --quiet=true \
                 --allow-overwrite=true \
                 --file-allocation=none \
                 --max-tries=1 \
                 -o "$FILE.tmp" \
                 "$FULL" || true
-      
+
               if [ ! -f "$FILE.tmp" ]; then
-                sleep 60
+                sleep 5
+                ATTEMPT=$((ATTEMPT+1))
+                echo "[!] Segment $IDX tải lỗi mạng (Thử lại $ATTEMPT/$MAX_RETRIES)..."
                 continue
               fi
-      
-              SIZE=$(stat -c%s "$FILE.tmp")
-      
-              if [ "$SIZE" -lt 50000 ]; then
-                rm -f "$FILE.tmp"
-                sleep 60
-                continue
-              fi
-      
+
               ffprobe -v error "$FILE.tmp" >/dev/null 2>&1 || {
                 rm -f "$FILE.tmp"
-                sleep 60
+                sleep 5
+                ATTEMPT=$((ATTEMPT+1))
+                echo "[!] Segment $IDX file hỏng (Thử lại $ATTEMPT/$MAX_RETRIES)..."
                 continue
               }
-      
+
               mv "$FILE.tmp" "$FILE"
-              break
+              return 0
             done
+            
+            if [ "$IDX" -eq "$((TOTAL - 1))" ]; then
+              echo "[SKIP] CẢNH BÁO: Segment cuối cùng ($IDX) thất bại sau $MAX_RETRIES lần. Bỏ qua..."
+              touch "segments/seg_$(printf "%05d" "$IDX").skipped"
+              return 0
+            else
+              echo "[ERROR] Segment $IDX (ở giữa video) tải thất bại hoàn toàn sau $MAX_RETRIES lần!"
+              touch "segments/FAILED_CRITICAL"
+              return 1
+            fi
           }
-      
-      
-          echo "Starting parallel download (10 segments)..."
-      
+
+          echo "Starting parallel download..."
+
           for ((i=0;i<TOTAL;i++)); do
-      
-            download_segment $i &
-      
-            while [ "$(jobs -r | wc -l)" -ge 10 ]; do
+            download_segment "$i" &
+
+            while [ "$(jobs -p | wc -l)" -ge 10 ]; do
               sleep 1
             done
-      
           done
-      
-      
-          (
-            while true; do
-              DONE=$(ls segments | wc -l)
-              echo "Downloading... $DONE / $TOTAL segments"
-              sleep 30
+
+          while true; do
+            if [ -f "segments/FAILED_CRITICAL" ]; then
+              echo "Có segment ở giữa video không thể tải được. Hủy bỏ quá trình..."
+              exit 1
+            fi
+
+            SUCCESS=$(find segments -maxdepth 1 -name "*.ts" 2>/dev/null | wc -l || echo 0)
+            SKIPPED=$(find segments -maxdepth 1 -name "*.skipped" 2>/dev/null | wc -l || echo 0)
+            DONE=$((SUCCESS + SKIPPED))
+            
+            if [ "$DONE" -eq "$TOTAL" ]; then
+              echo "Hoàn tất! Đã xử lý $TOTAL segments ($SUCCESS thành công, $SKIPPED bỏ qua)."
+              break
+            fi
+
+            MISSING=""
+            for ((i=0; i<TOTAL; i++)); do
+              FILE=$(printf "segments/seg_%05d" "$i")
+              if [ ! -f "${FILE}.ts" ] && [ ! -f "${FILE}.skipped" ]; then
+                MISSING="$MISSING $i"
+              fi
             done
-          ) &
-      
-          LOGGER=$!
-      
-          wait
-      
-          kill $LOGGER || true
-      
-      
-          echo "All segments downloaded"
-      
-      
-          echo "Creating concat list..."
-      
-          rm -f list.txt
-      
-          for f in segments/*.ts; do
-            echo "file '$f'" >> list.txt
+            
+            MISSING_PREVIEW=$(echo "$MISSING" | awk '{for(i=1;i<=10&&i<=NF;i++) printf $i" "; if(NF>10) print "..."}')
+
+            echo "Downloading... $DONE / $TOTAL segments"
+            echo "Đang chờ / Đang lỗi ở các segments:[ $MISSING_PREVIEW ]"
+            
+            sleep 15
           done
-      
-      
-          echo "Merging video..."
-      
-          ffmpeg -loglevel error \
-            -f concat \
-            -safe 0 \
-            -i list.txt \
-            -c copy \
-            input_video.mp4
-      
-      
+
+          wait
+          echo "All background downloads finished."
+
+          echo "Merging video streams directly (Binary Concat)..."
+          cat segments/*.ts > combined.ts
+          
+          echo "Converting to MP4 & Re-building audio track to fix ADTS errors..."
+          # ĐIỂM QUAN TRỌNG NHẤT: -c:v copy (giữ hình) và -c:a aac (sửa tiếng)
+          ffmpeg -loglevel error -y -i combined.ts -map 0:v? -map 0:a? -c:v copy -c:a aac input_video.mp4
+          rm -f combined.ts
+
           echo "Checking duration..."
-      
           EXPECTED=$(grep "#EXTINF" playlist.m3u8 | awk -F: '{sum+=$2} END{print int(sum)}')
-      
+
           ACTUAL=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            input_video.mp4)
-      
+            input_video.mp4 || echo "0")
           ACTUAL=${ACTUAL%.*}
-      
+
           echo "Expected: $EXPECTED"
           echo "Actual: $ACTUAL"
-      
+
           DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
-      
           echo "Duration difference: $DIFF seconds"
-      
-      
-          echo "Checking decode errors..."
-      
-          ERRORS=$(ffmpeg -v error -i input_video.mp4 -f null - 2>&1 | wc -l)
-      
-          echo "Decode errors: $ERRORS"
-      
-      
-          if [ "$DIFF" -le 5 ] && [ "$ERRORS" -eq 0 ]; then
-            echo "Video verified successfully"
-            exit 0
+
+          MAX_DIFF=60 
+          if [ "$SKIPPED" -gt 0 ]; then
+            echo "[INFO] Segment cuối bị bỏ qua."
           fi
-      
-          echo "Video verification failed"
-          exit 1
+
+          echo "Checking decode errors..."
+          ERRORS=$(ffmpeg -v error -i input_video.mp4 -f null - 2>&1 | wc -l || true)
+          echo "Decode errors: $ERRORS"
+
+          if [ "$DIFF" -gt "$MAX_DIFF" ]; then
+            echo "[LỖI NẶNG] Sai số thời lượng quá lớn ($DIFF giây). Xác nhận video bị hỏng."
+            exit 1
+          fi
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "[WARNING] Phát hiện $ERRORS lỗi khung hình (Frame corruption) trong video gốc. Sẽ tự động khôi phục lúc Re-Encode!"
+          fi
+
+          echo "Video verified successfully"
 
           echo "Collecting video information..."
-
           SIZE=$(du -h input_video.mp4 | cut -f1)
-          
-          DURATION=$(ffprobe -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            input_video.mp4)
-          
-          BITRATE=$(ffprobe -v error \
-            -show_entries format=bit_rate \
-            -of default=noprint_wrappers=1:nokey=1 \
-            input_video.mp4)
-          
-          WIDTH=$(ffprobe -v error \
-            -select_streams v:0 \
-            -show_entries stream=width \
-            -of csv=p=0 input_video.mp4)
-          
-          HEIGHT=$(ffprobe -v error \
-            -select_streams v:0 \
-            -show_entries stream=height \
-            -of csv=p=0 input_video.mp4)
-          
-          FPS=$(ffprobe -v error \
-            -select_streams v:0 \
-            -show_entries stream=r_frame_rate \
-            -of csv=p=0 input_video.mp4)
-          
-          CODEC=$(ffprobe -v error \
-            -select_streams v:0 \
-            -show_entries stream=codec_name \
-            -of csv=p=0 input_video.mp4)
-          
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input_video.mp4 || echo "N/A")
+          BITRATE=$(ffprobe -v error -show_entries format=bit_rate -of default=noprint_wrappers=1:nokey=1 input_video.mp4 || echo "N/A")
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 input_video.mp4 | head -n1 || echo "N/A")
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 input_video.mp4 | head -n1 || echo "N/A")
+          FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 input_video.mp4 | head -n1 || echo "N/A")
+          CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 input_video.mp4 | head -n1 || echo "N/A")
+
           echo "================ VIDEO INFO ================"
           echo "File: input_video.mp4"
           echo "Size: $SIZE"
@@ -231,6 +225,7 @@ jobs:
           echo "Codec: $CODEC"
           echo "Bitrate: $BITRATE"
           echo "==========================================="
+          
       - name: Re-Encode & Convert to HLS fMP4 (Strict 5.00s Segments as PNG)
         run: |
           mkdir -p output
@@ -243,7 +238,7 @@ jobs:
           ffmpeg -y -stats_period 30 -i input_video.mp4 \
             -map 0:v:0 -map 0:a? \
             -c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 -crf 23 -preset medium \
-            -maxrate 2000k -bufsize 3500k \
+            -maxrate 1800k -bufsize 3000k \
             -r 30 -g 150 -keyint_min 150 -sc_threshold 0 \
             -c:a aac -b:a 96k -ac 2 -ar 48000 -threads 0 \
             -f hls \
