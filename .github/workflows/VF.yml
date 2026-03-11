@@ -40,18 +40,11 @@ jobs:
 
           URL="${{ github.event.inputs.link }}"
 
-          DOMAINS=(
-            "thunderleaf12.online"
-            "aurorabird6.live"
-            "rainorbit33.xyz"
-            "frostcomet5.pro"
-            "nightbreeze17.site"
-          )
-
-          PREFIX="https://limit.fatherlessdad.workers.dev"
-
           echo "Getting real m3u8..."
           M3U8=$(yt-dlp -g "$URL")
+          
+          # Lấy Base URL để ghép nếu segment là đường dẫn tương đối
+          BASE_URL=$(echo "$M3U8" | sed 's/\/[^\/]*$/\//')
 
           curl -sL "$M3U8" -o playlist.m3u8
 
@@ -59,7 +52,6 @@ jobs:
           grep "#EXTINF" playlist.m3u8 | awk -F: '{print $2}' | sed 's/,//' > durations.txt
 
           TOTAL=$(wc -l < segments.txt)
-
           echo "Total segments: $TOTAL"
 
           mkdir -p segments
@@ -67,32 +59,42 @@ jobs:
           mapfile -t DURS < durations.txt
 
           download_segment() {
-
             IDX=$1
             SEG="${SEGS[$IDX]}"
             EXPECT="${DURS[$IDX]}"
 
             FILE=$(printf "segments/seg_%05d.ts" "$IDX")
 
+            # Xử lý URL: Nếu SEG có http thì dùng luôn, nếu không thì ghép với BASE_URL
+            if [[ "$SEG" == http* ]]; then
+              FULL="$SEG"
+            else
+              # Đảm bảo không bị trùng dấu gạch chéo
+              SEG_CLEAN=$(echo "$SEG" | sed 's/^\///')
+              FULL="${BASE_URL}${SEG_CLEAN}"
+            fi
+
             ATTEMPT=0
             MAX_RETRIES=25
 
             while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
-
-              DOMAIN=${DOMAINS[$((ATTEMPT % ${#DOMAINS[@]}))]}
-              SEG_PATH=$(echo "$SEG" | sed -E 's|^/?[^/]+/|/|')
-
+              # Thêm tham số ngẫu nhiên để tránh cache của server nếu cần
               RAND=$RANDOM
-              FULL="$PREFIX/$DOMAIN$SEG_PATH?v=$RAND"
+              FINAL_URL="${FULL}"
+              if [[ "$FULL" == *\?* ]]; then
+                FINAL_URL="${FULL}&v=$RAND"
+              else
+                FINAL_URL="${FULL}?v=$RAND"
+              fi
 
               echo "[SEG $IDX] attempt $ATTEMPT"
 
               if [ $ATTEMPT -lt 10 ]; then
-                aria2c --quiet=true --file-allocation=none -o "$FILE.tmp" "$FULL" || true
+                aria2c --quiet=true --file-allocation=none -o "$FILE.tmp" "$FINAL_URL" || true
               elif [ $ATTEMPT -lt 20 ]; then
-                curl -L "$FULL" -o "$FILE.tmp" || true
+                curl -L "$FINAL_URL" -o "$FILE.tmp" || true
               else
-                yt-dlp -o "$FILE.tmp" "$FULL" || true
+                yt-dlp -o "$FILE.tmp" "$FINAL_URL" || true
               fi
 
               if [ ! -f "$FILE.tmp" ]; then
@@ -102,7 +104,6 @@ jobs:
               fi
 
               SIZE=$(stat -c%s "$FILE.tmp")
-
               if [ "$SIZE" -lt 10000 ]; then
                 echo "[SEG $IDX] file too small ($SIZE)"
                 rm -f "$FILE.tmp"
@@ -122,9 +123,7 @@ jobs:
                 -of default=noprint_wrappers=1:nokey=1 "$FILE.tmp" || echo "0")
 
               DUR=${DUR%.*}
-
               EXP=${EXPECT%.*}
-
               DIFF=$(echo "$DUR $EXP" | awk '{print ($1>$2)?$1-$2:$2-$1}')
 
               if [ "$DIFF" -gt 2 ]; then
@@ -135,11 +134,8 @@ jobs:
               fi
 
               mv "$FILE.tmp" "$FILE"
-
               echo "[SEG $IDX] OK duration=$DUR"
-
               return 0
-
             done
 
             echo "[ERROR] segment $IDX failed completely"
@@ -148,10 +144,8 @@ jobs:
           }
 
           echo "Starting parallel download..."
-
           for ((i=0;i<TOTAL;i++)); do
             download_segment "$i" &
-
             while [ "$(jobs -p | wc -l)" -ge 10 ]; do
               sleep 1
             done
@@ -165,9 +159,7 @@ jobs:
           fi
 
           echo "Checking segment durations..."
-
           TOTAL_ACTUAL=0
-
           for f in segments/*.ts; do
             D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo 0)
             D=${D%.*}
@@ -175,16 +167,13 @@ jobs:
           done
 
           EXPECTED=$(grep "#EXTINF" playlist.m3u8 | awk -F: '{sum+=$2} END{print int(sum)}')
-
           echo "Expected duration: $EXPECTED"
           echo "Actual duration (segments): $TOTAL_ACTUAL"
 
           echo "Merging segments..."
-
           cat segments/*.ts > combined.ts
 
           echo "Rebuilding video..."
-
           ffmpeg -loglevel error -y \
             -fflags +genpts+discardcorrupt \
             -err_detect ignore_err \
@@ -198,14 +187,12 @@ jobs:
           rm combined.ts
 
           echo "Final duration..."
-
           ACTUAL=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
             input_video.mp4)
 
           ACTUAL=${ACTUAL%.*}
-
           DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
 
           echo "Expected: $EXPECTED"
