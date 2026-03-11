@@ -87,7 +87,6 @@ jobs:
                 FINAL_URL="${FULL}?v=$RAND"
               fi
 
-              echo "[SEG $IDX] attempt $ATTEMPT"
 
               if [ $ATTEMPT -lt 10 ]; then
                 aria2c --quiet=true --file-allocation=none -o "$FILE.tmp" "$FINAL_URL" || true
@@ -134,7 +133,6 @@ jobs:
               fi
 
               mv "$FILE.tmp" "$FILE"
-              echo "[SEG $IDX] OK duration=$DUR"
               return 0
             done
 
