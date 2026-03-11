@@ -53,71 +53,98 @@ jobs:
           echo "Getting real m3u8..."
           M3U8=$(yt-dlp -g "$URL")
 
-          echo "Downloading playlist..."
           curl -sL "$M3U8" -o playlist.m3u8
 
           grep -v '^#' playlist.m3u8 | grep -v '^[[:space:]]*$' > segments.txt
+          grep "#EXTINF" playlist.m3u8 | awk -F: '{print $2}' | sed 's/,//' > durations.txt
+
           TOTAL=$(wc -l < segments.txt)
 
           echo "Total segments: $TOTAL"
 
           mkdir -p segments
           mapfile -t SEGS < segments.txt
+          mapfile -t DURS < durations.txt
 
           download_segment() {
+
             IDX=$1
             SEG="${SEGS[$IDX]}"
+            EXPECT="${DURS[$IDX]}"
+
             FILE=$(printf "segments/seg_%05d.ts" "$IDX")
-            
+
             ATTEMPT=0
-            MAX_RETRIES=20
+            MAX_RETRIES=25
 
             while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
+
               DOMAIN=${DOMAINS[$((ATTEMPT % ${#DOMAINS[@]}))]}
               SEG_PATH=$(echo "$SEG" | sed -E 's|^/?[^/]+/|/|')
-              FULL="$PREFIX/$DOMAIN$SEG_PATH"
 
-              if (( ATTEMPT >= 5 )); then
-                RAND=$RANDOM
-                FULL="$FULL?v=$RAND"
+              RAND=$RANDOM
+              FULL="$PREFIX/$DOMAIN$SEG_PATH?v=$RAND"
+
+              echo "[SEG $IDX] attempt $ATTEMPT"
+
+              if [ $ATTEMPT -lt 10 ]; then
+                aria2c --quiet=true --file-allocation=none -o "$FILE.tmp" "$FULL" || true
+              elif [ $ATTEMPT -lt 20 ]; then
+                curl -L "$FULL" -o "$FILE.tmp" || true
+              else
+                yt-dlp -o "$FILE.tmp" "$FULL" || true
               fi
 
-              /usr/bin/aria2c \
-                --quiet=true \
-                --allow-overwrite=true \
-                --file-allocation=none \
-                --max-tries=1 \
-                -o "$FILE.tmp" \
-                "$FULL" || true
-
               if [ ! -f "$FILE.tmp" ]; then
-                sleep 5
                 ATTEMPT=$((ATTEMPT+1))
-                echo "[!] Segment $IDX tải lỗi mạng (Thử lại $ATTEMPT/$MAX_RETRIES)..."
+                sleep 3
+                continue
+              fi
+
+              SIZE=$(stat -c%s "$FILE.tmp")
+
+              if [ "$SIZE" -lt 10000 ]; then
+                echo "[SEG $IDX] file too small ($SIZE)"
+                rm -f "$FILE.tmp"
+                ATTEMPT=$((ATTEMPT+1))
                 continue
               fi
 
               ffprobe -v error "$FILE.tmp" >/dev/null 2>&1 || {
+                echo "[SEG $IDX] ffprobe failed"
                 rm -f "$FILE.tmp"
-                sleep 5
                 ATTEMPT=$((ATTEMPT+1))
-                echo "[!] Segment $IDX file hỏng (Thử lại $ATTEMPT/$MAX_RETRIES)..."
                 continue
               }
 
+              DUR=$(ffprobe -v error \
+                -show_entries format=duration \
+                -of default=noprint_wrappers=1:nokey=1 "$FILE.tmp" || echo "0")
+
+              DUR=${DUR%.*}
+
+              EXP=${EXPECT%.*}
+
+              DIFF=$(echo "$DUR $EXP" | awk '{print ($1>$2)?$1-$2:$2-$1}')
+
+              if [ "$DIFF" -gt 2 ]; then
+                echo "[SEG $IDX] duration mismatch expected=$EXP actual=$DUR"
+                rm -f "$FILE.tmp"
+                ATTEMPT=$((ATTEMPT+1))
+                continue
+              fi
+
               mv "$FILE.tmp" "$FILE"
+
+              echo "[SEG $IDX] OK duration=$DUR"
+
               return 0
+
             done
-            
-            if [ "$IDX" -eq "$((TOTAL - 1))" ]; then
-              echo "[SKIP] CẢNH BÁO: Segment cuối cùng ($IDX) thất bại sau $MAX_RETRIES lần. Bỏ qua..."
-              touch "segments/seg_$(printf "%05d" "$IDX").skipped"
-              return 0
-            else
-              echo "[ERROR] Segment $IDX (ở giữa video) tải thất bại hoàn toàn sau $MAX_RETRIES lần!"
-              touch "segments/FAILED_CRITICAL"
-              return 1
-            fi
+
+            echo "[ERROR] segment $IDX failed completely"
+            touch segments/FAILED_CRITICAL
+            return 1
           }
 
           echo "Starting parallel download..."
@@ -130,83 +157,67 @@ jobs:
             done
           done
 
-          while true; do
-            if [ -f "segments/FAILED_CRITICAL" ]; then
-              echo "Có segment ở giữa video không thể tải được. Hủy bỏ quá trình..."
-              exit 1
-            fi
+          wait
 
-            SUCCESS=$(find segments -maxdepth 1 -name "*.ts" 2>/dev/null | wc -l || echo 0)
-            SKIPPED=$(find segments -maxdepth 1 -name "*.skipped" 2>/dev/null | wc -l || echo 0)
-            DONE=$((SUCCESS + SKIPPED))
-            
-            if [ "$DONE" -eq "$TOTAL" ]; then
-              echo "Hoàn tất! Đã xử lý $TOTAL segments ($SUCCESS thành công, $SKIPPED bỏ qua)."
-              break
-            fi
+          if [ -f segments/FAILED_CRITICAL ]; then
+            echo "Critical segment failed"
+            exit 1
+          fi
 
-            MISSING=""
-            for ((i=0; i<TOTAL; i++)); do
-              FILE=$(printf "segments/seg_%05d" "$i")
-              if [ ! -f "${FILE}.ts" ] && [ ! -f "${FILE}.skipped" ]; then
-                MISSING="$MISSING $i"
-              fi
-            done
-            
-            MISSING_PREVIEW=$(echo "$MISSING" | awk '{for(i=1;i<=10&&i<=NF;i++) printf $i" "; if(NF>10) print "..."}')
+          echo "Checking segment durations..."
 
-            echo "Downloading... $DONE / $TOTAL segments"
-            echo "Đang chờ / Đang lỗi ở các segments:[ $MISSING_PREVIEW ]"
-            
-            sleep 15
+          TOTAL_ACTUAL=0
+
+          for f in segments/*.ts; do
+            D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" || echo 0)
+            D=${D%.*}
+            TOTAL_ACTUAL=$((TOTAL_ACTUAL + D))
           done
 
-          wait
-          echo "All background downloads finished."
-
-          echo "Merging video streams directly (Binary Concat)..."
-          cat segments/*.ts > combined.ts
-          
-          echo "Converting to MP4 & Re-building audio track to fix ADTS errors..."
-          # ĐIỂM QUAN TRỌNG NHẤT: -c:v copy (giữ hình) và -c:a aac (sửa tiếng)
-          ffmpeg -loglevel error -y -i combined.ts -map 0:v? -map 0:a? -c:v copy -c:a aac input_video.mp4
-          rm -f combined.ts
-
-          echo "Checking duration..."
           EXPECTED=$(grep "#EXTINF" playlist.m3u8 | awk -F: '{sum+=$2} END{print int(sum)}')
+
+          echo "Expected duration: $EXPECTED"
+          echo "Actual duration (segments): $TOTAL_ACTUAL"
+
+          echo "Merging segments..."
+
+          cat segments/*.ts > combined.ts
+
+          echo "Rebuilding video..."
+
+          ffmpeg -loglevel error -y \
+            -fflags +genpts+discardcorrupt \
+            -err_detect ignore_err \
+            -i combined.ts \
+            -map 0:v? -map 0:a? \
+            -c:v copy \
+            -c:a aac \
+            -af aresample=async=1 \
+            input_video.mp4
+
+          rm combined.ts
+
+          echo "Final duration..."
 
           ACTUAL=$(ffprobe -v error \
             -show_entries format=duration \
             -of default=noprint_wrappers=1:nokey=1 \
-            input_video.mp4 || echo "0")
+            input_video.mp4)
+
           ACTUAL=${ACTUAL%.*}
+
+          DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
 
           echo "Expected: $EXPECTED"
           echo "Actual: $ACTUAL"
+          echo "Diff: $DIFF"
 
-          DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
-          echo "Duration difference: $DIFF seconds"
-
-          MAX_DIFF=60 
-          if [ "$SKIPPED" -gt 0 ]; then
-            echo "[INFO] Segment cuối bị bỏ qua."
-          fi
-
-          echo "Checking decode errors..."
-          ERRORS=$(ffmpeg -v error -i input_video.mp4 -f null - 2>&1 | wc -l || true)
-          echo "Decode errors: $ERRORS"
-
-          if [ "$DIFF" -gt "$MAX_DIFF" ]; then
-            echo "[LỖI NẶNG] Sai số thời lượng quá lớn ($DIFF giây). Xác nhận video bị hỏng."
+          if [ "$DIFF" -gt 10 ]; then
+            echo "[ERROR] duration mismatch too large"
             exit 1
           fi
 
-          if [ "$ERRORS" -gt 0 ]; then
-            echo "[WARNING] Phát hiện $ERRORS lỗi khung hình (Frame corruption) trong video gốc. Sẽ tự động khôi phục lúc Re-Encode!"
-          fi
-
           echo "Video verified successfully"
-
           echo "Collecting video information..."
           SIZE=$(du -h input_video.mp4 | cut -f1)
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 input_video.mp4 || echo "N/A")
