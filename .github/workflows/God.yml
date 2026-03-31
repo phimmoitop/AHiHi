@@ -1,0 +1,48 @@
+name: Fixed Key M3U8 Downloader
+
+on:
+  workflow_dispatch: # Chạy thủ công
+
+jobs:
+  download_and_decrypt:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+
+      - name: Fetch and Prepare M3U8
+        run: |
+          # 1. Tải file m3u8 từ link bạn cung cấp
+          curl -L "https://vicdn.cc/tt/1.m3u8" -o input.m3u8
+          
+          # 2. Tạo file key nhị phân từ key cố định của bạn
+          # Key: 223e4393fe559da5 (16 bytes)
+          echo -n "223e4393fe559da5" > video.key
+          
+          # 3. Tự động sửa file m3u8: 
+          # - Thay URI cũ bằng file 'video.key' cục bộ
+          # - Đảm bảo các đường dẫn phân đoạn là tuyệt đối (nếu cần)
+          sed -i 's|URI="[^"]*"|URI="video.key"|g' input.m3u8
+          
+          # Kiểm tra nội dung sau khi sửa (để debug nếu cần)
+          head -n 10 input.m3u8
+
+      - name: Download with FFmpeg
+        run: |
+          # Dùng FFmpeg để tải và giải mã tự động
+          # -allowed_extensions ALL: Cho phép đọc file .key và .ts/.jpg
+          # -protocol_whitelist: Cho phép các giao thức cần thiết để giải mã AES
+          ffmpeg -allowed_extensions ALL \
+            -protocol_whitelist file,http,https,tcp,tls,crypto \
+            -i input.m3u8 \
+            -c copy finished_video.mp4 \
+            -loglevel warning
+
+      - name: Upload Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: Video_Ket_Qua
+          path: finished_video.mp4
