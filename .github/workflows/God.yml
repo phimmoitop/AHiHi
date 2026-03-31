@@ -1,48 +1,69 @@
-name: Fixed Key M3U8 Downloader
+name: Ultimate M3U8 Decryptor
 
 on:
-  workflow_dispatch: # Chạy thủ công
+  workflow_dispatch:
 
 jobs:
-  download_and_decrypt:
+  build:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Install Tools
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Environment
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
+          pip install pycryptodome requests
 
-      - name: Fetch and Prepare M3U8
+      - name: Advanced Link Repair & Key Setup
+        shell: python
         run: |
-          # 1. Tải file m3u8 từ link bạn cung cấp
-          curl -L "https://vicdn.cc/tt/1.m3u8" -o input.m3u8
-          
-          # 2. Tạo file key nhị phân từ key cố định của bạn
-          # Key: 223e4393fe559da5 (16 bytes)
-          echo -n "223e4393fe559da5" > video.key
-          
-          # 3. Tự động sửa file m3u8: 
-          # - Thay URI cũ bằng file 'video.key' cục bộ
-          # - Đảm bảo các đường dẫn phân đoạn là tuyệt đối (nếu cần)
-          sed -i 's|URI="[^"]*"|URI="video.key"|g' input.m3u8
-          
-          # Kiểm tra nội dung sau khi sửa (để debug nếu cần)
-          head -n 10 input.m3u8
+          import os
+          import requests
+          import re
 
-      - name: Download with FFmpeg
+          # 1. Tải file m3u8 gốc
+          m3u8_url = "https://vicdn.cc/tt/1.m3u8"
+          print(f"Downloading playlist from {m3u8_url}")
+          r = requests.get(m3u8_url)
+          content = r.text
+
+          # 2. Tạo file key nhị phân (16 bytes)
+          # Key cố định của bạn: 223e4393fe559da5
+          with open("video.key", "wb") as kf:
+              kf.write(b"223e4393fe559da5")
+
+          # 3. Sửa nội dung M3U8
+          # Thay đổi link Key trỏ về file nội bộ
+          content = re.sub(r'URI="[^"]+"', 'URI="video.key"', content)
+
+          # Sửa link segment: Biến .jpg/.jpeg thành .woff2 (link thật của KingCDN)
+          # Đây là bước quan trọng nhất để tránh lỗi 404
+          content = content.replace(".jpg", ".woff2")
+          content = content.replace(".jpeg", ".woff2")
+          content = content.replace(".svg", ".woff2")
+          content = content.replace(".png", ".woff2")
+
+          with open("final.m3u8", "w") as f:
+              f.write(content)
+          print("Playlist fixed and saved as final.m3u8")
+
+      - name: FFmpeg Download & Decrypt
         run: |
-          # Dùng FFmpeg để tải và giải mã tự động
-          # -allowed_extensions ALL: Cho phép đọc file .key và .ts/.jpg
-          # -protocol_whitelist: Cho phép các giao thức cần thiết để giải mã AES
+          # Chạy FFmpeg với playlist đã được sửa link thật
+          # Sử dụng Header để tránh bị server chặn
           ffmpeg -allowed_extensions ALL \
             -protocol_whitelist file,http,https,tcp,tls,crypto \
-            -i input.m3u8 \
-            -c copy finished_video.mp4 \
+            -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"$'\r\n'"Referer: https://vicdn.cc/" \
+            -i final.m3u8 \
+            -c copy "Phim_Da_Giai_Ma.mp4" \
             -loglevel warning
 
-      - name: Upload Result
+      - name: Upload Video
         uses: actions/upload-artifact@v4
         with:
-          name: Video_Ket_Qua
-          path: finished_video.mp4
+          name: Video_Output
+          path: Phim_Da_Giai_Ma.mp4
+          retention-days: 1
