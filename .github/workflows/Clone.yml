@@ -1,4 +1,4 @@
-name: Clone Voice Profile
+name: Clone Voice Profile - VieNeu
 
 on:
   workflow_dispatch:
@@ -50,7 +50,9 @@ jobs:
             "vieneu==2.7.0" \
             numpy \
             soundfile \
-            pydub
+            pydub \
+            onnxruntime \
+            "huggingface_hub[cli]"
 
       # ============================================================
       # 5. Verify source audio
@@ -138,6 +140,9 @@ jobs:
       # This is the actual voice enrollment step.
       # ============================================================
       - name: Encode voice profile
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python - <<'PY'
           import json
@@ -285,6 +290,9 @@ jobs:
       # them straight from the repo and delete manually afterwards.
       # ============================================================
       - name: Test cloned voice
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python - <<'PY'
           from pathlib import Path
