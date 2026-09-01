@@ -62,6 +62,7 @@ jobs:
             soundfile \
             pydub \
             onnxruntime \
+            "demucs-onnx" \
             "huggingface_hub[cli]"
 
       # ============================================================
@@ -98,7 +99,14 @@ jobs:
         run: |
           rm -rf voice_profile
           mkdir -p voice_profile
+      - name: Isolate vocals with demucs-onnx
+        run: |
+          mkdir -p separated
+          demucs-onnx separate audio1.mp3 separated/ --stem vocals
 
+          echo "Isolated vocal track:"
+          ls -lh separated/
+      
       # ============================================================
       # 7. Prepare reference audio
       #
@@ -114,7 +122,7 @@ jobs:
 
           ffmpeg \
             -y \
-            -i "audio1.mp3" \
+            -i "separated/vocals.wav" \
             -vn \
             -ac 1 \
             -c:a pcm_s16le \
