@@ -47,7 +47,7 @@ jobs:
           python -m pip install --upgrade pip
 
           pip install \
-            torch --index-url https://download.pytorch.org/whl/cpu
+            torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
           pip install \
             "vieneu==2.7.0" \
