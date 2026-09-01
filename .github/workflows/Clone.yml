@@ -68,12 +68,12 @@ jobs:
       # ============================================================
       # 5. Verify source audio
       # ============================================================
-      - name: Verify audio2.mp3
+      - name: Verify audio3.mp3
         run: |
-          if [ ! -f "audio2.mp3" ]; then
-            echo "::error::Không tìm thấy audio2.mp3 ở thư mục gốc repository."
+          if [ ! -f "audio3.mp3" ]; then
+            echo "::error::Không tìm thấy audio3.mp3 ở thư mục gốc repository."
             echo "Hãy kiểm tra file phải nằm tại:"
-            echo "audio2.mp3"
+            echo "audio3.mp3"
             exit 1
           fi
 
@@ -81,7 +81,7 @@ jobs:
           echo "SOURCE AUDIO"
           echo "======================================"
 
-          ls -lh audio2.mp3
+          ls -lh audio3.mp3
 
           echo ""
           echo "FFmpeg audio information:"
@@ -90,7 +90,7 @@ jobs:
             -show_entries format=duration \
             -show_entries stream=codec_name,sample_rate,channels \
             -of default=noprint_wrappers=1 \
-            audio2.mp3
+            audio3.mp3
 
       # ============================================================
       # 6. Create voice_profile directory
@@ -102,7 +102,7 @@ jobs:
       - name: Isolate vocals with demucs-onnx
         run: |
           mkdir -p separated
-          demucs-onnx separate audio2.mp3 separated/ --stem vocals
+          demucs-onnx separate audio3.mp3 separated/ --stem vocals
 
           echo "Isolated vocal track:"
           ls -lh separated/
@@ -110,7 +110,7 @@ jobs:
       # ============================================================
       # 7. Prepare reference audio
       #
-      # audio2.mp3 is already the exact 8-second reference.
+      # audio3.mp3 is already the exact 8-second reference.
       #
       # We convert it to clean mono WAV.
       #
@@ -146,7 +146,7 @@ jobs:
       # ============================================================
       - name: Save reference transcript
         run: |
-          printf '%s\n' "trong những mùa khô hạn, người dân phải ăn lá me để tạm cầm cự cơn khát giữa rừng, thậm chí sử dụng phèn để lọc nước" > voice_profile/reference.txt
+          printf '%s\n' "cũng có những lời nói dối chỉ để người mình yêu thương được yên lòng" > voice_profile/reference.txt
 
           echo "Reference transcript:"
           cat voice_profile/reference.txt
@@ -252,7 +252,7 @@ jobs:
 
               "method": "zero-shot voice cloning",
 
-              "source_audio": "audio2.mp3",
+              "source_audio": "audio3.mp3",
 
               "reference_audio": (
                   "voice_profile/reference.wav"
