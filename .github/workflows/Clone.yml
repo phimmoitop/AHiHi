@@ -167,7 +167,10 @@ jobs:
           print("Initializing VieNeu")
           print("======================================")
 
-          tts = Vieneu()
+          # IMPORTANT: the default codec (neucodec-onnx-decoder-int8) can
+          # only DECODE, not ENCODE. encode_reference() requires the full
+          # PyTorch codec "neuphonic/neucodec".
+          tts = Vieneu(codec_repo="neuphonic/neucodec")
 
           print("")
           print("Encoding reference voice...")
