@@ -51,6 +51,7 @@ jobs:
 
           pip install \
             "vieneu==2.7.0" \
+            neucodec \
             numpy \
             soundfile \
             pydub \
