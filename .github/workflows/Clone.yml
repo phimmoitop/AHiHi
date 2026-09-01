@@ -1,0 +1,414 @@
+name: Clone Voice Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_audio_path:
+        description: "File audio gốc chứa giọng cần clone"
+        required: true
+        default: "audio1.mp3"
+
+      ref_text:
+        description: "Transcript CHÍNH XÁC của đoạn reference được dùng để clone"
+        required: true
+        default: ""
+
+      clip_seconds:
+        description: "Độ dài reference tối đa (khuyến nghị 5-8 giây)"
+        required: true
+        default: "8"
+
+      voice_name:
+        description: "Tên profile giọng"
+        required: true
+        default: "my_voice"
+
+permissions:
+  contents: write
+
+jobs:
+  clone-voice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout repository
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 2. Python
+      # ------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ------------------------------------------------------------
+      # 3. FFmpeg
+      # ------------------------------------------------------------
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      # ------------------------------------------------------------
+      # 4. Install dependencies
+      #
+      # Pin VieNeu version so that the encoded profile remains
+      # associated with a known SDK/model implementation.
+      # ------------------------------------------------------------
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "vieneu==2.7.0" pydub numpy soundfile
+
+      # ------------------------------------------------------------
+      # 5. Verify source audio
+      # ------------------------------------------------------------
+      - name: Verify source audio
+        env:
+          SOURCE_AUDIO: ${{ inputs.source_audio_path }}
+        run: |
+          if [ ! -f "$SOURCE_AUDIO" ]; then
+            echo "::error::Không tìm thấy file '$SOURCE_AUDIO'."
+            echo "Hãy upload audio1.mp3 vào repository trước khi chạy workflow."
+            exit 1
+          fi
+
+          echo "Found source audio:"
+          ls -lh "$SOURCE_AUDIO"
+
+      # ------------------------------------------------------------
+      # 6. Validate ref text
+      # ------------------------------------------------------------
+      - name: Validate reference transcript
+        env:
+          REF_TEXT: ${{ inputs.ref_text }}
+        run: |
+          if [ -z "$REF_TEXT" ]; then
+            echo "::error::ref_text không được để trống."
+            echo "Transcript phải khớp chính xác với đoạn audio reference."
+            exit 1
+          fi
+
+          echo "Reference transcript:"
+          echo "$REF_TEXT"
+
+      # ------------------------------------------------------------
+      # 7. Prepare reference audio
+      #
+      # The source can be longer (e.g. 30-60 seconds).
+      # We create a clean mono WAV and take at most N seconds.
+      #
+      # IMPORTANT:
+      # This is deliberately conservative:
+      # - remove leading/trailing silence
+      # - mono
+      # - 16-bit
+      #
+      # VieNeu itself performs reference processing during cloning.
+      # We don't aggressively denoise here because excessive
+      # preprocessing can damage the speaker characteristics.
+      # ------------------------------------------------------------
+      - name: Prepare reference audio
+        env:
+          SOURCE_AUDIO: ${{ inputs.source_audio_path }}
+          CLIP_SECONDS: ${{ inputs.clip_seconds }}
+          REF_TEXT: ${{ inputs.ref_text }}
+          VOICE_NAME: ${{ inputs.voice_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import datetime
+          from pathlib import Path
+
+          from pydub import AudioSegment, silence
+
+          source = os.environ["SOURCE_AUDIO"]
+          clip_seconds = float(os.environ.get("CLIP_SECONDS", "8"))
+          ref_text = os.environ["REF_TEXT"].strip()
+          voice_name = os.environ["VOICE_NAME"].strip()
+
+          if clip_seconds < 3:
+              raise SystemExit("clip_seconds phải >= 3 giây.")
+
+          if clip_seconds > 8:
+              print("Cảnh báo: VieNeu khuyến nghị reference ngắn; giới hạn ở 8 giây.")
+              clip_seconds = 8
+
+          out_dir = Path("voice_profile")
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          print(f"Loading: {source}")
+
+          audio = AudioSegment.from_file(source)
+
+          print(
+              f"Original audio: "
+              f"{len(audio) / 1000:.2f}s, "
+              f"{audio.frame_rate}Hz, "
+              f"{audio.channels} channels"
+          )
+
+          # Convert to mono / 16-bit.
+          # Do NOT force 24kHz here because the current VieNeu SDK
+          # handles reference resampling internally.
+          audio = (
+              audio
+              .set_channels(1)
+              .set_sample_width(2)
+          )
+
+          # Remove leading/trailing silence only.
+          # Do not remove internal pauses because that can alter
+          # the natural speech pattern.
+          try:
+              start = silence.detect_leading_silence(
+                  audio,
+                  silence_threshold=-40,
+                  chunk_size=10,
+              )
+
+              end = silence.detect_leading_silence(
+                  audio.reverse(),
+                  silence_threshold=-40,
+                  chunk_size=10,
+              )
+
+              if start + end < len(audio):
+                  trimmed = audio[start:len(audio) - end]
+              else:
+                  trimmed = audio
+
+          except Exception as e:
+              print(f"Silence detection warning: {e}")
+              trimmed = audio
+
+          max_ms = int(clip_seconds * 1000)
+
+          if len(trimmed) > max_ms:
+              print(
+                  f"Reference is longer than {clip_seconds}s. "
+                  f"Taking the first {clip_seconds}s after trimming."
+              )
+              trimmed = trimmed[:max_ms]
+
+          duration = len(trimmed) / 1000
+
+          if duration < 3:
+              raise SystemExit(
+                  f"Reference chỉ còn {duration:.2f}s. "
+                  "Cần ít nhất khoảng 3 giây speech rõ ràng."
+              )
+
+          reference_path = out_dir / "reference.wav"
+
+          trimmed.export(
+              reference_path,
+              format="wav",
+              parameters=[
+                  "-ac", "1",
+                  "-sample_fmt", "s16",
+              ],
+          )
+
+          # Save exact transcript.
+          transcript_path = out_dir / "reference.txt"
+          transcript_path.write_text(
+              ref_text,
+              encoding="utf-8"
+          )
+
+          profile = {
+              "voice_name": voice_name,
+              "source_audio": source,
+              "reference_audio": str(reference_path),
+              "reference_text_file": str(transcript_path),
+              "reference_duration_seconds": round(duration, 3),
+              "source_duration_seconds": round(len(audio) / 1000, 3),
+              "created_at": datetime.datetime.now(
+                  datetime.timezone.utc
+              ).isoformat(),
+              "sdk": "vieneu",
+              "sdk_version": "2.7.0",
+              "profile_format": "numpy_voice_codes",
+              "note": (
+                  "Zero-shot voice cloning profile. "
+                  "This is not a fine-tuned model."
+              ),
+          }
+
+          with open(
+              out_dir / "profile.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  profile,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print(f"Reference saved: {reference_path}")
+          print(f"Duration: {duration:.2f}s")
+          print(f"Profile directory: {out_dir}")
+          PY
+
+      # ------------------------------------------------------------
+      # 8. Encode voice reference
+      #
+      # This is the actual "profile creation" step.
+      # ------------------------------------------------------------
+      - name: Encode voice profile with VieNeu
+        env:
+          VOICE_NAME: ${{ inputs.voice_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import numpy as np
+
+          from vieneu import Vieneu
+
+          voice_name = os.environ["VOICE_NAME"]
+
+          reference_audio = "voice_profile/reference.wav"
+          output_codes = "voice_profile/voice_codes.npy"
+
+          print("Initializing VieNeu...")
+          tts = Vieneu()
+
+          print("Encoding reference voice...")
+          codes = tts.encode_reference(reference_audio)
+
+          # Convert torch tensor / numpy array to numpy.
+          if hasattr(codes, "detach"):
+              codes = codes.detach().cpu().numpy()
+          else:
+              codes = np.asarray(codes)
+
+          if codes.size == 0:
+              raise RuntimeError(
+                  "VieNeu returned an empty voice profile."
+              )
+
+          np.save(output_codes, codes)
+
+          print("Voice profile created.")
+          print(f"Shape: {codes.shape}")
+          print(f"Dtype: {codes.dtype}")
+          print(f"Saved: {output_codes}")
+
+          # Add technical information to profile.json.
+          profile_path = "voice_profile/profile.json"
+
+          with open(
+              profile_path,
+              "r",
+              encoding="utf-8"
+          ) as f:
+              profile = json.load(f)
+
+          profile["voice_name"] = voice_name
+          profile["codes_file"] = output_codes
+          profile["codes_shape"] = list(codes.shape)
+          profile["codes_dtype"] = str(codes.dtype)
+
+          with open(
+              profile_path,
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  profile,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+          PY
+
+      # ------------------------------------------------------------
+      # 9. Verify that the profile can actually synthesize speech
+      # ------------------------------------------------------------
+      - name: Test cloned voice
+        run: |
+          python - <<'PY'
+          import numpy as np
+          from vieneu import Vieneu
+
+          reference_text = open(
+              "voice_profile/reference.txt",
+              encoding="utf-8"
+          ).read().strip()
+
+          codes = np.load(
+              "voice_profile/voice_codes.npy"
+          )
+
+          tts = Vieneu()
+
+          test_sentences = [
+              "Xin chào, đây là bài kiểm tra giọng nói của tôi.",
+              "Hôm nay chúng ta sẽ cùng tìm hiểu một chủ đề rất thú vị.",
+              "Bạn có thể nghe thử xem giọng nói này có tự nhiên hay không.",
+              "Đây là giọng được tạo ra từ voice profile đã lưu.",
+              "Cảm ơn bạn đã lắng nghe và hẹn gặp lại trong những nội dung tiếp theo."
+          ]
+
+          for index, text in enumerate(test_sentences, start=1):
+
+              print(f"Generating test {index}: {text}")
+
+              audio = tts.infer(
+                  text=text,
+                  voice=codes,
+              )
+
+              output = f"voice_profile/test_{index}.wav"
+
+              tts.save(
+                  audio,
+                  output
+              )
+
+              print(f"Saved: {output}")
+
+          print("All voice tests completed successfully.")
+          PY
+
+      # ------------------------------------------------------------
+      # 10. Upload artifacts for listening
+      # ------------------------------------------------------------
+      - name: Upload voice profile test samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-profile-${{ inputs.voice_name }}
+          path: |
+            voice_profile/reference.wav
+            voice_profile/reference.txt
+            voice_profile/profile.json
+            voice_profile/voice_codes.npy
+            voice_profile/test_*.wav
+          retention-days: 30
+
+      # ------------------------------------------------------------
+      # 11. Commit profile into repository
+      # ------------------------------------------------------------
+      - name: Commit voice profile
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add voice_profile/
+
+          if git diff --cached --quiet; then
+            echo "Không có thay đổi để commit."
+          else
+            git commit -m "Create VieNeu voice profile"
+            git push
+          fi
