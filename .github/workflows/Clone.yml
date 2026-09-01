@@ -1,4 +1,4 @@
-name: Clone Voice Profile - VieNeu
+name: Clone Voice Profile
 
 on:
   workflow_dispatch:
@@ -126,9 +126,7 @@ jobs:
       # ============================================================
       - name: Save reference transcript
         run: |
-          cat > voice_profile/reference.txt <<'EOF'
-Ngươi có tha cho Thiên Lam Tông của chúng ta không, sẽ không đuổi cùng giết tận để khử Thiên Lam Tông chúng ta sao
-EOF
+          printf '%s\n' "Ngươi có tha cho Thiên Lam Tông của chúng ta không, sẽ không đuổi cùng giết tận để khử Thiên Lam Tông chúng ta sao" > voice_profile/reference.txt
 
           echo "Reference transcript:"
           cat voice_profile/reference.txt
@@ -281,6 +279,10 @@ EOF
       #
       # IMPORTANT:
       # Use ref_codes + ref_text.
+      #
+      # Test WAV files are written directly into the repository
+      # root (not into voice_profile/tests) so you can listen to
+      # them straight from the repo and delete manually afterwards.
       # ============================================================
       - name: Test cloned voice
         run: |
@@ -330,14 +332,8 @@ EOF
               "Cảm ơn bạn đã lắng nghe và hẹn gặp lại trong những nội dung tiếp theo."
           ]
 
-          output_dir = Path(
-              "voice_profile/tests"
-          )
-
-          output_dir.mkdir(
-              parents=True,
-              exist_ok=True
-          )
+          # Repo root, not voice_profile/tests
+          output_dir = Path(".")
 
           for index, text in enumerate(
               test_sentences,
@@ -384,99 +380,111 @@ EOF
       - name: Create profile README
         run: |
           cat > voice_profile/README.md <<'EOF'
-# VieNeu Voice Profile
+          # VieNeu Voice Profile
 
-This directory contains a zero-shot VieNeu voice profile.
+          This directory contains a zero-shot VieNeu voice profile.
 
-## Files
+          ## Files
 
-- `reference.wav` - cleaned reference audio
-- `reference.txt` - exact transcript of reference audio
-- `voice_codes.npy` - encoded VieNeu voice codes
-- `profile.json` - profile metadata
-- `tests/` - generated test samples
+          - `reference.wav` - cleaned reference audio
+          - `reference.txt` - exact transcript of reference audio
+          - `voice_codes.npy` - encoded VieNeu voice codes
+          - `profile.json` - profile metadata
 
-## Model
+          Test samples (`test_*.wav`) are generated in the repository
+          root on each run and are not tracked long-term here.
 
-VieNeu TTS 2.7.0
+          ## Model
 
-## Usage
+          VieNeu TTS 2.7.0
 
-Load `voice_codes.npy` and use it with:
+          ## Usage
 
-```python
-audio = tts.infer(
-    text="Nội dung cần đọc",
-    ref_codes=ref_codes,
-    ref_text=reference_text,
-)
-  # ============================================================
-  # 12. Upload test audio as GitHub Artifact
-  #
-  # Test WAV files are NOT committed into Git.
-  # ============================================================
-  - name: Upload test samples
-    uses: actions/upload-artifact@v4
-    with:
-      name: my-voice-vieneu-test
-      path: |
-        voice_profile/reference.wav
-        voice_profile/reference.txt
-        voice_profile/profile.json
-        voice_profile/voice_codes.npy
-        voice_profile/README.md
-        voice_profile/tests/*.wav
-      retention-days: 30
+          Load `voice_codes.npy` and use it with:
 
-  # ============================================================
-  # 13. Commit persistent voice profile
-  #
-  # We keep:
-  # - reference.wav
-  # - reference.txt
-  # - voice_codes.npy
-  # - profile.json
-  # - README.md
-  #
-  # We do NOT commit generated test WAVs.
-  # ============================================================
-  - name: Commit voice profile to repository
-    run: |
-      rm -rf voice_profile/tests
+          ```python
+          audio = tts.infer(
+              text="Nội dung cần đọc",
+              ref_codes=ref_codes,
+              ref_text=reference_text,
+          )
+          ```
+          EOF
 
-      git config user.name "github-actions[bot]"
-      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "README created:"
+          cat voice_profile/README.md
 
-      git add voice_profile/
+      # ============================================================
+      # 12. Upload test audio as GitHub Artifact
+      #
+      # Kept as an extra download option in Actions, in addition to
+      # the WAV files committed straight to the repo root.
+      # ============================================================
+      - name: Upload test samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-voice-vieneu-test
+          path: |
+            voice_profile/reference.wav
+            voice_profile/reference.txt
+            voice_profile/profile.json
+            voice_profile/voice_codes.npy
+            voice_profile/README.md
+            test_*.wav
+          retention-days: 30
 
-      if git diff --cached --quiet; then
-        echo "No profile changes detected."
-      else
-        git commit -m "Create VieNeu voice profile"
-        git push
-      fi
+      # ============================================================
+      # 13. Commit persistent voice profile + test samples
+      #
+      # We keep:
+      # - reference.wav
+      # - reference.txt
+      # - voice_codes.npy
+      # - profile.json
+      # - README.md
+      #
+      # We ALSO commit the test_*.wav files at the repo root, so
+      # you can listen to them directly and delete manually later.
+      # ============================================================
+      - name: Commit voice profile to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-  # ============================================================
-  # 14. Final summary
-  # ============================================================
-  - name: Final summary
-    run: |
-      echo ""
-      echo "=============================================="
-      echo "VOICE CLONING COMPLETED"
-      echo "=============================================="
-      echo ""
-      echo "Profile:"
-      echo "  voice_profile/voice_codes.npy"
-      echo ""
-      echo "Reference:"
-      echo "  voice_profile/reference.wav"
-      echo ""
-      echo "Transcript:"
-      echo "  voice_profile/reference.txt"
-      echo ""
-      echo "Metadata:"
-      echo "  voice_profile/profile.json"
-      echo ""
-      echo "The profile has been committed to the repository."
-      echo "=============================================="
+          git add voice_profile/
+          git add test_*.wav
+
+          if git diff --cached --quiet; then
+            echo "No profile changes detected."
+          else
+            git commit -m "Create VieNeu voice profile + test samples"
+            git push
+          fi
+
+      # ============================================================
+      # 14. Final summary
+      # ============================================================
+      - name: Final summary
+        run: |
+          echo ""
+          echo "=============================================="
+          echo "VOICE CLONING COMPLETED"
+          echo "=============================================="
+          echo ""
+          echo "Profile:"
+          echo "  voice_profile/voice_codes.npy"
+          echo ""
+          echo "Reference:"
+          echo "  voice_profile/reference.wav"
+          echo ""
+          echo "Transcript:"
+          echo "  voice_profile/reference.txt"
+          echo ""
+          echo "Metadata:"
+          echo "  voice_profile/profile.json"
+          echo ""
+          echo "Test samples (repo root):"
+          echo "  test_1.wav ... test_5.wav"
+          echo ""
+          echo "The profile and test samples have been committed to the repository."
+          echo "=============================================="
