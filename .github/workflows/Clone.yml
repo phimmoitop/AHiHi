@@ -49,6 +49,10 @@ jobs:
           pip install \
             torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
+          # Pin torchao: newer releases removed torchao.dtypes.nf4tensor,
+          # which torchtune (a neucodec dependency) still imports from.
+          pip install "torchao==0.12.0"
+
           pip install \
             "vieneu==2.7.0" \
             neucodec \
