@@ -134,7 +134,6 @@ jobs:
         env:
           BILIBILI_URL: ${{ inputs.url }}
         run: |
-      
           set -e
       
           echo "=========================================="
@@ -149,18 +148,17 @@ jobs:
           yt-dlp --version
       
           echo ""
-          echo "Trying Bilibili with browser-like headers..."
+          echo "Downloading..."
       
           yt-dlp \
             --no-playlist \
-            --no-warnings \
             --extractor-retries 5 \
             --fragment-retries 5 \
             --retries 5 \
             --socket-timeout 30 \
-            --http-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
-            --http-header "Referer: https://www.bilibili.com/" \
-            --http-header "Origin: https://www.bilibili.com" \
+            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
+            --add-header "Referer: https://www.bilibili.com/" \
+            --add-header "Origin: https://www.bilibili.com" \
             --merge-output-format mp4 \
             -f "bv*+ba/b" \
             -o "work/source.%(ext)s" \
