@@ -452,135 +452,94 @@ jobs:
           # ============================================================
 
           def ocr_image(image):
-
-              result = ocr.predict(
-                  image
-              )
-
+          
+              result = ocr.predict(image)
+          
               texts = []
               boxes = []
-
+          
               for page in result:
-
+          
+                  print("\n========== OCR RAW DEBUG ==========")
+                  print("TYPE:", type(page))
+          
+                  # PaddleOCR 3.x thường có export json
                   data = None
-
+          
                   try:
-
                       data = page.json
-
                       if callable(data):
                           data = data()
-
-                  except Exception:
-
-                      data = None
-
-                  if isinstance(
-                      data,
-                      str
-                  ):
-
+          
+                      print("page.json TYPE:", type(data))
+          
+                  except Exception as e:
+                      print("page.json ERROR:", repr(e))
+          
+                  if isinstance(data, str):
                       try:
-                          data = json.loads(
-                              data
-                          )
-
-                      except Exception:
+                          data = json.loads(data)
+                      except Exception as e:
+                          print("JSON LOAD ERROR:", repr(e))
                           data = None
-
-                  if data is None:
-
+          
+                  if not isinstance(data, dict):
+          
                       try:
                           data = page.res
-
-                      except Exception:
+                          print("page.res TYPE:", type(data))
+                      except Exception as e:
+                          print("page.res ERROR:", repr(e))
                           data = None
-
-                  if not isinstance(
-                      data,
-                      dict
-                  ):
+          
+                  if not isinstance(data, dict):
                       continue
-
-                  rec_texts = data.get(
-                      "rec_texts",
-                      []
-                  )
-
-                  rec_scores = data.get(
-                      "rec_scores",
-                      []
-                  )
-
-                  rec_polys = data.get(
-                      "rec_polys",
-                      []
-                  )
-
-                  for i, text in enumerate(
-                      rec_texts
-                  ):
-
-                      text = str(
-                          text
-                      ).strip()
-
+          
+                  print("KEYS:", list(data.keys()))
+          
+                  rec_texts = data.get("rec_texts", [])
+                  rec_scores = data.get("rec_scores", [])
+                  rec_polys = data.get("rec_polys", [])
+          
+                  print("rec_texts:", rec_texts)
+                  print("rec_scores:", rec_scores)
+          
+                  for i, text in enumerate(rec_texts):
+          
+                      text = str(text).strip()
+          
                       if not text:
                           continue
-
+          
                       score = 1.0
-
-                      if i < len(
-                          rec_scores
-                      ):
-
+          
+                      if i < len(rec_scores):
                           try:
-
-                              score = float(
-                                  rec_scores[i]
-                              )
-
+                              score = float(rec_scores[i])
                           except Exception:
                               pass
-
-                      if score < 0.40:
+          
+                      if score < 0.30:
                           continue
-
-                      if i >= len(
-                          rec_polys
-                      ):
+          
+                      if i >= len(rec_polys):
                           continue
-
-                      points = np.asarray(
-                          rec_polys[i]
-                      )
-
+          
+                      points = np.asarray(rec_polys[i])
+          
                       if points.ndim != 2:
                           continue
-
+          
                       if points.shape[1] != 2:
                           continue
-
-                      x1 = int(
-                          points[:, 0].min()
-                      )
-
-                      y1 = int(
-                          points[:, 1].min()
-                      )
-
-                      x2 = int(
-                          points[:, 0].max()
-                      )
-
-                      y2 = int(
-                          points[:, 1].max()
-                      )
-
-                      texts.append(
-                          text
-                      )
-
+          
+                      x1 = int(points[:, 0].min())
+                      y1 = int(points[:, 1].min())
+                      x2 = int(points[:, 0].max())
+                      y2 = int(points[:, 1].max())
+          
+                      texts.append(text)
+          
                       boxes.append(
                           (
                               x1,
@@ -589,11 +548,9 @@ jobs:
                               y2
                           )
                       )
+          
+              return texts, boxes
 
-              return (
-                  texts,
-                  boxes
-              )
 
 
           # ============================================================
