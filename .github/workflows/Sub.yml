@@ -460,49 +460,57 @@ jobs:
           
               for page in result:
           
-                  print("\n========== OCR RAW DEBUG ==========")
-                  print("TYPE:", type(page))
-          
-                  # PaddleOCR 3.x thường có export json
                   data = None
           
                   try:
                       data = page.json
+          
                       if callable(data):
                           data = data()
           
-                      print("page.json TYPE:", type(data))
-          
                   except Exception as e:
                       print("page.json ERROR:", repr(e))
+                      continue
           
                   if isinstance(data, str):
                       try:
                           data = json.loads(data)
-                      except Exception as e:
-                          print("JSON LOAD ERROR:", repr(e))
-                          data = None
-          
-                  if not isinstance(data, dict):
-          
-                      try:
-                          data = page.res
-                          print("page.res TYPE:", type(data))
-                      except Exception as e:
-                          print("page.res ERROR:", repr(e))
+                      except Exception:
                           data = None
           
                   if not isinstance(data, dict):
                       continue
           
-                  print("KEYS:", list(data.keys()))
+                  # ========================================================
+                  # PaddleOCR 3.x:
+                  #
+                  # page.json
+                  # {
+                  #     "res": {
+                  #         "rec_texts": [...],
+                  #         "rec_scores": [...],
+                  #         "rec_polys": [...]
+                  #     }
+                  # }
+                  # ========================================================
           
-                  rec_texts = data.get("rec_texts", [])
-                  rec_scores = data.get("rec_scores", [])
-                  rec_polys = data.get("rec_polys", [])
+                  if isinstance(data.get("res"), dict):
+                      data = data["res"]
           
-                  print("rec_texts:", rec_texts)
-                  print("rec_scores:", rec_scores)
+                  rec_texts = data.get(
+                      "rec_texts",
+                      []
+                  )
+          
+                  rec_scores = data.get(
+                      "rec_scores",
+                      []
+                  )
+          
+                  rec_polys = data.get(
+                      "rec_polys",
+                      []
+                  )
           
                   for i, text in enumerate(rec_texts):
           
@@ -515,7 +523,9 @@ jobs:
           
                       if i < len(rec_scores):
                           try:
-                              score = float(rec_scores[i])
+                              score = float(
+                                  rec_scores[i]
+                              )
                           except Exception:
                               pass
           
@@ -525,7 +535,9 @@ jobs:
                       if i >= len(rec_polys):
                           continue
           
-                      points = np.asarray(rec_polys[i])
+                      points = np.asarray(
+                          rec_polys[i]
+                      )
           
                       if points.ndim != 2:
                           continue
@@ -533,10 +545,21 @@ jobs:
                       if points.shape[1] != 2:
                           continue
           
-                      x1 = int(points[:, 0].min())
-                      y1 = int(points[:, 1].min())
-                      x2 = int(points[:, 0].max())
-                      y2 = int(points[:, 1].max())
+                      x1 = int(
+                          points[:, 0].min()
+                      )
+          
+                      y1 = int(
+                          points[:, 1].min()
+                      )
+          
+                      x2 = int(
+                          points[:, 0].max()
+                      )
+          
+                      y2 = int(
+                          points[:, 1].max()
+                      )
           
                       texts.append(text)
           
@@ -549,7 +572,11 @@ jobs:
                           )
                       )
           
-              return texts, boxes
+              return (
+                  texts,
+                  boxes
+              )
+
 
 
 
