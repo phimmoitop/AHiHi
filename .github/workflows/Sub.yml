@@ -1377,54 +1377,133 @@ jobs:
               ass,
               region
           ):
-
-              width = region[
-                  "width"
-              ]
-
-              height = region[
-                  "height"
-              ]
-
-              x1 = region["x1"]
-              y1 = region["y1"]
-              x2 = region["x2"]
-              y2 = region["y2"]
-
-              # Mở rộng một chút để xóa hết
-              # viền subtitle Trung.
-
+          
+              width = int(
+                  region["width"]
+              )
+          
+              height = int(
+                  region["height"]
+              )
+          
+              # ============================================================
+              # Original OCR region
+              # ============================================================
+          
+              x1 = int(region["x1"])
+              y1 = int(region["y1"])
+              x2 = int(region["x2"])
+              y2 = int(region["y2"])
+          
+              # ============================================================
+              # Expand slightly
+              # ============================================================
+          
               padx = int(
                   width * 0.012
               )
-
+          
               pady = int(
                   height * 0.010
               )
-
+          
               x1 = max(
                   0,
                   x1 - padx
               )
-
+          
               y1 = max(
                   0,
                   y1 - pady
               )
-
+          
               x2 = min(
-                  width,
+                  width - 2,
                   x2 + padx
               )
-
+          
               y2 = min(
-                  height,
+                  height - 2,
                   y2 + pady
               )
-
+          
+              # ============================================================
+              # Guarantee valid region
+              # ============================================================
+          
+              if x2 <= x1:
+                  raise RuntimeError(
+                      f"Invalid x region: "
+                      f"{x1} -> {x2}"
+                  )
+          
+              if y2 <= y1:
+                  raise RuntimeError(
+                      f"Invalid y region: "
+                      f"{y1} -> {y2}"
+                  )
+          
               w = x2 - x1
               h = y2 - y1
-
+          
+              # Extra safety for FFmpeg delogo
+              w = min(
+                  w,
+                  width - x1 - 2
+              )
+          
+              h = min(
+                  h,
+                  height - y1 - 2
+              )
+          
+              if w <= 0 or h <= 0:
+                  raise RuntimeError(
+                      f"Invalid delogo region: "
+                      f"x={x1}, "
+                      f"y={y1}, "
+                      f"w={w}, "
+                      f"h={h}, "
+                      f"video={width}x{height}"
+                  )
+          
+              print()
+              print(
+                  "=========================================="
+              )
+          
+              print(
+                  "DELLOGO REGION"
+              )
+          
+              print(
+                  f"x={x1}"
+              )
+          
+              print(
+                  f"y={y1}"
+              )
+          
+              print(
+                  f"w={w}"
+              )
+          
+              print(
+                  f"h={h}"
+              )
+          
+              print(
+                  f"Video={width}x{height}"
+              )
+          
+              print(
+                  "=========================================="
+              )
+          
+              # ============================================================
+              # ASS path
+              # ============================================================
+          
               ass_path = (
                   str(ass)
                   .replace(
@@ -1440,7 +1519,11 @@ jobs:
                       "\\'"
                   )
               )
-
+          
+              # ============================================================
+              # Filter
+              # ============================================================
+          
               video_filter = (
                   f"delogo="
                   f"x={x1}:"
@@ -1450,77 +1533,79 @@ jobs:
                   f"show=0,"
                   f"ass='{ass_path}'"
               )
-
+          
               output = (
                   OUTPUT
                   /
                   "video_vi.mp4"
               )
-
+          
               command = [
+          
                   "ffmpeg",
-
+          
                   "-hide_banner",
-
+          
                   "-y",
-
+          
                   "-i",
                   str(VIDEO),
-
+          
                   "-vf",
                   video_filter,
-
+          
                   "-map",
                   "0:v:0",
-
+          
                   "-map",
                   "0:a?",
-
+          
                   "-c:v",
                   "libx264",
-
+          
                   "-preset",
                   "veryfast",
-
+          
                   "-crf",
                   "21",
-
+          
                   "-pix_fmt",
                   "yuv420p",
-
+          
                   "-c:a",
                   "aac",
-
+          
                   "-b:a",
                   "192k",
-
+          
                   "-movflags",
                   "+faststart",
-
+          
                   str(output)
               ]
-
+          
               print()
               print(
                   "=========================================="
               )
-
+          
               print(
                   "Rendering final video"
               )
-
+          
               print(
                   "=========================================="
               )
-
+          
               print()
-
+          
               subprocess.run(
                   command,
                   check=True
               )
-
+          
               return output
+
 
 
           # ============================================================
