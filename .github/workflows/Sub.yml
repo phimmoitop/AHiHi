@@ -72,6 +72,15 @@ jobs:
             libgl1 \
             libglib2.0-0
 
+          echo ""
+          echo "=========================================="
+          echo "AVAILABLE FONTS"
+          echo "=========================================="
+
+          fc-list | grep -Ei \
+            "Oward|Noto Sans CJK|DejaVu Sans" \
+            | head -30 || true
+
 
       # ==========================================================
       # PYTHON PACKAGES
@@ -298,6 +307,68 @@ jobs:
               )
           )
 
+          # ============================================================
+          # SUBTITLE STYLE
+          # ============================================================
+
+          # Font mặc định.
+          #
+          # Nếu Oward được cài trong runner thì dùng Oward.
+          # Nếu không có -> Noto Sans CJK SC.
+          #
+          FONT_SIZE = 25
+
+          # Khoảng cách giữa các ký tự.
+          #
+          # Giá trị âm = chữ sát nhau hơn.
+          #
+          LETTER_SPACING = -1
+
+          # Viền chữ.
+          OUTLINE_SIZE = 2
+
+          # Shadow.
+          SHADOW_SIZE = 0
+
+          # Khoảng cách subtitle với đáy video.
+          #
+          # Đây KHÔNG phải vị trí blur.
+          # Chỉ dùng để render text.
+          SUBTITLE_BOTTOM_MARGIN = 25
+
+          # ============================================================
+          # BLUR CONFIG
+          # ============================================================
+
+          # Padding ngang thêm vào vùng blur.
+          #
+          # Subtitle dài nhất:
+          #
+          # [----------- subtitle -----------]
+          #
+          # Blur:
+          #
+          # [ + padding | subtitle | padding + ]
+          #
+          BLUR_PAD_X_RATIO = 0.012
+
+          # Padding dọc.
+          #
+          # Chỉ cao hơn subtitle một chút.
+          BLUR_PAD_Y_RATIO = 0.008
+
+          # Độ mạnh blur.
+          #
+          # 8-14 thường đẹp.
+          #
+          BLUR_SIGMA = 9
+
+          # Không cho blur chạm đáy video.
+          #
+          # Nếu subtitle thực tế nằm cao hơn đáy,
+          # vùng blur sẽ giữ nguyên khoảng cách đó.
+          MIN_BOTTOM_GAP = 8
+
 
           # ============================================================
           # FFPROBE
@@ -307,6 +378,7 @@ jobs:
 
               command = [
                   "ffprobe",
+
                   "-hide_banner",
                   "-v",
                   "error",
@@ -373,7 +445,7 @@ jobs:
 
 
           # ============================================================
-          # DECODE ONE FRAME USING FFMPEG
+          # DECODE ONE FRAME
           # ============================================================
 
           def get_frame(
@@ -452,117 +524,131 @@ jobs:
           # ============================================================
 
           def ocr_image(image):
-          
+
               result = ocr.predict(image)
-          
+
               texts = []
               boxes = []
-          
+
               for page in result:
-          
+
                   data = None
-          
+
                   try:
+
                       data = page.json
-          
+
                       if callable(data):
                           data = data()
-          
+
                   except Exception as e:
-                      print("page.json ERROR:", repr(e))
+
+                      print(
+                          "page.json ERROR:",
+                          repr(e)
+                      )
+
                       continue
-          
+
                   if isinstance(data, str):
+
                       try:
                           data = json.loads(data)
+
                       except Exception:
                           data = None
-          
+
                   if not isinstance(data, dict):
                       continue
-          
-                  # ========================================================
-                  # PaddleOCR 3.x:
-                  #
-                  # page.json
-                  # {
-                  #     "res": {
-                  #         "rec_texts": [...],
-                  #         "rec_scores": [...],
-                  #         "rec_polys": [...]
-                  #     }
-                  # }
-                  # ========================================================
-          
-                  if isinstance(data.get("res"), dict):
+
+                  # ====================================================
+                  # PaddleOCR 3.x
+                  # ====================================================
+
+                  if isinstance(
+                      data.get("res"),
+                      dict
+                  ):
+
                       data = data["res"]
-          
+
                   rec_texts = data.get(
                       "rec_texts",
                       []
                   )
-          
+
                   rec_scores = data.get(
                       "rec_scores",
                       []
                   )
-          
+
                   rec_polys = data.get(
                       "rec_polys",
                       []
                   )
-          
-                  for i, text in enumerate(rec_texts):
-          
-                      text = str(text).strip()
-          
+
+                  for i, text in enumerate(
+                      rec_texts
+                  ):
+
+                      text = str(
+                          text
+                      ).strip()
+
                       if not text:
                           continue
-          
+
                       score = 1.0
-          
-                      if i < len(rec_scores):
+
+                      if i < len(
+                          rec_scores
+                      ):
+
                           try:
+
                               score = float(
                                   rec_scores[i]
                               )
+
                           except Exception:
                               pass
-          
+
                       if score < 0.30:
                           continue
-          
-                      if i >= len(rec_polys):
+
+                      if i >= len(
+                          rec_polys
+                      ):
                           continue
-          
+
                       points = np.asarray(
                           rec_polys[i]
                       )
-          
+
                       if points.ndim != 2:
                           continue
-          
+
                       if points.shape[1] != 2:
                           continue
-          
+
                       x1 = int(
                           points[:, 0].min()
                       )
-          
+
                       y1 = int(
                           points[:, 1].min()
                       )
-          
+
                       x2 = int(
                           points[:, 0].max()
                       )
-          
+
                       y2 = int(
                           points[:, 1].max()
                       )
-          
+
                       texts.append(text)
-          
+
                       boxes.append(
                           (
                               x1,
@@ -571,13 +657,11 @@ jobs:
                               y2
                           )
                       )
-          
+
               return (
                   texts,
                   boxes
               )
-
-
 
 
           # ============================================================
@@ -595,7 +679,7 @@ jobs:
 
 
           # ============================================================
-          # FIND SUBTITLE REGION
+          # FIND INITIAL SUBTITLE REGION
           # ============================================================
 
           def find_subtitle_region():
@@ -628,9 +712,7 @@ jobs:
 
               print()
 
-              # Subtitle thường nằm ở
-              # phần 55-100% chiều cao.
-
+              # Subtitle thường nằm ở 55-100%.
               y0 = int(
                   height * 0.55
               )
@@ -707,13 +789,6 @@ jobs:
                       if box_height < 8:
                           continue
 
-                      # Subtitle score.
-                      #
-                      # Ưu tiên:
-                      # - nhiều chữ Trung
-                      # - chiều rộng lớn
-                      # - nằm thấp trong frame
-
                       bottom_score = (
                           yy2 / height
                       )
@@ -757,13 +832,24 @@ jobs:
 
                       x1, y1, x2, y2 = box
 
-                      # Padding
+                      # ==================================================
+                      # IMPORTANT:
+                      #
+                      # Không padding quá nhiều ở đây.
+                      #
+                      # Đặc biệt KHÔNG kéo y2 xuống 1080.
+                      # ==================================================
+
                       padx = int(
-                          width * 0.015
+                          width
+                          *
+                          BLUR_PAD_X_RATIO
                       )
 
                       pady = int(
-                          height * 0.015
+                          height
+                          *
+                          BLUR_PAD_Y_RATIO
                       )
 
                       x1 = max(
@@ -777,16 +863,17 @@ jobs:
                       )
 
                       x2 = min(
-                          width,
+                          width - 1,
                           x2 + padx
                       )
 
                       y2 = min(
-                          height,
+                          height - MIN_BOTTOM_GAP,
                           y2 + pady
                       )
 
                       region = {
+
                           "x1": x1,
                           "y1": y1,
                           "x2": x2,
@@ -810,7 +897,7 @@ jobs:
                       )
 
                       print(
-                          "SUBTITLE REGION FOUND"
+                          "INITIAL SUBTITLE REGION FOUND"
                       )
 
                       print(
@@ -841,10 +928,20 @@ jobs:
 
           # ============================================================
           # OCR WHOLE VIDEO
+          #
+          # IMPORTANT:
+          #
+          # Trong lúc OCR:
+          #
+          # 1. Lưu subtitle cues
+          # 2. Đồng thời lưu bbox của từng subtitle
+          #
+          # Sau đó lấy subtitle có WIDTH LỚN NHẤT
+          # làm kích thước vùng blur.
           # ============================================================
 
           def extract_subtitles(
-              region
+              initial_region
           ):
 
               (
@@ -854,10 +951,15 @@ jobs:
                   duration
               ) = probe_video()
 
-              x1 = region["x1"]
-              y1 = region["y1"]
-              x2 = region["x2"]
-              y2 = region["y2"]
+              # Initial OCR region chỉ dùng để tìm subtitle.
+              #
+              # Sau khi OCR toàn video, vùng blur sẽ được
+              # tính lại dựa trên subtitle dài nhất.
+
+              rx1 = initial_region["x1"]
+              ry1 = initial_region["y1"]
+              rx2 = initial_region["x2"]
+              ry2 = initial_region["y2"]
 
               samples = max(
                   1,
@@ -893,6 +995,12 @@ jobs:
 
               start_time = None
 
+              # ========================================================
+              # Geometry data
+              # ========================================================
+
+              subtitle_boxes = []
+
               for i in tqdm(
                   range(samples),
                   desc="OCR video"
@@ -914,28 +1022,91 @@ jobs:
                       continue
 
                   crop = frame[
-                      y1:y2,
-                      x1:x2
+                      ry1:ry2,
+                      rx1:rx2
                   ]
 
-                  texts, _ = (
+                  texts, boxes = (
                       ocr_image(crop)
                   )
 
                   valid = []
 
-                  for text in texts:
+                  for text, box in zip(
+                      texts,
+                      boxes
+                  ):
 
                       if chinese_count(
                           text
-                      ) >= 2:
+                      ) < 2:
+                          continue
 
-                          valid.append(
-                              text
+                      x1, y1, x2, y2 = box
+
+                      # Chuyển bbox từ crop
+                      # về tọa độ video.
+
+                      abs_x1 = (
+                          x1 + rx1
+                      )
+
+                      abs_y1 = (
+                          y1 + ry1
+                      )
+
+                      abs_x2 = (
+                          x2 + rx1
+                      )
+
+                      abs_y2 = (
+                          y2 + ry1
+                      )
+
+                      box_width = (
+                          abs_x2
+                          -
+                          abs_x1
+                      )
+
+                      box_height = (
+                          abs_y2
+                          -
+                          abs_y1
+                      )
+
+                      if box_width < 40:
+                          continue
+
+                      if box_height < 8:
+                          continue
+
+                      valid.append(
+                          (
+                              text,
+                              (
+                                  abs_x1,
+                                  abs_y1,
+                                  abs_x2,
+                                  abs_y2
+                              )
                           )
+                      )
+
+                  # ====================================================
+                  # Sort text boxes left → right
+                  #
+                  # Trường hợp subtitle bị OCR thành nhiều box.
+                  # ====================================================
+
+                  valid.sort(
+                      key=lambda item:
+                      item[1][0]
+                  )
 
                   text = " ".join(
-                      valid
+                      item[0]
+                      for item in valid
                   )
 
                   text = re.sub(
@@ -944,13 +1115,89 @@ jobs:
                       text
                   ).strip()
 
-                  # ------------------------------------
+                  # ====================================================
+                  # Geometry
+                  # ====================================================
+
+                  if valid:
+
+                      all_x1 = min(
+                          item[1][0]
+                          for item in valid
+                      )
+
+                      all_y1 = min(
+                          item[1][1]
+                          for item in valid
+                      )
+
+                      all_x2 = max(
+                          item[1][2]
+                          for item in valid
+                      )
+
+                      all_y2 = max(
+                          item[1][3]
+                          for item in valid
+                      )
+
+                      geometry = {
+
+                          "x1": all_x1,
+                          "y1": all_y1,
+                          "x2": all_x2,
+                          "y2": all_y2,
+
+                          "width":
+                              all_x2
+                              -
+                              all_x1,
+
+                          "height":
+                              all_y2
+                              -
+                              all_y1,
+
+                          "center_x":
+                              (
+                                  all_x1
+                                  +
+                                  all_x2
+                              )
+                              /
+                              2,
+
+                          "center_y":
+                              (
+                                  all_y1
+                                  +
+                                  all_y2
+                              )
+                              /
+                              2
+                      }
+
+                      subtitle_boxes.append(
+                          {
+                              "time":
+                                  current_time,
+
+                              "text":
+                                  text,
+
+                              "box":
+                                  geometry
+                          }
+                      )
+
+                  # ====================================================
                   # Subtitle changed
-                  # ------------------------------------
+                  # ====================================================
 
                   if text != previous_text:
 
-                      # Close previous subtitle
+                      # Close previous subtitle.
+
                       if (
                           previous_text
                           and
@@ -969,7 +1216,8 @@ jobs:
                                   previous_text
                           })
 
-                      # New subtitle
+                      # New subtitle.
+
                       if text:
 
                           previous_text = (
@@ -986,7 +1234,10 @@ jobs:
 
                           start_time = None
 
+              # ========================================================
               # Close last subtitle
+              # ========================================================
+
               if (
                   previous_text
                   and
@@ -1005,9 +1256,9 @@ jobs:
                           previous_text
                   })
 
-              # ------------------------------------
+              # ========================================================
               # Cleanup
-              # ------------------------------------
+              # ========================================================
 
               cleaned = []
 
@@ -1063,7 +1314,398 @@ jobs:
                   f"{len(cleaned)}"
               )
 
-              return cleaned
+              # ========================================================
+              # FIND LONGEST SUBTITLE
+              # ========================================================
+
+              if not subtitle_boxes:
+
+                  raise RuntimeError(
+                      "Không có geometry subtitle."
+                  )
+
+              longest = max(
+                  subtitle_boxes,
+                  key=lambda item:
+                  item["box"]["width"]
+              )
+
+              longest_box = (
+                  longest["box"]
+              )
+
+              print()
+              print(
+                  "=========================================="
+              )
+
+              print(
+                  "LONGEST SUBTITLE"
+              )
+
+              print(
+                  "Text:",
+                  longest["text"]
+              )
+
+              print(
+                  "Time:",
+                  f'{longest["time"]:.2f}s'
+              )
+
+              print(
+                  "X:",
+                  longest_box["x1"],
+                  "->",
+                  longest_box["x2"]
+              )
+
+              print(
+                  "Y:",
+                  longest_box["y1"],
+                  "->",
+                  longest_box["y2"]
+              )
+
+              print(
+                  "Width:",
+                  longest_box["width"]
+              )
+
+              print(
+                  "Height:",
+                  longest_box["height"]
+              )
+
+              print(
+                  "=========================================="
+              )
+
+              print()
+
+              # ========================================================
+              # Build final blur region
+              #
+              # CHIỀU DÀI:
+              #     = subtitle dài nhất
+              #       + padding hai bên
+              #
+              # CHIỀU CAO:
+              #     = subtitle cao nhất
+              #       + padding nhỏ
+              #
+              # VỊ TRÍ:
+              #     = vị trí subtitle thực tế
+              #
+              # Không kéo xuống đáy.
+              # ========================================================
+
+              max_width = max(
+                  item["box"]["width"]
+                  for item in subtitle_boxes
+              )
+
+              max_height = max(
+                  item["box"]["height"]
+                  for item in subtitle_boxes
+              )
+
+              # Subtitle dài nhất.
+
+              longest_width = (
+                  longest_box["width"]
+              )
+
+              # Nếu OCR có những subtitle
+              # bị lệch trái/phải giữa các frame,
+              # dùng width lớn nhất nhưng giữ tâm
+              # của subtitle dài nhất.
+
+              center_x = (
+                  longest_box["center_x"]
+              )
+
+              # Chiều rộng vùng blur.
+
+              blur_width = int(
+                  longest_width
+                  +
+                  (
+                      width
+                      *
+                      BLUR_PAD_X_RATIO
+                      *
+                      2
+                  )
+              )
+
+              # Chiều cao vùng blur.
+              #
+              # Dùng chiều cao lớn nhất của subtitle,
+              # không dùng chiều cao của crop.
+              blur_height = int(
+                  max_height
+                  +
+                  (
+                      height
+                      *
+                      BLUR_PAD_Y_RATIO
+                      *
+                      2
+                  )
+              )
+
+              # Đảm bảo không quá nhỏ.
+
+              blur_height = max(
+                  blur_height,
+                  20
+              )
+
+              # Tính x.
+
+              blur_x1 = int(
+                  center_x
+                  -
+                  blur_width / 2
+              )
+
+              blur_x2 = (
+                  blur_x1
+                  +
+                  blur_width
+              )
+
+              # ========================================================
+              # Vertical position
+              #
+              # Lấy median center_y của subtitle.
+              #
+              # Cách này tốt hơn việc mặc định:
+              # y = height - something
+              #
+              # Vì video của bạn có khoảng trống
+              # giữa subtitle và đáy.
+              # ========================================================
+
+              centers_y = [
+                  item["box"]["center_y"]
+                  for item in subtitle_boxes
+              ]
+
+              subtitle_center_y = float(
+                  np.median(
+                      centers_y
+                  )
+              )
+
+              blur_y1 = int(
+                  subtitle_center_y
+                  -
+                  blur_height / 2
+              )
+
+              blur_y2 = (
+                  blur_y1
+                  +
+                  blur_height
+              )
+
+              # ========================================================
+              # Clamp
+              # ========================================================
+
+              blur_x1 = max(
+                  0,
+                  blur_x1
+              )
+
+              blur_x2 = min(
+                  width,
+                  blur_x2
+              )
+
+              blur_y1 = max(
+                  0,
+                  blur_y1
+              )
+
+              # Quan trọng:
+              #
+              # Không cho vùng blur chạm đáy video.
+              #
+              # Nếu subtitle cách đáy 40px,
+              # blur vẫn sẽ cách đáy khoảng đó.
+              #
+              if blur_y2 > height - MIN_BOTTOM_GAP:
+
+                  shift_up = (
+                      blur_y2
+                      -
+                      (
+                          height
+                          -
+                          MIN_BOTTOM_GAP
+                      )
+                  )
+
+                  blur_y1 -= shift_up
+                  blur_y2 -= shift_up
+
+              blur_y1 = max(
+                  0,
+                  blur_y1
+              )
+
+              blur_y2 = min(
+                  height
+                  -
+                  MIN_BOTTOM_GAP,
+                  blur_y2
+              )
+
+              final_region = {
+
+                  "x1":
+                      int(blur_x1),
+
+                  "y1":
+                      int(blur_y1),
+
+                  "x2":
+                      int(blur_x2),
+
+                  "y2":
+                      int(blur_y2),
+
+                  "width":
+                      width,
+
+                  "height":
+                      height,
+
+                  "fps":
+                      fps,
+
+                  "found_at":
+                      initial_region[
+                          "found_at"
+                      ],
+
+                  "sample_text":
+                      initial_region[
+                          "sample_text"
+                      ],
+
+                  "longest_text":
+                      longest["text"],
+
+                  "longest_subtitle_width":
+                      int(longest_width),
+
+                  "longest_subtitle_height":
+                      int(max_height),
+
+                  "blur_width":
+                      int(
+                          blur_x2
+                          -
+                          blur_x1
+                      ),
+
+                  "blur_height":
+                      int(
+                          blur_y2
+                          -
+                          blur_y1
+                      ),
+
+                  "bottom_gap":
+                      int(
+                          height
+                          -
+                          blur_y2
+                      )
+              }
+
+              print()
+              print(
+                  "=========================================="
+              )
+
+              print(
+                  "FINAL BLUR REGION"
+              )
+
+              print(
+                  "=========================================="
+              )
+
+              print(
+                  f"x1 = {blur_x1}"
+              )
+
+              print(
+                  f"y1 = {blur_y1}"
+              )
+
+              print(
+                  f"x2 = {blur_x2}"
+              )
+
+              print(
+                  f"y2 = {blur_y2}"
+              )
+
+              print()
+
+              print(
+                  f"Blur width  = "
+                  f"{blur_x2 - blur_x1}"
+              )
+
+              print(
+                  f"Blur height = "
+                  f"{blur_y2 - blur_y1}"
+              )
+
+              print()
+
+              print(
+                  f"Bottom gap  = "
+                  f"{height - blur_y2}px"
+              )
+
+              print()
+
+              print(
+                  "Longest subtitle:"
+              )
+
+              print(
+                  longest["text"]
+              )
+
+              print(
+                  "Longest width:",
+                  longest_width
+              )
+
+              print(
+                  "Max subtitle height:",
+                  max_height
+              )
+
+              print(
+                  "=========================================="
+              )
+
+              print()
+
+              return (
+                  cleaned,
+                  final_region
+              )
 
 
           # ============================================================
@@ -1190,9 +1832,9 @@ jobs:
                       max_length=256
                   )
 
-                  with __import__(
-                      "torch"
-                  ).no_grad():
+                  import torch
+
+                  with torch.no_grad():
 
                       output = (
                           model.generate(
@@ -1218,13 +1860,11 @@ jobs:
 
                       vi = vi.strip()
 
-                      # Nếu model không dịch được,
-                      # giữ nguyên text để không mất cue.
-
                       if not vi:
                           vi = cue["text"]
 
                       results.append({
+
                           "start":
                               cue["start"],
 
@@ -1242,6 +1882,90 @@ jobs:
 
 
           # ============================================================
+          # FIND FONT
+          # ============================================================
+
+          def find_font():
+
+              candidates = [
+
+                  "Oward",
+
+                  "Oward.ttf",
+
+                  "Oward.otf",
+
+                  "Noto Sans CJK SC",
+
+                  "Noto Sans CJK TC",
+
+                  "Noto Sans CJK"
+
+              ]
+
+              # ========================================================
+              # Check fontconfig
+              # ========================================================
+
+              for candidate in candidates:
+
+                  try:
+
+                      result = subprocess.run(
+                          [
+                              "fc-match",
+                              "-f",
+                              "%{family}\\n",
+                              candidate
+                          ],
+
+                          stdout=subprocess.PIPE,
+
+                          stderr=subprocess.PIPE,
+
+                          text=True
+                      )
+
+                      family = (
+                          result.stdout
+                          .strip()
+                      )
+
+                      if not family:
+                          continue
+
+                      if (
+                          "Oward"
+                          in
+                          family
+                      ):
+
+                          print(
+                              "Font selected:",
+                              family
+                          )
+
+                          return family
+
+                  except Exception:
+                      pass
+
+              # ========================================================
+              # Noto fallback
+              # ========================================================
+
+              print(
+                  "Oward not found."
+              )
+
+              print(
+                  "Using Noto Sans CJK SC."
+              )
+
+              return "Noto Sans CJK SC"
+
+
+          # ============================================================
           # CREATE ASS
           # ============================================================
 
@@ -1250,34 +1974,66 @@ jobs:
               region
           ):
 
-              width = region[
-                  "width"
-              ]
+              width = int(
+                  region["width"]
+              )
 
-              height = region[
-                  "height"
-              ]
+              height = int(
+                  region["height"]
+              )
 
-              y2 = region[
-                  "y2"
-              ]
+              blur_y2 = int(
+                  region["y2"]
+              )
+
+              font_name = find_font()
+
+              print()
+              print(
+                  "=========================================="
+              )
+
+              print(
+                  "SUBTITLE STYLE"
+              )
+
+              print(
+                  f"Font: {font_name}"
+              )
+
+              print(
+                  f"Font size: {FONT_SIZE}"
+              )
+
+              print(
+                  f"Letter spacing: {LETTER_SPACING}"
+              )
+
+              print(
+                  f"Outline: {OUTLINE_SIZE}"
+              )
+
+              print(
+                  "=========================================="
+              )
+
+              print()
 
               subs = pysubs2.SSAFile()
 
               style = pysubs2.SSAStyle()
 
-              style.fontname = (
-                  "Noto Sans CJK SC"
-              )
+              style.fontname = font_name
 
-              style.fontsize = max(
-                  30,
-                  int(
-                      height
-                      *
-                      0.035
-                  )
-              )
+              # ========================================================
+              # FONT SIZE
+              # ========================================================
+
+              style.fontsize = FONT_SIZE
+
+              # ========================================================
+              # COLORS
+              # ========================================================
 
               style.primarycolor = (
                   pysubs2.Color(
@@ -1315,30 +2071,66 @@ jobs:
                   )
               )
 
-              style.outline = 3
+              # ========================================================
+              # TEXT OUTLINE
+              # ========================================================
 
-              style.shadow = 0
+              style.outline = OUTLINE_SIZE
 
-              # Bottom-center
+              style.shadow = SHADOW_SIZE
+
+              # ========================================================
+              # BOTTOM CENTER
+              # ========================================================
+
               style.alignment = 2
+
+              # ========================================================
+              # Margins
+              # ========================================================
 
               style.marginl = 30
               style.marginr = 30
 
-              # Giữ vị trí gần subtitle cũ.
-              style.marginv = max(
-                  15,
-                  height - y2
+              style.marginv = (
+                  SUBTITLE_BOTTOM_MARGIN
               )
 
               subs.styles[
                   "Default"
               ] = style
 
+              # ========================================================
+              # EVENTS
+              # ========================================================
+
               for cue in cues:
+
+                  vi = cue["vi"]
+
+                  # ====================================================
+                  # Force ASS rendering settings.
+                  #
+                  # \fsp-1:
+                  # chữ sát nhau hơn.
+                  #
+                  # \q2:
+                  # smart line wrapping.
+                  #
+                  # \N không được tự thêm ở đây.
+                  # ====================================================
+
+                  text = (
+                      "{\\fsp"
+                      f"{LETTER_SPACING}"
+                      "\\q2}"
+                      +
+                      vi
+                  )
 
                   subs.events.append(
                       pysubs2.SSAEvent(
+
                           start=int(
                               cue["start"]
                               *
@@ -1351,7 +2143,7 @@ jobs:
                               1000
                           ),
 
-                          text=cue["vi"]
+                          text=text
                       )
                   )
 
@@ -1371,139 +2163,159 @@ jobs:
 
           # ============================================================
           # RENDER
+          #
+          # Thay DELLOGO bằng blur thật.
+          #
+          # Pipeline:
+          #
+          # [source]
+          #      |
+          #      +--------------------+
+          #      |                    |
+          #      |                    |
+          #    main                blur copy
+          #                           |
+          #                         crop
+          #                           |
+          #                       boxblur
+          #                           |
+          #                           +------+
+          #                                  |
+          # main ------------------------- overlay
+          #                                  |
+          #                                ASS
+          #
+          # Kết quả:
+          # subtitle Trung cũ bị blur mềm,
+          # không phải interpolation của delogo.
           # ============================================================
 
           def render_video(
               ass,
               region
           ):
-          
+
               width = int(
                   region["width"]
               )
-          
+
               height = int(
                   region["height"]
               )
-          
-              # ============================================================
-              # Original OCR region
-              # ============================================================
-          
-              x1 = int(region["x1"])
-              y1 = int(region["y1"])
-              x2 = int(region["x2"])
-              y2 = int(region["y2"])
-          
-              # ============================================================
-              # Expand slightly
-              # ============================================================
-          
-              padx = int(
-                  width * 0.012
+
+              x1 = int(
+                  region["x1"]
               )
-          
-              pady = int(
-                  height * 0.010
+
+              y1 = int(
+                  region["y1"]
               )
-          
-              x1 = max(
-                  0,
-                  x1 - padx
+
+              x2 = int(
+                  region["x2"]
               )
-          
-              y1 = max(
-                  0,
-                  y1 - pady
+
+              y2 = int(
+                  region["y2"]
               )
-          
-              x2 = min(
-                  width - 2,
-                  x2 + padx
+
+              w = (
+                  x2
+                  -
+                  x1
               )
-          
-              y2 = min(
-                  height - 2,
-                  y2 + pady
+
+              h = (
+                  y2
+                  -
+                  y1
               )
-          
-              # ============================================================
-              # Guarantee valid region
-              # ============================================================
-          
-              if x2 <= x1:
+
+              # ========================================================
+              # Validate
+              # ========================================================
+
+              if x1 < 0:
                   raise RuntimeError(
-                      f"Invalid x region: "
-                      f"{x1} -> {x2}"
+                      f"Invalid x1={x1}"
                   )
-          
-              if y2 <= y1:
+
+              if y1 < 0:
                   raise RuntimeError(
-                      f"Invalid y region: "
-                      f"{y1} -> {y2}"
+                      f"Invalid y1={y1}"
                   )
-          
-              w = x2 - x1
-              h = y2 - y1
-          
-              # Extra safety for FFmpeg delogo
-              w = min(
-                  w,
-                  width - x1 - 2
-              )
-          
-              h = min(
-                  h,
-                  height - y1 - 2
-              )
-          
-              if w <= 0 or h <= 0:
+
+              if x2 > width:
                   raise RuntimeError(
-                      f"Invalid delogo region: "
-                      f"x={x1}, "
-                      f"y={y1}, "
-                      f"w={w}, "
-                      f"h={h}, "
-                      f"video={width}x{height}"
+                      f"Invalid x2={x2}, "
+                      f"video width={width}"
                   )
-          
+
+              if y2 > height:
+                  raise RuntimeError(
+                      f"Invalid y2={y2}, "
+                      f"video height={height}"
+                  )
+
+              if w <= 0:
+                  raise RuntimeError(
+                      f"Invalid blur width={w}"
+                  )
+
+              if h <= 0:
+                  raise RuntimeError(
+                      f"Invalid blur height={h}"
+                  )
+
+              if y2 >= height:
+                  raise RuntimeError(
+                      "Blur region unexpectedly "
+                      "touches bottom of frame."
+                  )
+
               print()
               print(
                   "=========================================="
               )
-          
+
               print(
-                  "DELLOGO REGION"
+                  "BLUR REGION"
               )
-          
+
               print(
                   f"x={x1}"
               )
-          
+
               print(
                   f"y={y1}"
               )
-          
+
               print(
                   f"w={w}"
               )
-          
+
               print(
                   f"h={h}"
               )
-          
+
               print(
-                  f"Video={width}x{height}"
+                  f"bottom gap={height - y2}px"
               )
-          
+
+              print(
+                  f"blur sigma={BLUR_SIGMA}"
+              )
+
               print(
                   "=========================================="
               )
-          
-              # ============================================================
+
+              print()
+
+              # ========================================================
               # ASS path
-              # ============================================================
-          
+              # ========================================================
+
               ass_path = (
                   str(ass)
                   .replace(
@@ -1519,93 +2331,140 @@ jobs:
                       "\\'"
                   )
               )
-          
-              # ============================================================
-              # Filter
-              # ============================================================
-          
+
+              # ========================================================
+              # Blur filter
+              #
+              # Dùng split thay vì delogo.
+              #
+              # crop chính xác vùng subtitle,
+              # blur vùng đó,
+              # overlay trở lại vị trí cũ.
+              # ========================================================
+
               video_filter = (
-                  f"delogo="
-                  f"x={x1}:"
-                  f"y={y1}:"
+
+                  "split=2"
+                  "[main][blur];"
+
+                  "[blur]"
+                  f"crop="
                   f"w={w}:"
                   f"h={h}:"
-                  f"show=0,"
+                  f"x={x1}:"
+                  f"y={y1},"
+
+                  f"boxblur="
+                  f"luma_radius={BLUR_SIGMA}:"
+                  f"luma_power=1:"
+                  f"chroma_radius={BLUR_SIGMA}:"
+                  f"chroma_power=1"
+                  "[blurred];"
+
+                  "[main]"
+                  "[blurred]"
+                  f"overlay="
+                  f"x={x1}:"
+                  f"y={y1}"
+                  ":eof_action=pass"
+                  "[clean];"
+
+                  "[clean]"
                   f"ass='{ass_path}'"
               )
-          
+
               output = (
                   OUTPUT
                   /
                   "video_vi.mp4"
               )
-          
-              command = [
-          
-                  "ffmpeg",
-          
-                  "-hide_banner",
-          
-                  "-y",
-          
-                  "-i",
-                  str(VIDEO),
-          
-                  "-vf",
-                  video_filter,
-          
-                  "-map",
-                  "0:v:0",
-          
-                  "-map",
-                  "0:a?",
-          
-                  "-c:v",
-                  "libx264",
-          
-                  "-preset",
-                  "veryfast",
-          
-                  "-crf",
-                  "21",
-          
-                  "-pix_fmt",
-                  "yuv420p",
-          
-                  "-c:a",
-                  "aac",
-          
-                  "-b:a",
-                  "192k",
-          
-                  "-movflags",
-                  "+faststart",
-          
-                  str(output)
-              ]
-          
+
+              # ========================================================
+              # Remove old output
+              # ========================================================
+
+              if output.exists():
+                  output.unlink()
+
               print()
               print(
                   "=========================================="
               )
-          
+
               print(
                   "Rendering final video"
               )
-          
+
               print(
                   "=========================================="
               )
-          
+
               print()
-          
+
+              command = [
+
+                  "ffmpeg",
+
+                  "-hide_banner",
+
+                  "-y",
+
+                  "-i",
+                  str(VIDEO),
+
+                  "-vf",
+                  video_filter,
+
+                  "-map",
+                  "0:v:0",
+
+                  "-map",
+                  "0:a?",
+
+                  "-c:v",
+                  "libx264",
+
+                  "-preset",
+                  "veryfast",
+
+                  "-crf",
+                  "21",
+
+                  "-pix_fmt",
+                  "yuv420p",
+
+                  "-c:a",
+                  "aac",
+
+                  "-b:a",
+                  "192k",
+
+                  "-movflags",
+                  "+faststart",
+
+                  str(output)
+              ]
+
               subprocess.run(
                   command,
                   check=True
               )
-          
-              return output
 
+              if not output.exists():
+
+                  raise RuntimeError(
+                      "FFmpeg không tạo được "
+                      "video output."
+                  )
+
+              if output.stat().st_size < 10000:
+
+                  raise RuntimeError(
+                      "Output video bất thường "
+                      "(file quá nhỏ)."
+                  )
+
+              return output
 
 
           # ============================================================
@@ -1627,13 +2486,36 @@ jobs:
                   duration
               ) = probe_video()
 
-              # --------------------------------------------
-              # 1. Find subtitle region
-              # --------------------------------------------
+              # ========================================================
+              # 1. Find initial subtitle region
+              # ========================================================
 
-              region = (
+              initial_region = (
                   find_subtitle_region()
               )
+
+              # ========================================================
+              # 2. OCR whole video
+              #
+              # Đồng thời tìm subtitle dài nhất.
+              # ========================================================
+
+              (
+                  cues,
+                  region
+              ) = extract_subtitles(
+                  initial_region
+              )
+
+              if not cues:
+
+                  raise RuntimeError(
+                      "OCR không tìm thấy subtitle."
+                  )
+
+              # ========================================================
+              # Save final region
+              # ========================================================
 
               region_file = (
                   WORK
@@ -1650,25 +2532,9 @@ jobs:
                   encoding="utf-8"
               )
 
-              # --------------------------------------------
-              # 2. OCR
-              # --------------------------------------------
-
-              cues = (
-                  extract_subtitles(
-                      region
-                  )
-              )
-
-              if not cues:
-
-                  raise RuntimeError(
-                      "OCR không tìm thấy subtitle."
-                  )
-
-              # --------------------------------------------
+              # ========================================================
               # 3. Chinese SRT
-              # --------------------------------------------
+              # ========================================================
 
               chinese_srt = (
                   WORK
@@ -1682,9 +2548,9 @@ jobs:
                   "text"
               )
 
-              # --------------------------------------------
+              # ========================================================
               # 4. Translate
-              # --------------------------------------------
+              # ========================================================
 
               translated = (
                   translate_cues(
@@ -1692,9 +2558,9 @@ jobs:
                   )
               )
 
-              # --------------------------------------------
+              # ========================================================
               # 5. Vietnamese SRT
-              # --------------------------------------------
+              # ========================================================
 
               vietnamese_srt = (
                   WORK
@@ -1708,9 +2574,9 @@ jobs:
                   "vi"
               )
 
-              # --------------------------------------------
+              # ========================================================
               # 6. ASS
-              # --------------------------------------------
+              # ========================================================
 
               ass = (
                   create_ass(
@@ -1719,9 +2585,9 @@ jobs:
                   )
               )
 
-              # --------------------------------------------
+              # ========================================================
               # 7. Render
-              # --------------------------------------------
+              # ========================================================
 
               output = (
                   render_video(
@@ -1729,6 +2595,10 @@ jobs:
                       region
                   )
               )
+
+              # ========================================================
+              # COMPLETE
+              # ========================================================
 
               print()
               print(
@@ -1742,6 +2612,8 @@ jobs:
               print(
                   "=========================================="
               )
+
+              print()
 
               print(
                   f"Video: {output}"
@@ -1757,6 +2629,20 @@ jobs:
 
               print(
                   f"Region: {region_file}"
+              )
+
+              print()
+
+              print(
+                  "FINAL REGION:"
+              )
+
+              print(
+                  json.dumps(
+                      region,
+                      ensure_ascii=False,
+                      indent=2
+                  )
               )
 
               print()
