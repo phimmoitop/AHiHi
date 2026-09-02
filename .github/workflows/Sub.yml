@@ -1,4 +1,4 @@
-name: Bilibili -> Vietnamese HardSub
+name: Bilibili → Vietnamese
 
 on:
   workflow_dispatch:
@@ -8,1047 +8,154 @@ on:
         required: true
         type: string
 
-      sample_seconds:
-        description: "Scan every N seconds to find first subtitle frame"
+      scan_seconds:
+        description: "Khoảng cách quét để tìm frame subtitle đầu tiên"
         required: false
         default: "1"
         type: string
 
       ocr_fps:
-        description: "OCR sampling FPS"
+        description: "FPS OCR. 2-3 là đủ cho subtitle thông thường"
         required: false
-        default: "3"
+        default: "2"
         type: string
-
-      output_resolution:
-        description: "Output resolution"
-        required: false
-        default: "original"
-        type: choice
-        options:
-          - original
-          - 1080p
-          - 720p
 
 jobs:
   process:
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
 
     steps:
 
-      # =========================================================
-      # 1. CHECKOUT
-      # =========================================================
+      # --------------------------------------------------
+      # CHECKOUT
+      # --------------------------------------------------
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
 
-      # =========================================================
-      # 2. SYSTEM PACKAGES
-      # =========================================================
+      # --------------------------------------------------
+      # PYTHON
+      # --------------------------------------------------
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+
+      # --------------------------------------------------
+      # SYSTEM
+      # --------------------------------------------------
+
       - name: Install system packages
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             ffmpeg \
-            fonts-noto-core \
             fonts-noto-cjk \
-            python3-dev \
-            build-essential
+            fonts-noto-core \
+            libgl1 \
+            libglib2.0-0
 
 
-      # =========================================================
-      # 3. PYTHON
-      # =========================================================
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
+      # --------------------------------------------------
+      # PYTHON PACKAGES
+      # --------------------------------------------------
 
-
-      # =========================================================
-      # 4. INSTALL PYTHON
-      # =========================================================
       - name: Install Python packages
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip
 
-          # PaddlePaddle CPU
           python -m pip install \
-            paddlepaddle==3.2.0 \
-            -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-
-          # OCR
-          python -m pip install "paddleocr>=3.0,<4"
-
-          # Video / subtitle processing
-          python -m pip install \
-            opencv-python-headless \
-            numpy \
-            pysubs2 \
-            pillow \
-            tqdm
-
-          # Translation
-          python -m pip install \
-            "transformers<5" \
-            sentencepiece \
-            torch \
-            safetensors
-
-          # Bilibili downloader
-          python -m pip install -U yt-dlp
+            -r requirements.txt
 
 
-      # =========================================================
-      # 5. PREPARE DIRECTORIES
-      # =========================================================
+      # --------------------------------------------------
+      # CREATE DIRECTORIES
+      # --------------------------------------------------
+
       - name: Prepare directories
         run: |
           mkdir -p work
           mkdir -p output
-          mkdir -p scripts
-          mkdir -p hf-cache
-
-          echo "URL=${{ inputs.url }}"
 
 
-      # =========================================================
-      # 6. DOWNLOAD VIDEO
-      # =========================================================
+      # --------------------------------------------------
+      # DOWNLOAD BILIBILI
+      # --------------------------------------------------
+
       - name: Download Bilibili video
         env:
-          VIDEO_URL: ${{ inputs.url }}
+          BILIBILI_URL: ${{ inputs.url }}
+
         run: |
+
+          echo "Downloading:"
+          echo "$BILIBILI_URL"
+
           yt-dlp \
             --no-playlist \
-            --restrict-filenames \
             --merge-output-format mp4 \
-            -f "bv*+ba/b" \
-            -o "work/source.%(ext)s" \
-            "$VIDEO_URL"
+            --format "bv*+ba/b" \
+            --output "work/source.%(ext)s" \
+            "$BILIBILI_URL"
 
-          echo "Downloaded:"
+          echo ""
+          echo "Downloaded files:"
           ls -lh work/
 
 
-      # =========================================================
-      # 7. CREATE PROCESSING SCRIPT
-      # =========================================================
-      - name: Create processing script
-        run: |
-          cat > scripts/process.py <<'PY'
-          import os
-          import re
-          import sys
-          import math
-          import json
-          import time
-          import shutil
-          import subprocess
-          from pathlib import Path
-
-          import cv2
-          import numpy as np
-          import pysubs2
-
-          from PIL import Image
-          from tqdm import tqdm
-
-          from paddleocr import PaddleOCR
-
-          from transformers import (
-              AutoTokenizer,
-              AutoModelForSeq2SeqLM
-          )
-
-
-          VIDEO = Path("work/source.mp4")
-          OUT_DIR = Path("output")
-          WORK = Path("work")
-
-          ZH_SRT = WORK / "chinese.srt"
-          VI_SRT = WORK / "vietnamese.srt"
-
-          MASK_DIR = WORK / "masks"
-
-          MODEL_NAME = "Helsinki-NLP/opus-mt-zh-vi"
-
-
-          # ---------------------------------------------------------
-          # Helpers
-          # ---------------------------------------------------------
-
-          def run(cmd, check=True):
-              print("\n$", " ".join(map(str, cmd)))
-
-              p = subprocess.run(
-                  cmd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True
-              )
-
-              print(p.stdout[-5000:])
-
-              if check and p.returncode != 0:
-                  raise RuntimeError(
-                      "Command failed: " + " ".join(map(str, cmd))
-                  )
-
-              return p
-
-
-          def ffprobe_value(args):
-              cmd = [
-                  "ffprobe",
-                  "-v", "error",
-                  *args
-              ]
-
-              return subprocess.check_output(
-                  cmd,
-                  text=True
-              ).strip()
-
-
-          def video_info():
-              width = int(ffprobe_value([
-                  "-select_streams", "v:0",
-                  "-show_entries", "stream=width",
-                  "-of", "csv=p=0",
-                  str(VIDEO)
-              ]))
-
-              height = int(ffprobe_value([
-                  "-select_streams", "v:0",
-                  "-show_entries", "stream=height",
-                  "-of", "csv=p=0",
-                  str(VIDEO)
-              ]))
-
-              fps_text = ffprobe_value([
-                  "-select_streams", "v:0",
-                  "-show_entries", "stream=r_frame_rate",
-                  "-of", "csv=p=0",
-                  str(VIDEO)
-              ])
-
-              a, b = fps_text.split("/")
-              fps = float(a) / float(b)
-
-              duration = float(ffprobe_value([
-                  "-show_entries", "format=duration",
-                  "-of", "default=noprint_wrappers=1:nokey=1",
-                  str(VIDEO)
-              ]))
-
-              return width, height, fps, duration
-
-
-          # ---------------------------------------------------------
-          # OCR
-          # ---------------------------------------------------------
-
-          print("Loading PaddleOCR...")
-
-          ocr = PaddleOCR(
-              lang="ch"
-          )
-
-
-          def ocr_image(image):
-              """
-              PaddleOCR 3.x result normalization.
-              Returns:
-                  [
-                    {
-                      "text": "...",
-                      "score": 0.95,
-                      "box": [x1,y1,x2,y2]
-                    }
-                  ]
-              """
-
-              result = ocr.predict(image)
-
-              items = []
-
-              for page in result:
-
-                  data = None
-
-                  # PaddleOCR 3.x
-                  if hasattr(page, "json"):
-                      try:
-                          data = page.json
-                      except Exception:
-                          data = None
-
-                  if callable(data):
-                      try:
-                          data = data()
-                      except Exception:
-                          data = None
-
-                  if isinstance(data, str):
-                      try:
-                          data = json.loads(data)
-                      except Exception:
-                          data = None
-
-                  if data is None and hasattr(page, "res"):
-                      data = page.res
-
-                  if data is None:
-                      continue
-
-                  if isinstance(data, dict):
-                      texts = data.get("rec_texts", [])
-                      scores = data.get("rec_scores", [])
-                      boxes = data.get("rec_polys", [])
-
-                      for i, text in enumerate(texts):
-
-                          if not text:
-                              continue
-
-                          score = (
-                              float(scores[i])
-                              if i < len(scores)
-                              else 1.0
-                          )
-
-                          if score < 0.45:
-                              continue
-
-                          if i < len(boxes):
-                              pts = np.array(
-                                  boxes[i],
-                                  dtype=np.float32
-                              )
-
-                              x1 = int(np.min(pts[:, 0]))
-                              y1 = int(np.min(pts[:, 1]))
-                              x2 = int(np.max(pts[:, 0]))
-                              y2 = int(np.max(pts[:, 1]))
-
-                              items.append({
-                                  "text": str(text).strip(),
-                                  "score": score,
-                                  "box": [x1, y1, x2, y2]
-                              })
-
-              return items
-
-
-          # ---------------------------------------------------------
-          # Find first frame containing subtitle
-          # ---------------------------------------------------------
-
-          def find_subtitle_region():
-
-              width, height, fps, duration = video_info()
-
-              print(
-                  f"Video: {width}x{height}, "
-                  f"{fps:.2f} FPS, "
-                  f"{duration:.1f}s"
-              )
-
-              cap = cv2.VideoCapture(str(VIDEO))
-
-              if not cap.isOpened():
-                  raise RuntimeError("Cannot open video")
-
-              # Search first 60 seconds.
-              search_end = min(duration, 60.0)
-
-              step = float(
-                  os.environ.get("SAMPLE_SECONDS", "1")
-              )
-
-              t = 0.0
-
-              while t < search_end:
-
-                  cap.set(
-                      cv2.CAP_PROP_POS_MSEC,
-                      t * 1000
-                  )
-
-                  ok, frame = cap.read()
-
-                  if not ok:
-                      t += step
-                      continue
-
-                  # Only inspect bottom 35%.
-                  y_start = int(height * 0.65)
-
-                  crop = frame[
-                      y_start:height,
-                      0:width
-                  ]
-
-                  print(
-                      f"Searching subtitle frame "
-                      f"{t:.1f}s..."
-                  )
-
-                  detections = ocr_image(crop)
-
-                  candidates = []
-
-                  for d in detections:
-
-                      text = d["text"].strip()
-
-                      # Require actual Chinese characters.
-                      chinese_count = len(
-                          re.findall(
-                              r"[\u3400-\u9fff]",
-                              text
-                          )
-                      )
-
-                      if chinese_count < 2:
-                          continue
-
-                      x1, y1, x2, y2 = d["box"]
-
-                      # Convert crop coordinates -> frame coords.
-                      y1 += y_start
-                      y2 += y_start
-
-                      box_h = y2 - y1
-                      box_w = x2 - x1
-
-                      if box_h < 8:
-                          continue
-
-                      if box_w < 30:
-                          continue
-
-                      candidates.append({
-                          "text": text,
-                          "score": d["score"],
-                          "box": [x1, y1, x2, y2]
-                      })
-
-                  if candidates:
-
-                      # Usually subtitle is the widest/lower text.
-                      candidates.sort(
-                          key=lambda d: (
-                              d["box"][2] - d["box"][0]
-                          ) * d["score"],
-                          reverse=True
-                      )
-
-                      chosen = candidates[0]
-
-                      x1, y1, x2, y2 = chosen["box"]
-
-                      # Expand the subtitle region.
-                      pad_x = int(width * 0.015)
-                      pad_y = int(height * 0.012)
-
-                      x1 = max(0, x1 - pad_x)
-                      y1 = max(0, y1 - pad_y)
-                      x2 = min(width, x2 + pad_x)
-                      y2 = min(height, y2 + pad_y)
-
-                      print("\nFOUND SUBTITLE")
-                      print("Text:", chosen["text"])
-                      print(
-                          "ROI:",
-                          x1, y1, x2, y2
-                      )
-
-                      cap.release()
-
-                      return {
-                          "x1": x1,
-                          "y1": y1,
-                          "x2": x2,
-                          "y2": y2,
-                          "frame_width": width,
-                          "frame_height": height,
-                          "found_at": t
-                      }
-
-                  t += step
-
-              cap.release()
-
-              raise RuntimeError(
-                  "Could not find Chinese subtitle "
-                  "in first 60 seconds."
-              )
-
-
-          REGION = find_subtitle_region()
-
-          (WORK / "subtitle_region.json").write_text(
-              json.dumps(REGION, ensure_ascii=False, indent=2),
-              encoding="utf-8"
-          )
-
-
-          # ---------------------------------------------------------
-          # Extract OCR
-          # ---------------------------------------------------------
-
-          width = REGION["frame_width"]
-          height = REGION["frame_height"]
-
-          x1 = REGION["x1"]
-          y1 = REGION["y1"]
-          x2 = REGION["x2"]
-          y2 = REGION["y2"]
-
-          cap = cv2.VideoCapture(str(VIDEO))
-
-          fps = cap.get(cv2.CAP_PROP_FPS)
-
-          duration = (
-              cap.get(cv2.CAP_PROP_FRAME_COUNT)
-              / fps
-          )
-
-          ocr_fps = float(
-              os.environ.get("OCR_FPS", "3")
-          )
-
-          frame_step = max(
-              1,
-              int(round(fps / ocr_fps))
-          )
-
-          print(
-              f"OCR FPS={ocr_fps}, "
-              f"frame step={frame_step}"
-          )
-
-
-          raw_cues = []
-
-          frame_index = 0
-
-          last_text = ""
-          last_start = None
-          last_box = None
-
-
-          while True:
-
-              ok, frame = cap.read()
-
-              if not ok:
-                  break
-
-              if frame_index % frame_step != 0:
-                  frame_index += 1
-                  continue
-
-              t = frame_index / fps
-
-              crop = frame[
-                  y1:y2,
-                  x1:x2
-              ]
-
-              detections = ocr_image(crop)
-
-              # Combine Chinese detections.
-              texts = []
-
-              for d in detections:
-
-                  text = d["text"].strip()
-
-                  chinese_count = len(
-                      re.findall(
-                          r"[\u3400-\u9fff]",
-                          text
-                      )
-                  )
-
-                  if chinese_count >= 2:
-
-                      texts.append(text)
-
-              text = " ".join(texts)
-
-              # Clean OCR noise.
-              text = re.sub(
-                  r"\s+",
-                  " ",
-                  text
-              ).strip()
-
-              # Remove duplicate exact strings.
-              if text == last_text:
-                  frame_index += 1
-                  continue
-
-              # Close previous cue.
-              if last_text:
-
-                  raw_cues.append({
-                      "start": last_start,
-                      "end": t,
-                      "text": last_text
-                  })
-
-              if text:
-
-                  last_text = text
-                  last_start = t
-
-              else:
-
-                  last_text = ""
-                  last_start = None
-
-              frame_index += 1
-
-
-          if last_text:
-
-              raw_cues.append({
-                  "start": last_start,
-                  "end": duration,
-                  "text": last_text
-              })
-
-
-          cap.release()
-
-
-          # ---------------------------------------------------------
-          # Merge very short OCR fragments
-          # ---------------------------------------------------------
-
-          cleaned = []
-
-          for cue in raw_cues:
-
-              if cue["end"] - cue["start"] < 0.15:
-                  continue
-
-              text = cue["text"]
-
-              # Remove obvious OCR garbage.
-              if len(text) < 2:
-                  continue
-
-              if cleaned:
-
-                  prev = cleaned[-1]
-
-                  if (
-                      cue["start"] - prev["end"] < 0.25
-                      and cue["text"] == prev["text"]
-                  ):
-                      prev["end"] = cue["end"]
-                      continue
-
-              cleaned.append(cue)
-
-
-          print(
-              f"OCR cues: {len(cleaned)}"
-          )
-
-
-          # ---------------------------------------------------------
-          # Write Chinese SRT
-          # ---------------------------------------------------------
-
-          subs = pysubs2.SSAFile()
-
-          for cue in cleaned:
-
-              start_ms = int(
-                  cue["start"] * 1000
-              )
-
-              end_ms = int(
-                  cue["end"] * 1000
-              )
-
-              subs.append(
-                  pysubs2.SSAEvent(
-                      start=start_ms,
-                      end=end_ms,
-                      text=cue["text"]
-                  )
-              )
-
-          subs.save(
-              str(ZH_SRT),
-              encoding="utf-8"
-          )
-
-
-          # ---------------------------------------------------------
-          # Translation
-          # ---------------------------------------------------------
-
-          print("\nLoading translation model...")
-
-          tokenizer = AutoTokenizer.from_pretrained(
-              MODEL_NAME,
-              cache_dir="hf-cache"
-          )
-
-          model = AutoModelForSeq2SeqLM.from_pretrained(
-              MODEL_NAME,
-              cache_dir="hf-cache"
-          )
-
-          model.eval()
-
-
-          def translate_batch(texts):
-
-              inputs = tokenizer(
-                  texts,
-                  return_tensors="pt",
-                  padding=True,
-                  truncation=True,
-                  max_length=256
-              )
-
-              outputs = model.generate(
-                  **inputs,
-                  max_length=256,
-                  num_beams=4,
-                  early_stopping=True
-              )
-
-              return tokenizer.batch_decode(
-                  outputs,
-                  skip_special_tokens=True
-              )
-
-
-          translated = []
-
-          BATCH = 8
-
-          for i in tqdm(
-              range(0, len(cleaned), BATCH),
-              desc="Translating"
-          ):
-
-              batch = cleaned[
-                  i:i+BATCH
-              ]
-
-              texts = [
-                  x["text"]
-                  for x in batch
-              ]
-
-              results = translate_batch(texts)
-
-              for cue, vi in zip(
-                  batch,
-                  results
-              ):
-
-                  translated.append({
-                      "start": cue["start"],
-                      "end": cue["end"],
-                      "zh": cue["text"],
-                      "vi": vi.strip()
-                  })
-
-
-          # ---------------------------------------------------------
-          # Write Vietnamese SRT
-          # ---------------------------------------------------------
-
-          vi_subs = pysubs2.SSAFile()
-
-          for cue in translated:
-
-              vi_subs.append(
-                  pysubs2.SSAEvent(
-                      start=int(
-                          cue["start"] * 1000
-                      ),
-                      end=int(
-                          cue["end"] * 1000
-                      ),
-                      text=cue["vi"]
-                  )
-              )
-
-          vi_subs.save(
-              str(VI_SRT),
-              encoding="utf-8"
-          )
-
-
-          # ---------------------------------------------------------
-          # ASS subtitle
-          # ---------------------------------------------------------
-
-          ASS = WORK / "vietnamese.ass"
-
-          ass = pysubs2.SSAFile()
-
-          ass.info["Title"] = "Vietnamese translation"
-
-          style = pysubs2.SSAStyle()
-
-          style.fontname = "Noto Sans CJK SC"
-
-          # Large readable subtitle.
-          style.fontsize = 52
-
-          style.primarycolor = pysubs2.Color(
-              255, 255, 255, 0
-          )
-
-          style.outlinecolor = pysubs2.Color(
-              0, 0, 0, 0
-          )
-
-          style.backcolor = pysubs2.Color(
-              0, 0, 0, 0
-          )
-
-          style.outline = 3
-          style.shadow = 0
-
-          style.alignment = 2
-
-          style.marginl = 30
-          style.marginr = 30
-
-          # Place subtitle around original subtitle position.
-          subtitle_center_y = (
-              (y1 + y2) // 2
-          )
-
-          # ASS Alignment 2 = bottom center.
-          # MarginV is calculated from bottom.
-          margin_v = max(
-              20,
-              height - y2 + int(height * 0.01)
-          )
-
-          style.marginv = margin_v
-
-          ass.styles["Default"] = style
-
-
-          for cue in translated:
-
-              event = pysubs2.SSAEvent(
-                  start=int(
-                      cue["start"] * 1000
-                  ),
-                  end=int(
-                      cue["end"] * 1000
-                  ),
-                  text=cue["vi"]
-              )
-
-              ass.events.append(event)
-
-
-          ass.save(
-              str(ASS),
-              encoding="utf-8"
-          )
-
-
-          # ---------------------------------------------------------
-          # Create subtitle mask video
-          #
-          # We don't simply put a black rectangle over the old
-          # subtitle. Instead we use FFmpeg delogo-like processing
-          # on the fixed subtitle region.
-          # ---------------------------------------------------------
-
-          MASK = WORK / "subtitle_mask.png"
-
-          mask = np.zeros(
-              (height, width),
-              dtype=np.uint8
-          )
-
-          # Expanded mask.
-          mx1 = max(0, x1 - int(width * 0.01))
-          my1 = max(0, y1 - int(height * 0.008))
-          mx2 = min(width, x2 + int(width * 0.01))
-          my2 = min(height, y2 + int(height * 0.008))
-
-          mask[my1:my2, mx1:mx2] = 255
-
-          cv2.imwrite(
-              str(MASK),
-              mask
-          )
-
-
-          # ---------------------------------------------------------
-          # Final rendering
-          #
-          # We use a fixed subtitle region because the user said
-          # the subtitle location never changes.
-          #
-          # delogo smooths/removes the old burned-in subtitle area.
-          # Then ASS renders Vietnamese.
-          # ---------------------------------------------------------
-
-          output = OUT_DIR / "video_vi.mp4"
-
-          # Build delogo rectangle.
-          delogo_x = mx1
-          delogo_y = my1
-          delogo_w = mx2 - mx1
-          delogo_h = my2 - my1
-
-          # Resolution option.
-          resolution = os.environ.get(
-              "OUTPUT_RESOLUTION",
-              "original"
-          )
-
-          vf_parts = []
-
-          # Remove old subtitle.
-          vf_parts.append(
-              "delogo="
-              f"x={delogo_x}:"
-              f"y={delogo_y}:"
-              f"w={delogo_w}:"
-              f"h={delogo_h}:"
-              "show=0"
-          )
-
-          # Render Vietnamese.
-          ass_path = str(ASS).replace(
-              "\\",
-              "/"
-          ).replace(
-              ":",
-              "\\:"
-          )
-
-          vf_parts.append(
-              f"ass='{ass_path}'"
-          )
-
-          if resolution == "1080p":
-              vf_parts.append(
-                  "scale=-2:1080"
-              )
-
-          elif resolution == "720p":
-              vf_parts.append(
-                  "scale=-2:720"
-              )
-
-          vf = ",".join(vf_parts)
-
-
-          cmd = [
-              "ffmpeg",
-              "-y",
-              "-i",
-              str(VIDEO),
-              "-vf",
-              vf,
-              "-map",
-              "0:v:0",
-              "-map",
-              "0:a?",
-              "-c:v",
-              "libx264",
-              "-preset",
-              "veryfast",
-              "-crf",
-              "20",
-              "-pix_fmt",
-              "yuv420p",
-              "-c:a",
-              "aac",
-              "-b:a",
-              "192k",
-              "-movflags",
-              "+faststart",
-              str(output)
-          ]
-
-          run(cmd)
-
-
-          # ---------------------------------------------------------
-          # Save metadata
-          # ---------------------------------------------------------
-
-          metadata = {
-              "video": str(VIDEO),
-              "region": REGION,
-              "ocr_cues": len(cleaned),
-              "translation_cues": len(translated),
-              "model": MODEL_NAME,
-              "output": str(output)
-          }
-
-          (OUT_DIR / "metadata.json").write_text(
-              json.dumps(
-                  metadata,
-                  ensure_ascii=False,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
-
-          print("\n====================================")
-          print("DONE")
-          print("====================================")
-          print("Chinese SRT :", ZH_SRT)
-          print("Vietnamese SRT:", VI_SRT)
-          print("Region      :", REGION)
-          print("Video       :", output)
-          PY
-
-
-      # =========================================================
-      # 8. RUN PROCESSING
-      # =========================================================
-      - name: OCR + Translate + Burn Vietnamese subtitle
+      # --------------------------------------------------
+      # PROCESS
+      # --------------------------------------------------
+
+      - name: OCR → Translate → Burn subtitle
         env:
-          SAMPLE_SECONDS: ${{ inputs.sample_seconds }}
+          SCAN_SECONDS: ${{ inputs.scan_seconds }}
           OCR_FPS: ${{ inputs.ocr_fps }}
-          OUTPUT_RESOLUTION: ${{ inputs.output_resolution }}
+
           PYTHONUNBUFFERED: "1"
+
+          HF_HOME: "${{ github.workspace }}/work/huggingface"
+
         run: |
-          python scripts/process.py
+
+          python process.py
 
 
-      # =========================================================
-      # 9. UPLOAD RESULT
-      # =========================================================
-      - name: Upload finished video
+      # --------------------------------------------------
+      # SHOW OUTPUT
+      # --------------------------------------------------
+
+      - name: Show output
+        run: |
+
+          echo "=============================="
+          echo "OUTPUT"
+          echo "=============================="
+
+          ls -lh output/
+          ls -lh work/*.srt 2>/dev/null || true
+
+
+      # --------------------------------------------------
+      # UPLOAD RESULT
+      # --------------------------------------------------
+
+      - name: Upload result
         uses: actions/upload-artifact@v4
+
         with:
           name: bilibili-vietnamese-result
+
           path: |
             output/video_vi.mp4
-            output/metadata.json
             work/chinese.srt
             work/vietnamese.srt
             work/subtitle_region.json
+
           retention-days: 7
