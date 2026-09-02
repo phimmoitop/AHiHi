@@ -125,7 +125,23 @@ jobs:
           echo "Files:"
           ls -la
 
-
+      - name: Prepare Bilibili cookies
+        env:
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
+        run: |
+          set -euo pipefail
+      
+          if [ -z "${BILIBILI_COOKIES:-}" ]; then
+            echo "::error::GitHub Secret BILIBILI_COOKIES chưa được cấu hình."
+            exit 1
+          fi
+      
+          printf '%s\n' "$BILIBILI_COOKIES" > work/cookies.txt
+      
+          chmod 600 work/cookies.txt
+      
+          echo "Bilibili cookie file created."
+          echo "Cookie lines: $(wc -l < work/cookies.txt)"
       # ==========================================
       # DOWNLOAD VIDEO
       # ==========================================
@@ -134,7 +150,7 @@ jobs:
         env:
           BILIBILI_URL: ${{ inputs.url }}
         run: |
-          set -e
+          set -euo pipefail
       
           echo "=========================================="
           echo "Bilibili download"
@@ -148,17 +164,15 @@ jobs:
           yt-dlp --version
       
           echo ""
-          echo "Downloading..."
+          echo "Testing Bilibili access..."
       
           yt-dlp \
+            --cookies work/cookies.txt \
             --no-playlist \
             --extractor-retries 5 \
             --fragment-retries 5 \
             --retries 5 \
             --socket-timeout 30 \
-            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
-            --add-header "Referer: https://www.bilibili.com/" \
-            --add-header "Origin: https://www.bilibili.com" \
             --merge-output-format mp4 \
             -f "bv*+ba/b" \
             -o "work/source.%(ext)s" \
@@ -170,6 +184,12 @@ jobs:
           echo "=========================================="
       
           ls -lh work/
+      
+          echo ""
+          echo "Removing cookies..."
+      
+          rm -f work/cookies.txt
+
 
 
 
