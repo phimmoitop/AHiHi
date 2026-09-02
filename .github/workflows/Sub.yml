@@ -1,4 +1,4 @@
-name: Bilibili → Vietnamese
+name: Bilibili AI Subtitle Translator
 
 on:
   workflow_dispatch:
@@ -9,13 +9,13 @@ on:
         type: string
 
       scan_seconds:
-        description: "Khoảng cách quét để tìm frame subtitle đầu tiên"
+        description: "Scan interval for finding subtitle position"
         required: false
         default: "1"
         type: string
 
       ocr_fps:
-        description: "FPS OCR. 2-3 là đủ cho subtitle thông thường"
+        description: "OCR FPS"
         required: false
         default: "2"
         type: string
@@ -28,17 +28,17 @@ jobs:
 
     steps:
 
-      # --------------------------------------------------
+      # ==========================================
       # CHECKOUT
-      # --------------------------------------------------
+      # ==========================================
 
       - name: Checkout repository
         uses: actions/checkout@v5
 
 
-      # --------------------------------------------------
+      # ==========================================
       # PYTHON
-      # --------------------------------------------------
+      # ==========================================
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -46,12 +46,13 @@ jobs:
           python-version: "3.10"
 
 
-      # --------------------------------------------------
-      # SYSTEM
-      # --------------------------------------------------
+      # ==========================================
+      # SYSTEM PACKAGES
+      # ==========================================
 
       - name: Install system packages
         run: |
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -62,31 +63,72 @@ jobs:
             libglib2.0-0
 
 
-      # --------------------------------------------------
-      # PYTHON PACKAGES
-      # --------------------------------------------------
+      # ==========================================
+      # PYTHON DEPENDENCIES
+      # ==========================================
 
-      - name: Install Python packages
+      - name: Install Python dependencies
         run: |
+
           python -m pip install --upgrade pip
 
           python -m pip install \
-            -r requirements.txt
+            yt-dlp \
+            numpy==1.26.4 \
+            opencv-python-headless==4.10.0.84 \
+            pillow \
+            tqdm \
+            pysubs2 \
+            sentencepiece \
+            safetensors \
+            torch==2.4.1 \
+            transformers==4.47.1
 
 
-      # --------------------------------------------------
+      # ==========================================
+      # PADDLEPADDLE
+      # ==========================================
+
+      - name: Install PaddlePaddle CPU
+        run: |
+
+          python -m pip install \
+            paddlepaddle==3.2.0 \
+            -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+
+      # ==========================================
+      # PADDLEOCR
+      # ==========================================
+
+      - name: Install PaddleOCR
+        run: |
+
+          python -m pip install \
+            paddleocr==3.3.2
+
+
+      # ==========================================
       # CREATE DIRECTORIES
-      # --------------------------------------------------
+      # ==========================================
 
       - name: Prepare directories
         run: |
+
           mkdir -p work
           mkdir -p output
 
+          echo "Workspace:"
+          pwd
 
-      # --------------------------------------------------
-      # DOWNLOAD BILIBILI
-      # --------------------------------------------------
+          echo ""
+          echo "Files:"
+          ls -la
+
+
+      # ==========================================
+      # DOWNLOAD VIDEO
+      # ==========================================
 
       - name: Download Bilibili video
         env:
@@ -94,32 +136,1252 @@ jobs:
 
         run: |
 
-          echo "Downloading:"
+          echo "=========================================="
+          echo "Bilibili URL"
+          echo "=========================================="
+
           echo "$BILIBILI_URL"
+
+          echo ""
+          echo "Downloading..."
 
           yt-dlp \
             --no-playlist \
             --merge-output-format mp4 \
-            --format "bv*+ba/b" \
-            --output "work/source.%(ext)s" \
+            -f "bv*+ba/b" \
+            -o "work/source.%(ext)s" \
             "$BILIBILI_URL"
 
           echo ""
-          echo "Downloaded files:"
+          echo "Downloaded:"
           ls -lh work/
 
 
-      # --------------------------------------------------
-      # PROCESS
-      # --------------------------------------------------
+      # ==========================================
+      # CREATE PYTHON PROCESSOR
+      # ==========================================
 
-      - name: OCR → Translate → Burn subtitle
+      - name: Create processor
+        run: |
+
+          cat > process.py <<'PY'
+
+          import os
+          import re
+          import json
+          import subprocess
+          from pathlib import Path
+
+          import cv2
+          import numpy as np
+          import pysubs2
+
+          from tqdm import tqdm
+
+          from paddleocr import PaddleOCR
+
+          from transformers import (
+              AutoTokenizer,
+              AutoModelForSeq2SeqLM
+          )
+
+
+          # ==================================================
+          # CONFIG
+          # ==================================================
+
+          WORK = Path("work")
+          OUTPUT = Path("output")
+
+          MODEL_NAME = (
+              "Helsinki-NLP/opus-mt-zh-vi"
+          )
+
+          SCAN_SECONDS = float(
+              os.environ.get(
+                  "SCAN_SECONDS",
+                  "1"
+              )
+          )
+
+          OCR_FPS = float(
+              os.environ.get(
+                  "OCR_FPS",
+                  "2"
+              )
+          )
+
+
+          # ==================================================
+          # FIND VIDEO
+          # ==================================================
+
+          def find_video():
+
+              files = list(
+                  WORK.glob("source.*")
+              )
+
+              valid = [
+                  f for f in files
+                  if f.suffix.lower()
+                  in (
+                      ".mp4",
+                      ".mkv",
+                      ".webm",
+                      ".mov",
+                      ".flv"
+                  )
+              ]
+
+              if not valid:
+
+                  raise RuntimeError(
+                      "Không tìm thấy video."
+                  )
+
+              return valid[0]
+
+
+          VIDEO = find_video()
+
+
+          # ==================================================
+          # FFPROBE
+          # ==================================================
+
+          def probe():
+
+              cmd = [
+                  "ffprobe",
+                  "-v",
+                  "error",
+                  "-show_entries",
+                  "stream=width,height,r_frame_rate",
+                  "-show_entries",
+                  "format=duration",
+                  "-of",
+                  "json",
+                  str(VIDEO)
+              ]
+
+              data = json.loads(
+                  subprocess.check_output(
+                      cmd,
+                      text=True
+                  )
+              )
+
+              stream = data[
+                  "streams"
+              ][0]
+
+              width = int(
+                  stream["width"]
+              )
+
+              height = int(
+                  stream["height"]
+              )
+
+              a, b = stream[
+                  "r_frame_rate"
+              ].split("/")
+
+              fps = (
+                  float(a)
+                  /
+                  float(b)
+              )
+
+              duration = float(
+                  data[
+                      "format"
+                  ][
+                      "duration"
+                  ]
+              )
+
+              return (
+                  width,
+                  height,
+                  fps,
+                  duration
+              )
+
+
+          # ==================================================
+          # OCR
+          # ==================================================
+
+          print(
+              "Loading PaddleOCR..."
+          )
+
+          ocr = PaddleOCR(
+              lang="ch"
+          )
+
+
+          def ocr_image(image):
+
+              result = ocr.predict(
+                  image
+              )
+
+              texts = []
+              boxes = []
+
+              for page in result:
+
+                  data = None
+
+                  try:
+
+                      data = page.json
+
+                      if callable(data):
+                          data = data()
+
+                  except Exception:
+                      data = None
+
+                  if isinstance(
+                      data,
+                      str
+                  ):
+
+                      try:
+                          data = json.loads(
+                              data
+                          )
+                      except Exception:
+                          data = None
+
+                  if data is None:
+
+                      try:
+                          data = page.res
+                      except Exception:
+                          data = None
+
+                  if not isinstance(
+                      data,
+                      dict
+                  ):
+                      continue
+
+                  rec_texts = data.get(
+                      "rec_texts",
+                      []
+                  )
+
+                  rec_scores = data.get(
+                      "rec_scores",
+                      []
+                  )
+
+                  rec_polys = data.get(
+                      "rec_polys",
+                      []
+                  )
+
+                  for i, text in enumerate(
+                      rec_texts
+                  ):
+
+                      text = str(
+                          text
+                      ).strip()
+
+                      if not text:
+                          continue
+
+                      score = 1.0
+
+                      if i < len(
+                          rec_scores
+                      ):
+
+                          try:
+                              score = float(
+                                  rec_scores[i]
+                              )
+                          except:
+                              pass
+
+                      if score < 0.40:
+                          continue
+
+                      if i >= len(
+                          rec_polys
+                      ):
+                          continue
+
+                      pts = np.asarray(
+                          rec_polys[i]
+                      )
+
+                      if pts.ndim != 2:
+                          continue
+
+                      if pts.shape[1] != 2:
+                          continue
+
+                      x1 = int(
+                          pts[:, 0].min()
+                      )
+
+                      y1 = int(
+                          pts[:, 1].min()
+                      )
+
+                      x2 = int(
+                          pts[:, 0].max()
+                      )
+
+                      y2 = int(
+                          pts[:, 1].max()
+                      )
+
+                      texts.append(
+                          text
+                      )
+
+                      boxes.append(
+                          (
+                              x1,
+                              y1,
+                              x2,
+                              y2
+                          )
+                      )
+
+              return (
+                  texts,
+                  boxes
+              )
+
+
+          # ==================================================
+          # FIND FIXED SUBTITLE REGION
+          # ==================================================
+
+          def find_region():
+
+              (
+                  width,
+                  height,
+                  fps,
+                  duration
+              ) = probe()
+
+              print(
+                  f"Video: "
+                  f"{width}x{height}"
+              )
+
+              print(
+                  f"FPS: {fps}"
+              )
+
+              print(
+                  f"Duration: "
+                  f"{duration:.2f}s"
+              )
+
+              cap = cv2.VideoCapture(
+                  str(VIDEO)
+              )
+
+              max_scan = min(
+                  duration,
+                  90
+              )
+
+              t = 0
+
+              while t <= max_scan:
+
+                  print(
+                      f"Scanning "
+                      f"{t:.1f}s"
+                  )
+
+                  cap.set(
+                      cv2.CAP_PROP_POS_MSEC,
+                      t * 1000
+                  )
+
+                  ok, frame = cap.read()
+
+                  if not ok:
+
+                      t += SCAN_SECONDS
+                      continue
+
+                  # Bottom 40%
+                  y0 = int(
+                      height * 0.60
+                  )
+
+                  crop = frame[
+                      y0:height,
+                      0:width
+                  ]
+
+                  texts, boxes = (
+                      ocr_image(
+                          crop
+                      )
+                  )
+
+                  candidates = []
+
+                  for text, box in zip(
+                      texts,
+                      boxes
+                  ):
+
+                      chinese = len(
+                          re.findall(
+                              r"[\u3400-\u9fff]",
+                              text
+                          )
+                      )
+
+                      if chinese < 2:
+                          continue
+
+                      x1, y1, x2, y2 = box
+
+                      y1 += y0
+                      y2 += y0
+
+                      bw = x2 - x1
+                      bh = y2 - y1
+
+                      if bw < 40:
+                          continue
+
+                      if bh < 8:
+                          continue
+
+                      candidates.append(
+                          (
+                              bw * chinese,
+                              text,
+                              (
+                                  x1,
+                                  y1,
+                                  x2,
+                                  y2
+                              )
+                          )
+                      )
+
+                  if candidates:
+
+                      candidates.sort(
+                          reverse=True
+                      )
+
+                      (
+                          score,
+                          text,
+                          box
+                      ) = candidates[0]
+
+                      x1, y1, x2, y2 = box
+
+                      padx = int(
+                          width * 0.015
+                      )
+
+                      pady = int(
+                          height * 0.015
+                      )
+
+                      x1 = max(
+                          0,
+                          x1 - padx
+                      )
+
+                      y1 = max(
+                          0,
+                          y1 - pady
+                      )
+
+                      x2 = min(
+                          width,
+                          x2 + padx
+                      )
+
+                      y2 = min(
+                          height,
+                          y2 + pady
+                      )
+
+                      region = {
+                          "x1": x1,
+                          "y1": y1,
+                          "x2": x2,
+                          "y2": y2,
+                          "width": width,
+                          "height": height,
+                          "fps": fps,
+                          "found_at": t
+                      }
+
+                      cap.release()
+
+                      print()
+                      print(
+                          "SUBTITLE REGION FOUND"
+                      )
+
+                      print(
+                          "Text:",
+                          text
+                      )
+
+                      print(
+                          "Region:",
+                          region
+                      )
+
+                      return region
+
+                  t += SCAN_SECONDS
+
+              cap.release()
+
+              raise RuntimeError(
+                  "Không tìm thấy subtitle "
+                  "tiếng Trung."
+              )
+
+
+          # ==================================================
+          # EXTRACT SUBTITLES
+          # ==================================================
+
+          def extract_subtitles(
+              region
+          ):
+
+              x1 = region["x1"]
+              y1 = region["y1"]
+              x2 = region["x2"]
+              y2 = region["y2"]
+
+              cap = cv2.VideoCapture(
+                  str(VIDEO)
+              )
+
+              fps = cap.get(
+                  cv2.CAP_PROP_FPS
+              )
+
+              frames = int(
+                  cap.get(
+                      cv2.CAP_PROP_FRAME_COUNT
+                  )
+              )
+
+              duration = (
+                  frames / fps
+              )
+
+              step = max(
+                  1,
+                  int(
+                      round(
+                          fps / OCR_FPS
+                      )
+                  )
+              )
+
+              cues = []
+
+              last_text = ""
+              start = None
+
+              frame = 0
+
+              with tqdm(
+                  total=frames,
+                  desc="OCR"
+              ) as bar:
+
+                  while True:
+
+                      ok, img = (
+                          cap.read()
+                      )
+
+                      if not ok:
+                          break
+
+                      if (
+                          frame
+                          % step
+                          == 0
+                      ):
+
+                          crop = img[
+                              y1:y2,
+                              x1:x2
+                          ]
+
+                          texts, _ = (
+                              ocr_image(
+                                  crop
+                              )
+                          )
+
+                          valid = []
+
+                          for text in texts:
+
+                              chinese = len(
+                                  re.findall(
+                                      r"[\u3400-\u9fff]",
+                                      text
+                                  )
+                              )
+
+                              if chinese >= 2:
+                                  valid.append(
+                                      text
+                                  )
+
+                          text = " ".join(
+                              valid
+                          )
+
+                          text = re.sub(
+                              r"\s+",
+                              " ",
+                              text
+                          ).strip()
+
+                          now = (
+                              frame / fps
+                          )
+
+                          if text != last_text:
+
+                              if (
+                                  last_text
+                                  and
+                                  start is not None
+                              ):
+
+                                  cues.append({
+                                      "start":
+                                          start,
+                                      "end":
+                                          now,
+                                      "text":
+                                          last_text
+                                  })
+
+                              if text:
+
+                                  last_text = (
+                                      text
+                                  )
+
+                                  start = (
+                                      now
+                                  )
+
+                              else:
+
+                                  last_text = ""
+
+                                  start = None
+
+                      frame += 1
+
+                      bar.update(1)
+
+              cap.release()
+
+              if (
+                  last_text
+                  and
+                  start is not None
+              ):
+
+                  cues.append({
+                      "start":
+                          start,
+                      "end":
+                          duration,
+                      "text":
+                          last_text
+                  })
+
+              # Cleanup
+              cleaned = []
+
+              for cue in cues:
+
+                  if len(
+                      cue["text"]
+                  ) < 2:
+                      continue
+
+                  if (
+                      cue["end"]
+                      -
+                      cue["start"]
+                      < 0.15
+                  ):
+                      continue
+
+                  if cleaned:
+
+                      prev = cleaned[-1]
+
+                      if (
+                          prev["text"]
+                          ==
+                          cue["text"]
+                          and
+                          cue["start"]
+                          -
+                          prev["end"]
+                          < 0.5
+                      ):
+
+                          prev["end"] = (
+                              cue["end"]
+                          )
+
+                          continue
+
+                  cleaned.append(
+                      cue
+                  )
+
+              return cleaned
+
+
+          # ==================================================
+          # SRT
+          # ==================================================
+
+          def save_srt(
+              cues,
+              path,
+              field
+          ):
+
+              subs = (
+                  pysubs2.SSAFile()
+              )
+
+              for cue in cues:
+
+                  subs.append(
+                      pysubs2.SSAEvent(
+                          start=int(
+                              cue["start"]
+                              * 1000
+                          ),
+
+                          end=int(
+                              cue["end"]
+                              * 1000
+                          ),
+
+                          text=cue[field]
+                      )
+                  )
+
+              subs.save(
+                  str(path),
+                  encoding="utf-8"
+              )
+
+
+          # ==================================================
+          # TRANSLATION
+          # ==================================================
+
+          def translate(
+              cues
+          ):
+
+              print()
+              print(
+                  "Loading translation model..."
+              )
+
+              tokenizer = (
+                  AutoTokenizer
+                  .from_pretrained(
+                      MODEL_NAME
+                  )
+              )
+
+              model = (
+                  AutoModelForSeq2SeqLM
+                  .from_pretrained(
+                      MODEL_NAME
+                  )
+              )
+
+              model.eval()
+
+              results = []
+
+              batch_size = 8
+
+              for i in tqdm(
+                  range(
+                      0,
+                      len(cues),
+                      batch_size
+                  ),
+                  desc="Translate"
+              ):
+
+                  batch = cues[
+                      i:i + batch_size
+                  ]
+
+                  texts = [
+                      x["text"]
+                      for x in batch
+                  ]
+
+                  inputs = tokenizer(
+                      texts,
+                      return_tensors="pt",
+                      padding=True,
+                      truncation=True,
+                      max_length=256
+                  )
+
+                  outputs = (
+                      model.generate(
+                          **inputs,
+                          max_length=256,
+                          num_beams=4
+                      )
+                  )
+
+                  translations = (
+                      tokenizer.batch_decode(
+                          outputs,
+                          skip_special_tokens=True
+                      )
+                  )
+
+                  for cue, vi in zip(
+                      batch,
+                      translations
+                  ):
+
+                      results.append({
+                          "start":
+                              cue["start"],
+
+                          "end":
+                              cue["end"],
+
+                          "text":
+                              cue["text"],
+
+                          "vi":
+                              vi.strip()
+                      })
+
+              return results
+
+
+          # ==================================================
+          # ASS
+          # ==================================================
+
+          def make_ass(
+              cues,
+              region
+          ):
+
+              width = region[
+                  "width"
+              ]
+
+              height = region[
+                  "height"
+              ]
+
+              y2 = region[
+                  "y2"
+              ]
+
+              subs = (
+                  pysubs2.SSAFile()
+              )
+
+              style = (
+                  pysubs2.SSAStyle()
+              )
+
+              style.fontname = (
+                  "Noto Sans CJK SC"
+              )
+
+              style.fontsize = max(
+                  30,
+                  int(
+                      height * 0.035
+                  )
+              )
+
+              style.primarycolor = (
+                  pysubs2.Color(
+                      255,
+                      255,
+                      255,
+                      0
+                  )
+              )
+
+              style.outlinecolor = (
+                  pysubs2.Color(
+                      0,
+                      0,
+                      0,
+                      0
+                  )
+              )
+
+              style.outline = 3
+
+              style.alignment = 2
+
+              style.marginl = 30
+              style.marginr = 30
+
+              style.marginv = max(
+                  15,
+                  height - y2
+              )
+
+              subs.styles[
+                  "Default"
+              ] = style
+
+              for cue in cues:
+
+                  subs.events.append(
+                      pysubs2.SSAEvent(
+                          start=int(
+                              cue["start"]
+                              * 1000
+                          ),
+
+                          end=int(
+                              cue["end"]
+                              * 1000
+                          ),
+
+                          text=cue["vi"]
+                      )
+                  )
+
+              path = (
+                  WORK
+                  / "vietnamese.ass"
+              )
+
+              subs.save(
+                  str(path),
+                  encoding="utf-8"
+              )
+
+              return path
+
+
+          # ==================================================
+          # RENDER
+          # ==================================================
+
+          def render(
+              ass,
+              region
+          ):
+
+              width = region[
+                  "width"
+              ]
+
+              height = region[
+                  "height"
+              ]
+
+              x1 = region["x1"]
+              y1 = region["y1"]
+              x2 = region["x2"]
+              y2 = region["y2"]
+
+              padx = int(
+                  width * 0.01
+              )
+
+              pady = int(
+                  height * 0.008
+              )
+
+              x1 = max(
+                  0,
+                  x1 - padx
+              )
+
+              y1 = max(
+                  0,
+                  y1 - pady
+              )
+
+              x2 = min(
+                  width,
+                  x2 + padx
+              )
+
+              y2 = min(
+                  height,
+                  y2 + pady
+              )
+
+              w = x2 - x1
+              h = y2 - y1
+
+              ass_path = (
+                  str(ass)
+                  .replace(
+                      "\\",
+                      "/"
+                  )
+                  .replace(
+                      ":",
+                      "\\:"
+                  )
+              )
+
+              vf = (
+                  f"delogo="
+                  f"x={x1}:"
+                  f"y={y1}:"
+                  f"w={w}:"
+                  f"h={h}:"
+                  f"show=0,"
+                  f"ass='{ass_path}'"
+              )
+
+              output = (
+                  OUTPUT
+                  / "video_vi.mp4"
+              )
+
+              cmd = [
+                  "ffmpeg",
+                  "-y",
+
+                  "-i",
+                  str(VIDEO),
+
+                  "-vf",
+                  vf,
+
+                  "-map",
+                  "0:v:0",
+
+                  "-map",
+                  "0:a?",
+
+                  "-c:v",
+                  "libx264",
+
+                  "-preset",
+                  "veryfast",
+
+                  "-crf",
+                  "21",
+
+                  "-pix_fmt",
+                  "yuv420p",
+
+                  "-c:a",
+                  "aac",
+
+                  "-b:a",
+                  "192k",
+
+                  "-movflags",
+                  "+faststart",
+
+                  str(output)
+              ]
+
+              print()
+              print(
+                  "Rendering final video..."
+              )
+
+              subprocess.run(
+                  cmd,
+                  check=True
+              )
+
+              return output
+
+
+          # ==================================================
+          # MAIN
+          # ==================================================
+
+          def main():
+
+              print()
+              print(
+                  "======================================"
+              )
+              print(
+                  "BILIBILI → VIETNAMESE"
+              )
+              print(
+                  "======================================"
+              )
+              print()
+
+              print(
+                  "Video:",
+                  VIDEO
+              )
+
+              # 1.
+              region = (
+                  find_region()
+              )
+
+              (
+                  WORK
+                  / "subtitle_region.json"
+              ).write_text(
+                  json.dumps(
+                      region,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+              # 2.
+              print()
+              print(
+                  "Extracting subtitles..."
+              )
+
+              cues = (
+                  extract_subtitles(
+                      region
+                  )
+              )
+
+              if not cues:
+
+                  raise RuntimeError(
+                      "OCR không tìm thấy "
+                      "subtitle."
+                  )
+
+              print(
+                  "Found",
+                  len(cues),
+                  "subtitle cues"
+              )
+
+              # 3.
+              chinese_srt = (
+                  WORK
+                  / "chinese.srt"
+              )
+
+              save_srt(
+                  cues,
+                  chinese_srt,
+                  "text"
+              )
+
+              # 4.
+              translated = (
+                  translate(
+                      cues
+                  )
+              )
+
+              # 5.
+              vietnamese_srt = (
+                  WORK
+                  / "vietnamese.srt"
+              )
+
+              save_srt(
+                  translated,
+                  vietnamese_srt,
+                  "vi"
+              )
+
+              # 6.
+              ass = make_ass(
+                  translated,
+                  region
+              )
+
+              # 7.
+              output = render(
+                  ass,
+                  region
+              )
+
+              print()
+              print(
+                  "======================================"
+              )
+              print(
+                  "FINISHED"
+              )
+              print(
+                  "======================================"
+              )
+
+              print(
+                  "Output:",
+                  output
+              )
+
+
+          if __name__ == "__main__":
+              main()
+
+          PY
+
+
+      # ==========================================
+      # RUN
+      # ==========================================
+
+      - name: Process video
         env:
           SCAN_SECONDS: ${{ inputs.scan_seconds }}
           OCR_FPS: ${{ inputs.ocr_fps }}
-
           PYTHONUNBUFFERED: "1"
-
           HF_HOME: "${{ github.workspace }}/work/huggingface"
 
         run: |
@@ -127,26 +1389,35 @@ jobs:
           python process.py
 
 
-      # --------------------------------------------------
-      # SHOW OUTPUT
-      # --------------------------------------------------
+      # ==========================================
+      # CHECK RESULT
+      # ==========================================
 
-      - name: Show output
+      - name: Check result
         run: |
 
-          echo "=============================="
-          echo "OUTPUT"
-          echo "=============================="
+          echo "=========================================="
+          echo "RESULT"
+          echo "=========================================="
 
           ls -lh output/
-          ls -lh work/*.srt 2>/dev/null || true
+
+          echo ""
+          echo "Subtitles:"
+
+          ls -lh work/*.srt || true
+
+          echo ""
+          echo "Region:"
+
+          cat work/subtitle_region.json || true
 
 
-      # --------------------------------------------------
-      # UPLOAD RESULT
-      # --------------------------------------------------
+      # ==========================================
+      # ARTIFACT
+      # ==========================================
 
-      - name: Upload result
+      - name: Upload finished video
         uses: actions/upload-artifact@v4
 
         with:
