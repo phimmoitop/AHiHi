@@ -21,6 +21,7 @@ on:
         default: "2"
         type: string
 
+
 jobs:
 
   process:
@@ -33,6 +34,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       HF_HOME: "${{ github.workspace }}/work/huggingface"
 
+
     steps:
 
       # ==========================================================
@@ -44,7 +46,7 @@ jobs:
 
 
       # ==========================================================
-      # PYTHON 3.11
+      # PYTHON
       # ==========================================================
 
       - name: Setup Python
@@ -134,7 +136,7 @@ jobs:
 
 
       # ==========================================================
-      # PREPARE BILIBILI COOKIE
+      # BILIBILI COOKIE
       # ==========================================================
 
       - name: Prepare Bilibili cookies
@@ -218,7 +220,7 @@ jobs:
 
 
       # ==========================================================
-      # CHECK VIDEO
+      # INSPECT VIDEO
       # ==========================================================
 
       - name: Inspect video
@@ -266,7 +268,9 @@ jobs:
           import re
           import json
           import subprocess
+
           from pathlib import Path
+          from difflib import SequenceMatcher
 
           import cv2
           import numpy as np
@@ -307,67 +311,134 @@ jobs:
               )
           )
 
+
           # ============================================================
           # SUBTITLE STYLE
           # ============================================================
 
-          # Font mặc định.
-          #
-          # Nếu Oward được cài trong runner thì dùng Oward.
-          # Nếu không có -> Noto Sans CJK SC.
-          #
           FONT_SIZE = 25
 
-          # Khoảng cách giữa các ký tự.
-          #
-          # Giá trị âm = chữ sát nhau hơn.
-          #
           LETTER_SPACING = -1
 
-          # Viền chữ.
           OUTLINE_SIZE = 2
 
-          # Shadow.
           SHADOW_SIZE = 0
 
-          # Khoảng cách subtitle với đáy video.
-          #
-          # Đây KHÔNG phải vị trí blur.
-          # Chỉ dùng để render text.
-          SUBTITLE_BOTTOM_MARGIN = 25
 
           # ============================================================
           # BLUR CONFIG
           # ============================================================
 
-          # Padding ngang thêm vào vùng blur.
+          # ------------------------------------------------------------
+          # Đây là điểm quan trọng nhất.
           #
-          # Subtitle dài nhất:
+          # Blur cao đúng khoảng 50 px tính từ ĐÁY subtitle gốc đi lên.
           #
-          # [----------- subtitle -----------]
+          # Ví dụ:
           #
-          # Blur:
+          # subtitle gốc:
           #
-          # [ + padding | subtitle | padding + ]
+          #        [  中文字幕  ]
+          #        ↑           ↑
+          #        y1          y2
           #
-          BLUR_PAD_X_RATIO = 0.012
+          # blur:
+          #
+          #        ┌─────────────────────┐
+          #        │                     │
+          #        │       BLUR          │  50px
+          #        │                     │
+          #        └─────────────────────┘
+          #                    ↑
+          #                   y2
+          #
+          # ------------------------------------------------------------
 
-          # Padding dọc.
-          #
-          # Chỉ cao hơn subtitle một chút.
-          BLUR_PAD_Y_RATIO = 0.008
+          BLUR_HEIGHT = 50
 
-          # Độ mạnh blur.
-          #
-          # 8-14 thường đẹp.
-          #
-          BLUR_SIGMA = 9
 
-          # Không cho blur chạm đáy video.
+          # ------------------------------------------------------------
+          # Blur kéo rộng thêm hai bên.
           #
-          # Nếu subtitle thực tế nằm cao hơn đáy,
-          # vùng blur sẽ giữ nguyên khoảng cách đó.
-          MIN_BOTTOM_GAP = 8
+          # 0.025 = thêm 2.5% chiều rộng video mỗi bên.
+          #
+          # Ví dụ video 1920:
+          #
+          # 1920 * 0.025 = 48px mỗi bên
+          #
+          # ------------------------------------------------------------
+
+          BLUR_PAD_X_RATIO = 0.025
+
+
+          # ------------------------------------------------------------
+          # Safety padding tuyệt đối.
+          #
+          # Giúp tránh trường hợp OCR bbox hơi ngắn hơn chữ thực.
+          # ------------------------------------------------------------
+
+          BLUR_EXTRA_X = 20
+
+
+          # ------------------------------------------------------------
+          # Subtitle Việt cách đáy blur đúng 5px.
+          # ------------------------------------------------------------
+
+          SUBTITLE_BOTTOM_GAP = 5
+
+
+          # ------------------------------------------------------------
+          # Blur mạnh.
+          #
+          # Giá trị cao hơn sẽ che text cũ tốt hơn.
+          # ------------------------------------------------------------
+
+          BLUR_SIGMA = 14
+
+
+          # ------------------------------------------------------------
+          # OCR filtering
+          # ------------------------------------------------------------
+
+          MIN_CHINESE_COUNT = 2
+
+          MIN_BOX_WIDTH = 40
+
+          MIN_BOX_HEIGHT = 8
+
+
+          # ------------------------------------------------------------
+          # Temporal subtitle merging
+          # ------------------------------------------------------------
+
+          # Hai subtitle gần nhau dưới khoảng này có thể được merge.
+          MAX_MERGE_GAP = 0.75
+
+
+          # ------------------------------------------------------------
+          # Fuzzy matching.
+          #
+          # OCR có thể đọc:
+          #
+          # 你好世界
+          #
+          # rồi frame sau:
+          #
+          # 你好 世 界
+          #
+          # Hai text này vẫn được coi là cùng subtitle.
+          # ------------------------------------------------------------
+
+          FUZZY_THRESHOLD = 0.86
+
+
+          # ------------------------------------------------------------
+          # Subtitle phải tồn tại ít nhất khoảng này.
+          #
+          # Giúp loại các OCR noise xuất hiện đúng 1 frame.
+          # ------------------------------------------------------------
+
+          MIN_CUE_DURATION = 0.30
 
 
           # ============================================================
@@ -377,6 +448,7 @@ jobs:
           def probe_video():
 
               command = [
+
                   "ffprobe",
 
                   "-hide_banner",
@@ -445,7 +517,7 @@ jobs:
 
 
           # ============================================================
-          # DECODE ONE FRAME
+          # DECODE FRAME
           # ============================================================
 
           def get_frame(
@@ -455,6 +527,7 @@ jobs:
           ):
 
               command = [
+
                   "ffmpeg",
 
                   "-hide_banner",
@@ -561,10 +634,6 @@ jobs:
                   if not isinstance(data, dict):
                       continue
 
-                  # ====================================================
-                  # PaddleOCR 3.x
-                  # ====================================================
-
                   if isinstance(
                       data.get("res"),
                       dict
@@ -665,6 +734,116 @@ jobs:
 
 
           # ============================================================
+          # TEXT NORMALIZATION
+          # ============================================================
+
+          def normalize_text(text):
+
+              if not text:
+                  return ""
+
+              text = str(
+                  text
+              )
+
+              # Xóa whitespace.
+
+              text = re.sub(
+                  r"\s+",
+                  "",
+                  text
+              )
+
+              # Chuẩn hóa punctuation OCR.
+
+              replacements = {
+
+                  "，": ",",
+                  "。": ".",
+                  "！": "!",
+                  "？": "?",
+                  "：": ":",
+                  "；": ";",
+                  "“": '"',
+                  "”": '"',
+                  "‘": "'",
+                  "’": "'",
+                  "（": "(",
+                  "）": ")",
+                  "【": "[",
+                  "】": "]",
+                  "　": "",
+              }
+
+              for a, b in replacements.items():
+
+                  text = text.replace(
+                      a,
+                      b
+                  )
+
+              return text.lower().strip()
+
+
+          # ============================================================
+          # FUZZY TEXT MATCH
+          # ============================================================
+
+          def texts_similar(
+              a,
+              b
+          ):
+
+              na = normalize_text(a)
+              nb = normalize_text(b)
+
+              if not na or not nb:
+                  return False
+
+              if na == nb:
+                  return True
+
+              # Nếu một text chứa text kia hoàn toàn.
+
+              if (
+                  na in nb
+                  or
+                  nb in na
+              ):
+
+                  shorter = min(
+                      len(na),
+                      len(nb)
+                  )
+
+                  longer = max(
+                      len(na),
+                      len(nb)
+                  )
+
+                  if (
+                      shorter
+                      /
+                      max(longer, 1)
+                      >= 0.75
+                  ):
+
+                      return True
+
+              ratio = SequenceMatcher(
+                  None,
+                  na,
+                  nb
+              ).ratio()
+
+              return (
+                  ratio
+                  >=
+                  FUZZY_THRESHOLD
+              )
+
+
+          # ============================================================
           # CHINESE TEXT TEST
           # ============================================================
 
@@ -712,7 +891,8 @@ jobs:
 
               print()
 
-              # Subtitle thường nằm ở 55-100%.
+              # Subtitle thường nằm ở phần dưới video.
+
               y0 = int(
                   height * 0.55
               )
@@ -767,7 +947,7 @@ jobs:
                           text
                       )
 
-                      if count < 2:
+                      if count < MIN_CHINESE_COUNT:
                           continue
 
                       x1, yy1, x2, yy2 = box
@@ -783,10 +963,10 @@ jobs:
                           yy2 - yy1
                       )
 
-                      if box_width < 40:
+                      if box_width < MIN_BOX_WIDTH:
                           continue
 
-                      if box_height < 8:
+                      if box_height < MIN_BOX_HEIGHT:
                           continue
 
                       bottom_score = (
@@ -832,44 +1012,25 @@ jobs:
 
                       x1, y1, x2, y2 = box
 
-                      # ==================================================
-                      # IMPORTANT:
-                      #
-                      # Không padding quá nhiều ở đây.
-                      #
-                      # Đặc biệt KHÔNG kéo y2 xuống 1080.
-                      # ==================================================
-
                       padx = int(
                           width
                           *
                           BLUR_PAD_X_RATIO
                       )
 
-                      pady = int(
-                          height
-                          *
-                          BLUR_PAD_Y_RATIO
-                      )
+                      # Chỉ dùng padding nhỏ để
+                      # tìm initial crop.
+                      #
+                      # Blur cuối sẽ tính lại.
 
                       x1 = max(
                           0,
                           x1 - padx
                       )
 
-                      y1 = max(
-                          0,
-                          y1 - pady
-                      )
-
                       x2 = min(
-                          width - 1,
+                          width,
                           x2 + padx
-                      )
-
-                      y2 = min(
-                          height - MIN_BOTTOM_GAP,
-                          y2 + pady
                       )
 
                       region = {
@@ -927,17 +1088,651 @@ jobs:
 
 
           # ============================================================
+          # CHOOSE BEST OCR LINE
+          # ============================================================
+
+          def choose_subtitle(
+              texts,
+              boxes,
+              rx1,
+              ry1
+          ):
+
+              valid = []
+
+              for text, box in zip(
+                  texts,
+                  boxes
+              ):
+
+                  if chinese_count(
+                      text
+                  ) < MIN_CHINESE_COUNT:
+                      continue
+
+                  x1, y1, x2, y2 = box
+
+                  abs_x1 = x1 + rx1
+                  abs_y1 = y1 + ry1
+                  abs_x2 = x2 + rx1
+                  abs_y2 = y2 + ry1
+
+                  box_width = (
+                      abs_x2 - abs_x1
+                  )
+
+                  box_height = (
+                      abs_y2 - abs_y1
+                  )
+
+                  if box_width < MIN_BOX_WIDTH:
+                      continue
+
+                  if box_height < MIN_BOX_HEIGHT:
+                      continue
+
+                  valid.append(
+                      (
+                          text,
+                          (
+                              abs_x1,
+                              abs_y1,
+                              abs_x2,
+                              abs_y2
+                          )
+                      )
+                  )
+
+              if not valid:
+                  return (
+                      "",
+                      None
+                  )
+
+              # Trái -> phải.
+
+              valid.sort(
+                  key=lambda item:
+                  item[1][0]
+              )
+
+              text = " ".join(
+                  item[0]
+                  for item in valid
+              )
+
+              text = re.sub(
+                  r"\s+",
+                  " ",
+                  text
+              ).strip()
+
+              all_x1 = min(
+                  item[1][0]
+                  for item in valid
+              )
+
+              all_y1 = min(
+                  item[1][1]
+                  for item in valid
+              )
+
+              all_x2 = max(
+                  item[1][2]
+                  for item in valid
+              )
+
+              all_y2 = max(
+                  item[1][3]
+                  for item in valid
+              )
+
+              geometry = {
+
+                  "x1": all_x1,
+                  "y1": all_y1,
+                  "x2": all_x2,
+                  "y2": all_y2,
+
+                  "width":
+                      all_x2 - all_x1,
+
+                  "height":
+                      all_y2 - all_y1,
+
+                  "center_x":
+                      (
+                          all_x1
+                          +
+                          all_x2
+                      )
+                      /
+                      2,
+
+                  "center_y":
+                      (
+                          all_y1
+                          +
+                          all_y2
+                      )
+                      /
+                      2
+              }
+
+              return (
+                  text,
+                  geometry
+              )
+
+
+          # ============================================================
+          # TEMPORAL DEDUPLICATION
+          #
+          # Đây là phần sửa lỗi subtitle trùng.
+          #
+          # Thay vì:
+          #
+          # frame 1 -> 你好世界
+          # frame 2 -> 你好 世界
+          # frame 3 -> 你好世界
+          # frame 4 -> 你好世界
+          #
+          # thành 4 subtitle,
+          #
+          # chúng ta gom thành:
+          #
+          # 00:01 -> 00:03  你好世界
+          #
+          # ============================================================
+
+          def consolidate_observations(
+              observations,
+              duration
+          ):
+
+              if not observations:
+                  return []
+
+              print()
+              print(
+                  "=========================================="
+              )
+
+              print(
+                  "TEMPORAL DEDUPLICATION"
+              )
+
+              print(
+                  f"Raw OCR observations: "
+                  f"{len(observations)}"
+              )
+
+              print(
+                  "=========================================="
+              )
+
+              print()
+
+              groups = []
+
+              current = None
+
+              for obs in observations:
+
+                  t = obs["time"]
+
+                  text = obs["text"]
+
+                  if not text:
+                      # Một frame không thấy subtitle.
+                      #
+                      # Không đóng cue ngay.
+                      #
+                      # Vì OCR có thể miss một frame.
+
+                      if current is not None:
+
+                          current[
+                              "missing_count"
+                          ] += 1
+
+                      continue
+
+                  if current is None:
+
+                      current = {
+
+                          "start": t,
+
+                          "last_seen": t,
+
+                          "texts": [text],
+
+                          "boxes": [
+                              obs["box"]
+                          ],
+
+                          "missing_count": 0,
+
+                          "observations": 1
+                      }
+
+                      continue
+
+                  current_text = max(
+                      current["texts"],
+                      key=len
+                  )
+
+                  gap = (
+                      t
+                      -
+                      current["last_seen"]
+                  )
+
+                  similar = texts_similar(
+                      current_text,
+                      text
+                  )
+
+                  # ==================================================
+                  # Cùng subtitle
+                  # ==================================================
+
+                  if (
+                      similar
+                      and
+                      gap
+                      <=
+                      MAX_MERGE_GAP
+                  ):
+
+                      current[
+                          "last_seen"
+                      ] = t
+
+                      current[
+                          "texts"
+                      ].append(
+                          text
+                      )
+
+                      current[
+                          "boxes"
+                      ].append(
+                          obs["box"]
+                      )
+
+                      current[
+                          "missing_count"
+                      ] = 0
+
+                      current[
+                          "observations"
+                      ] += 1
+
+                      continue
+
+                  # ==================================================
+                  # Subtitle khác.
+                  # ==================================================
+
+                  groups.append(
+                      current
+                  )
+
+                  current = {
+
+                      "start": t,
+
+                      "last_seen": t,
+
+                      "texts": [text],
+
+                      "boxes": [
+                          obs["box"]
+                      ],
+
+                      "missing_count": 0,
+
+                      "observations": 1
+                  }
+
+              if current is not None:
+                  groups.append(
+                      current
+                  )
+
+              # ========================================================
+              # Convert groups -> cues
+              # ========================================================
+
+              cues = []
+
+              for group in groups:
+
+                  start = group[
+                      "start"
+                  ]
+
+                  end = min(
+                      duration,
+                      group[
+                          "last_seen"
+                      ]
+                      +
+                      (
+                          1
+                          /
+                          OCR_FPS
+                      )
+                  )
+
+                  duration_sec = (
+                      end
+                      -
+                      start
+                  )
+
+                  # ----------------------------------------------------
+                  # Chọn text xuất hiện nhiều nhất.
+                  #
+                  # Nếu hòa -> chọn text dài nhất.
+                  # ----------------------------------------------------
+
+                  text_counts = {}
+
+                  for text in group[
+                      "texts"
+                  ]:
+
+                      key = normalize_text(
+                          text
+                      )
+
+                      if not key:
+                          continue
+
+                      if key not in text_counts:
+
+                          text_counts[
+                              key
+                          ] = {
+
+                              "count": 0,
+
+                              "texts": []
+                          }
+
+                      text_counts[
+                          key
+                      ]["count"] += 1
+
+                      text_counts[
+                          key
+                      ]["texts"
+                      ].append(
+                          text
+                      )
+
+                  if not text_counts:
+                      continue
+
+                  best_key = max(
+                      text_counts,
+                      key=lambda k: (
+                          text_counts[k]["count"],
+                          max(
+                              len(x)
+                              for x in
+                              text_counts[k][
+                                  "texts"
+                              ]
+                          )
+                      )
+                  )
+
+                  best_texts = text_counts[
+                      best_key
+                  ]["texts"]
+
+                  text = max(
+                      best_texts,
+                      key=len
+                  )
+
+                  # ----------------------------------------------------
+                  # Loại OCR noise cực ngắn.
+                  # ----------------------------------------------------
+
+                  if duration_sec < MIN_CUE_DURATION:
+
+                      # Nhưng nếu OCR quan sát nhiều frame,
+                      # vẫn có thể giữ.
+                      #
+                      # Tránh xóa subtitle thật quá ngắn.
+
+                      if group[
+                          "observations"
+                      ] < 2:
+
+                          continue
+
+                  # ----------------------------------------------------
+                  # Geometry:
+                  #
+                  # dùng bbox lớn nhất trong group.
+                  #
+                  # Điều này giúp blur không bị ngắn
+                  # khi một frame OCR thiếu vài ký tự.
+                  # ----------------------------------------------------
+
+                  boxes = group[
+                      "boxes"
+                  ]
+
+                  x1 = min(
+                      box["x1"]
+                      for box in boxes
+                  )
+
+                  y1 = min(
+                      box["y1"]
+                      for box in boxes
+                  )
+
+                  x2 = max(
+                      box["x2"]
+                      for box in boxes
+                  )
+
+                  y2 = max(
+                      box["y2"]
+                      for box in boxes
+                  )
+
+                  geometry = {
+
+                      "x1": x1,
+                      "y1": y1,
+                      "x2": x2,
+                      "y2": y2,
+
+                      "width":
+                          x2 - x1,
+
+                      "height":
+                          y2 - y1,
+
+                      "center_x":
+                          (
+                              x1 + x2
+                          )
+                          /
+                          2,
+
+                      "center_y":
+                          (
+                              y1 + y2
+                          )
+                          /
+                          2
+                  }
+
+                  cues.append({
+
+                      "start": start,
+
+                      "end": end,
+
+                      "text": text,
+
+                      "box": geometry,
+
+                      "observations":
+                          group[
+                              "observations"
+                          ]
+                  })
+
+              # ========================================================
+              # SECOND PASS
+              #
+              # Merge các cue kế tiếp nếu OCR vẫn nhận ra
+              # cùng subtitle nhưng bị tách do một đoạn miss.
+              # ========================================================
+
+              merged = []
+
+              for cue in cues:
+
+                  if not merged:
+
+                      merged.append(
+                          cue
+                      )
+
+                      continue
+
+                  previous = merged[-1]
+
+                  gap = (
+                      cue["start"]
+                      -
+                      previous["end"]
+                  )
+
+                  if (
+                      gap
+                      <=
+                      MAX_MERGE_GAP
+                      and
+                      texts_similar(
+                          previous["text"],
+                          cue["text"]
+                      )
+                  ):
+
+                      previous["end"] = max(
+                          previous["end"],
+                          cue["end"]
+                      )
+
+                      # Chọn text dài hơn.
+
+                      if len(
+                          cue["text"]
+                      ) > len(
+                          previous["text"]
+                      ):
+
+                          previous[
+                              "text"
+                          ] = cue[
+                              "text"
+                          ]
+
+                      # Expand geometry.
+
+                      p = previous[
+                          "box"
+                      ]
+
+                      c = cue[
+                          "box"
+                      ]
+
+                      p["x1"] = min(
+                          p["x1"],
+                          c["x1"]
+                      )
+
+                      p["y1"] = min(
+                          p["y1"],
+                          c["y1"]
+                      )
+
+                      p["x2"] = max(
+                          p["x2"],
+                          c["x2"]
+                      )
+
+                      p["y2"] = max(
+                          p["y2"],
+                          c["y2"]
+                      )
+
+                      p["width"] = (
+                          p["x2"]
+                          -
+                          p["x1"]
+                      )
+
+                      p["height"] = (
+                          p["y2"]
+                          -
+                          p["y1"]
+                      )
+
+                      continue
+
+                  merged.append(
+                      cue
+                  )
+
+              print(
+                  f"Final subtitle cues: "
+                  f"{len(merged)}"
+              )
+
+              print()
+
+              # ========================================================
+              # DEBUG
+              # ========================================================
+
+              print(
+                  "FIRST SUBTITLE CUES:"
+              )
+
+              for i, cue in enumerate(
+                  merged[:30]
+              ):
+
+                  print(
+                      f"[{i:03d}] "
+                      f"{cue['start']:.2f} -> "
+                      f"{cue['end']:.2f} | "
+                      f"{cue['text']}"
+                  )
+
+              print()
+
+              return merged
+
+
+          # ============================================================
           # OCR WHOLE VIDEO
-          #
-          # IMPORTANT:
-          #
-          # Trong lúc OCR:
-          #
-          # 1. Lưu subtitle cues
-          # 2. Đồng thời lưu bbox của từng subtitle
-          #
-          # Sau đó lấy subtitle có WIDTH LỚN NHẤT
-          # làm kích thước vùng blur.
           # ============================================================
 
           def extract_subtitles(
@@ -951,15 +1746,21 @@ jobs:
                   duration
               ) = probe_video()
 
-              # Initial OCR region chỉ dùng để tìm subtitle.
-              #
-              # Sau khi OCR toàn video, vùng blur sẽ được
-              # tính lại dựa trên subtitle dài nhất.
+              rx1 = initial_region[
+                  "x1"
+              ]
 
-              rx1 = initial_region["x1"]
-              ry1 = initial_region["y1"]
-              rx2 = initial_region["x2"]
-              ry2 = initial_region["y2"]
+              ry1 = initial_region[
+                  "y1"
+              ]
+
+              rx2 = initial_region[
+                  "x2"
+              ]
+
+              ry2 = initial_region[
+                  "y2"
+              ]
 
               samples = max(
                   1,
@@ -989,17 +1790,7 @@ jobs:
 
               print()
 
-              cues = []
-
-              previous_text = ""
-
-              start_time = None
-
-              # ========================================================
-              # Geometry data
-              # ========================================================
-
-              subtitle_boxes = []
+              observations = []
 
               for i in tqdm(
                   range(samples),
@@ -1030,309 +1821,61 @@ jobs:
                       ocr_image(crop)
                   )
 
-                  valid = []
-
-                  for text, box in zip(
-                      texts,
-                      boxes
-                  ):
-
-                      if chinese_count(
-                          text
-                      ) < 2:
-                          continue
-
-                      x1, y1, x2, y2 = box
-
-                      # Chuyển bbox từ crop
-                      # về tọa độ video.
-
-                      abs_x1 = (
-                          x1 + rx1
+                  text, geometry = (
+                      choose_subtitle(
+                          texts,
+                          boxes,
+                          rx1,
+                          ry1
                       )
-
-                      abs_y1 = (
-                          y1 + ry1
-                      )
-
-                      abs_x2 = (
-                          x2 + rx1
-                      )
-
-                      abs_y2 = (
-                          y2 + ry1
-                      )
-
-                      box_width = (
-                          abs_x2
-                          -
-                          abs_x1
-                      )
-
-                      box_height = (
-                          abs_y2
-                          -
-                          abs_y1
-                      )
-
-                      if box_width < 40:
-                          continue
-
-                      if box_height < 8:
-                          continue
-
-                      valid.append(
-                          (
-                              text,
-                              (
-                                  abs_x1,
-                                  abs_y1,
-                                  abs_x2,
-                                  abs_y2
-                              )
-                          )
-                      )
-
-                  # ====================================================
-                  # Sort text boxes left → right
-                  #
-                  # Trường hợp subtitle bị OCR thành nhiều box.
-                  # ====================================================
-
-                  valid.sort(
-                      key=lambda item:
-                      item[1][0]
                   )
 
-                  text = " ".join(
-                      item[0]
-                      for item in valid
-                  )
+                  observations.append({
 
-                  text = re.sub(
-                      r"\s+",
-                      " ",
-                      text
-                  ).strip()
-
-                  # ====================================================
-                  # Geometry
-                  # ====================================================
-
-                  if valid:
-
-                      all_x1 = min(
-                          item[1][0]
-                          for item in valid
-                      )
-
-                      all_y1 = min(
-                          item[1][1]
-                          for item in valid
-                      )
-
-                      all_x2 = max(
-                          item[1][2]
-                          for item in valid
-                      )
-
-                      all_y2 = max(
-                          item[1][3]
-                          for item in valid
-                      )
-
-                      geometry = {
-
-                          "x1": all_x1,
-                          "y1": all_y1,
-                          "x2": all_x2,
-                          "y2": all_y2,
-
-                          "width":
-                              all_x2
-                              -
-                              all_x1,
-
-                          "height":
-                              all_y2
-                              -
-                              all_y1,
-
-                          "center_x":
-                              (
-                                  all_x1
-                                  +
-                                  all_x2
-                              )
-                              /
-                              2,
-
-                          "center_y":
-                              (
-                                  all_y1
-                                  +
-                                  all_y2
-                              )
-                              /
-                              2
-                      }
-
-                      subtitle_boxes.append(
-                          {
-                              "time":
-                                  current_time,
-
-                              "text":
-                                  text,
-
-                              "box":
-                                  geometry
-                          }
-                      )
-
-                  # ====================================================
-                  # Subtitle changed
-                  # ====================================================
-
-                  if text != previous_text:
-
-                      # Close previous subtitle.
-
-                      if (
-                          previous_text
-                          and
-                          start_time
-                          is not None
-                      ):
-
-                          cues.append({
-                              "start":
-                                  start_time,
-
-                              "end":
-                                  current_time,
-
-                              "text":
-                                  previous_text
-                          })
-
-                      # New subtitle.
-
-                      if text:
-
-                          previous_text = (
-                              text
-                          )
-
-                          start_time = (
-                              current_time
-                          )
-
-                      else:
-
-                          previous_text = ""
-
-                          start_time = None
-
-              # ========================================================
-              # Close last subtitle
-              # ========================================================
-
-              if (
-                  previous_text
-                  and
-                  start_time
-                  is not None
-              ):
-
-                  cues.append({
-                      "start":
-                          start_time,
-
-                      "end":
-                          duration,
+                      "time":
+                          current_time,
 
                       "text":
-                          previous_text
+                          text,
+
+                      "box":
+                          geometry
                   })
-
-              # ========================================================
-              # Cleanup
-              # ========================================================
-
-              cleaned = []
-
-              for cue in cues:
-
-                  text = cue["text"]
-
-                  if len(text) < 2:
-                      continue
-
-                  cue_duration = (
-                      cue["end"]
-                      -
-                      cue["start"]
-                  )
-
-                  if cue_duration < 0.15:
-                      continue
-
-                  if cleaned:
-
-                      previous = (
-                          cleaned[-1]
-                      )
-
-                      gap = (
-                          cue["start"]
-                          -
-                          previous["end"]
-                      )
-
-                      if (
-                          text
-                          ==
-                          previous["text"]
-                          and
-                          gap < 0.6
-                      ):
-
-                          previous["end"] = (
-                              cue["end"]
-                          )
-
-                          continue
-
-                  cleaned.append(
-                      cue
-                  )
 
               print()
               print(
-                  f"Subtitle cues: "
-                  f"{len(cleaned)}"
+                  f"OCR observations: "
+                  f"{len(observations)}"
               )
 
               # ========================================================
-              # FIND LONGEST SUBTITLE
+              # Temporal deduplication
               # ========================================================
 
-              if not subtitle_boxes:
+              cues = consolidate_observations(
+                  observations,
+                  duration
+              )
+
+              if not cues:
 
                   raise RuntimeError(
-                      "Không có geometry subtitle."
+                      "OCR không tìm thấy subtitle."
                   )
 
+              # ========================================================
+              # FIND LONGEST ORIGINAL SUBTITLE
+              # ========================================================
+
               longest = max(
-                  subtitle_boxes,
-                  key=lambda item:
-                  item["box"]["width"]
+                  cues,
+                  key=lambda cue:
+                  cue["box"]["width"]
               )
 
-              longest_box = (
-                  longest["box"]
-              )
+              longest_box = longest[
+                  "box"
+              ]
 
               print()
               print(
@@ -1344,13 +1887,17 @@ jobs:
               )
 
               print(
+                  "=========================================="
+              )
+
+              print(
                   "Text:",
                   longest["text"]
               )
 
               print(
                   "Time:",
-                  f'{longest["time"]:.2f}s'
+                  f'{longest["start"]:.2f}s'
               )
 
               print(
@@ -1384,85 +1931,53 @@ jobs:
               print()
 
               # ========================================================
-              # Build final blur region
+              # FINAL BLUR WIDTH
               #
-              # CHIỀU DÀI:
-              #     = subtitle dài nhất
-              #       + padding hai bên
+              # Lấy subtitle dài nhất.
               #
-              # CHIỀU CAO:
-              #     = subtitle cao nhất
-              #       + padding nhỏ
+              # Sau đó cộng:
               #
-              # VỊ TRÍ:
-              #     = vị trí subtitle thực tế
+              # 2.5% video width mỗi bên
+              # +
+              # 20px safety mỗi bên
               #
-              # Không kéo xuống đáy.
+              # Điều này đảm bảo blur luôn dài hơn
+              # subtitle OCR.
               # ========================================================
-
-              max_width = max(
-                  item["box"]["width"]
-                  for item in subtitle_boxes
-              )
-
-              max_height = max(
-                  item["box"]["height"]
-                  for item in subtitle_boxes
-              )
-
-              # Subtitle dài nhất.
 
               longest_width = (
                   longest_box["width"]
               )
 
-              # Nếu OCR có những subtitle
-              # bị lệch trái/phải giữa các frame,
-              # dùng width lớn nhất nhưng giữ tâm
-              # của subtitle dài nhất.
-
-              center_x = (
-                  longest_box["center_x"]
+              padx = int(
+                  width
+                  *
+                  BLUR_PAD_X_RATIO
               )
 
-              # Chiều rộng vùng blur.
+              total_extra = (
+                  padx
+                  +
+                  BLUR_EXTRA_X
+              )
 
-              blur_width = int(
+              blur_width = (
                   longest_width
                   +
-                  (
-                      width
-                      *
-                      BLUR_PAD_X_RATIO
-                      *
-                      2
-                  )
+                  total_extra
+                  *
+                  2
               )
 
-              # Chiều cao vùng blur.
-              #
-              # Dùng chiều cao lớn nhất của subtitle,
-              # không dùng chiều cao của crop.
-              blur_height = int(
-                  max_height
-                  +
-                  (
-                      height
-                      *
-                      BLUR_PAD_Y_RATIO
-                      *
-                      2
-                  )
+              # ========================================================
+              # Center
+              # ========================================================
+
+              center_x = (
+                  longest_box[
+                      "center_x"
+                  ]
               )
-
-              # Đảm bảo không quá nhỏ.
-
-              blur_height = max(
-                  blur_height,
-                  20
-              )
-
-              # Tính x.
 
               blur_x1 = int(
                   center_x
@@ -1470,50 +1985,77 @@ jobs:
                   blur_width / 2
               )
 
-              blur_x2 = (
-                  blur_x1
+              blur_x2 = int(
+                  center_x
                   +
-                  blur_width
+                  blur_width / 2
               )
 
               # ========================================================
-              # Vertical position
+              # VERTICAL
               #
-              # Lấy median center_y của subtitle.
+              # ĐÂY LÀ FIX QUAN TRỌNG.
               #
-              # Cách này tốt hơn việc mặc định:
-              # y = height - something
+              # Không dùng median center_y nữa.
               #
-              # Vì video của bạn có khoảng trống
-              # giữa subtitle và đáy.
+              # Blur kết thúc đúng tại đáy subtitle gốc:
+              #
+              #                    y2
+              #                     ↓
+              #              ┌─────────────┐
+              #              │             │
+              #              │     BLUR    │
+              #              │             │ 50px
+              #              └─────────────┘
+              #
+              #                     ↓
+              #                 subtitle
+              #
               # ========================================================
 
-              centers_y = [
-                  item["box"]["center_y"]
-                  for item in subtitle_boxes
-              ]
+              subtitle_bottom = max(
+                  cue["box"]["y2"]
+                  for cue in cues
+              )
 
-              subtitle_center_y = float(
-                  np.median(
-                      centers_y
-                  )
+              # Tuy nhiên không nên lấy max y2
+              # nếu có OCR noise ở vị trí khác.
+              #
+              # Dùng y2 của subtitle dài nhất làm anchor.
+
+              subtitle_bottom = (
+                  longest_box["y2"]
+              )
+
+              blur_y2 = int(
+                  subtitle_bottom
               )
 
               blur_y1 = int(
-                  subtitle_center_y
+                  blur_y2
                   -
-                  blur_height / 2
-              )
-
-              blur_y2 = (
-                  blur_y1
-                  +
-                  blur_height
+                  BLUR_HEIGHT
               )
 
               # ========================================================
-              # Clamp
+              # Clamp horizontal
               # ========================================================
+
+              if blur_x1 < 0:
+
+                  blur_x2 -= blur_x1
+                  blur_x1 = 0
+
+              if blur_x2 > width:
+
+                  shift = (
+                      blur_x2
+                      -
+                      width
+                  )
+
+                  blur_x1 -= shift
+                  blur_x2 = width
 
               blur_x1 = max(
                   0,
@@ -1525,32 +2067,9 @@ jobs:
                   blur_x2
               )
 
-              blur_y1 = max(
-                  0,
-                  blur_y1
-              )
-
-              # Quan trọng:
-              #
-              # Không cho vùng blur chạm đáy video.
-              #
-              # Nếu subtitle cách đáy 40px,
-              # blur vẫn sẽ cách đáy khoảng đó.
-              #
-              if blur_y2 > height - MIN_BOTTOM_GAP:
-
-                  shift_up = (
-                      blur_y2
-                      -
-                      (
-                          height
-                          -
-                          MIN_BOTTOM_GAP
-                      )
-                  )
-
-                  blur_y1 -= shift_up
-                  blur_y2 -= shift_up
+              # ========================================================
+              # Clamp vertical
+              # ========================================================
 
               blur_y1 = max(
                   0,
@@ -1558,11 +2077,25 @@ jobs:
               )
 
               blur_y2 = min(
-                  height
-                  -
-                  MIN_BOTTOM_GAP,
+                  height,
                   blur_y2
               )
+
+              blur_width_final = (
+                  blur_x2
+                  -
+                  blur_x1
+              )
+
+              blur_height_final = (
+                  blur_y2
+                  -
+                  blur_y1
+              )
+
+              # ========================================================
+              # FINAL REGION
+              # ========================================================
 
               final_region = {
 
@@ -1598,34 +2131,49 @@ jobs:
                       ],
 
                   "longest_text":
-                      longest["text"],
+                      longest[
+                          "text"
+                      ],
 
                   "longest_subtitle_width":
-                      int(longest_width),
+                      int(
+                          longest_width
+                      ),
 
                   "longest_subtitle_height":
-                      int(max_height),
+                      int(
+                          longest_box[
+                              "height"
+                          ]
+                      ),
 
                   "blur_width":
                       int(
-                          blur_x2
-                          -
-                          blur_x1
+                          blur_width_final
                       ),
 
                   "blur_height":
                       int(
+                          blur_height_final
+                      ),
+
+                  "bottom_y":
+                      int(
                           blur_y2
-                          -
+                      ),
+
+                  "subtitle_bottom":
+                      int(
+                          subtitle_bottom
+                      ),
+
+                  "blur_top":
+                      int(
                           blur_y1
                       ),
 
-                  "bottom_gap":
-                      int(
-                          height
-                          -
-                          blur_y2
-                      )
+                  "subtitle_bottom_gap":
+                      SUBTITLE_BOTTOM_GAP
               }
 
               print()
@@ -1661,19 +2209,41 @@ jobs:
 
               print(
                   f"Blur width  = "
-                  f"{blur_x2 - blur_x1}"
+                  f"{blur_width_final}px"
               )
 
               print(
                   f"Blur height = "
-                  f"{blur_y2 - blur_y1}"
+                  f"{blur_height_final}px"
               )
 
               print()
 
               print(
-                  f"Bottom gap  = "
-                  f"{height - blur_y2}px"
+                  f"Original longest width = "
+                  f"{longest_width}px"
+              )
+
+              print(
+                  f"Horizontal padding each side = "
+                  f"{total_extra}px"
+              )
+
+              print()
+
+              print(
+                  f"Subtitle bottom = "
+                  f"{subtitle_bottom}px"
+              )
+
+              print(
+                  f"Blur bottom = "
+                  f"{blur_y2}px"
+              )
+
+              print(
+                  f"Blur top = "
+                  f"{blur_y1}px"
               )
 
               print()
@@ -1687,23 +2257,13 @@ jobs:
               )
 
               print(
-                  "Longest width:",
-                  longest_width
-              )
-
-              print(
-                  "Max subtitle height:",
-                  max_height
-              )
-
-              print(
                   "=========================================="
               )
 
               print()
 
               return (
-                  cleaned,
+                  cues,
                   final_region
               )
 
@@ -1903,10 +2463,6 @@ jobs:
 
               ]
 
-              # ========================================================
-              # Check fontconfig
-              # ========================================================
-
               for candidate in candidates:
 
                   try:
@@ -1950,10 +2506,6 @@ jobs:
                   except Exception:
                       pass
 
-              # ========================================================
-              # Noto fallback
-              # ========================================================
-
               print(
                   "Oward not found."
               )
@@ -1982,8 +2534,29 @@ jobs:
                   region["height"]
               )
 
+              # --------------------------------------------------------
+              # Đáy blur.
+              # --------------------------------------------------------
+
               blur_y2 = int(
                   region["y2"]
+              )
+
+              # --------------------------------------------------------
+              # Text bottom:
+              #
+              # blur bottom - 5px
+              #
+              # ASS alignment 2 = bottom-center.
+              #
+              # Vì \pos() với alignment 2 neo vào đáy text,
+              # text sẽ nằm ngay phía trên vùng đáy này.
+              # --------------------------------------------------------
+
+              subtitle_y = (
+                  blur_y2
+                  -
+                  SUBTITLE_BOTTOM_GAP
               )
 
               font_name = find_font()
@@ -2006,11 +2579,28 @@ jobs:
               )
 
               print(
-                  f"Letter spacing: {LETTER_SPACING}"
+                  f"Letter spacing: "
+                  f"{LETTER_SPACING}"
               )
 
               print(
-                  f"Outline: {OUTLINE_SIZE}"
+                  f"Outline: "
+                  f"{OUTLINE_SIZE}"
+              )
+
+              print(
+                  f"Subtitle Y: "
+                  f"{subtitle_y}"
+              )
+
+              print(
+                  f"Blur bottom: "
+                  f"{blur_y2}"
+              )
+
+              print(
+                  f"Gap: "
+                  f"{blur_y2 - subtitle_y}px"
               )
 
               print(
@@ -2025,15 +2615,7 @@ jobs:
 
               style.fontname = font_name
 
-              # ========================================================
-              # FONT SIZE
-              # ========================================================
-
               style.fontsize = FONT_SIZE
-
-              # ========================================================
-              # COLORS
-              # ========================================================
 
               style.primarycolor = (
                   pysubs2.Color(
@@ -2071,30 +2653,20 @@ jobs:
                   )
               )
 
-              # ========================================================
-              # TEXT OUTLINE
-              # ========================================================
-
               style.outline = OUTLINE_SIZE
 
               style.shadow = SHADOW_SIZE
 
-              # ========================================================
-              # BOTTOM CENTER
-              # ========================================================
+              # Bottom-center.
 
               style.alignment = 2
 
-              # ========================================================
-              # Margins
-              # ========================================================
-
+              # Margin không còn quyết định vị trí.
+              #
+              # Vị trí thật dùng \pos().
               style.marginl = 30
               style.marginr = 30
-
-              style.marginv = (
-                  SUBTITLE_BOTTOM_MARGIN
-              )
+              style.marginv = 0
 
               subs.styles[
                   "Default"
@@ -2106,25 +2678,30 @@ jobs:
 
               for cue in cues:
 
-                  vi = cue["vi"]
+                  vi = cue[
+                      "vi"
+                  ]
 
-                  # ====================================================
-                  # Force ASS rendering settings.
+                  # ----------------------------------------------------
+                  # Center X.
                   #
-                  # \fsp-1:
-                  # chữ sát nhau hơn.
-                  #
-                  # \q2:
-                  # smart line wrapping.
-                  #
-                  # \N không được tự thêm ở đây.
-                  # ====================================================
+                  # Subtitle Việt luôn nằm giữa video.
+                  # ----------------------------------------------------
+
+                  x = width // 2
 
                   text = (
-                      "{\\fsp"
-                      f"{LETTER_SPACING}"
+
+                      "{\\an2"
+
+                      f"\\pos({x},{subtitle_y})"
+
+                      f"\\fsp{LETTER_SPACING}"
+
                       "\\q2}"
+
                       +
+
                       vi
                   )
 
@@ -2164,30 +2741,21 @@ jobs:
           # ============================================================
           # RENDER
           #
-          # Thay DELLOGO bằng blur thật.
+          # Blur chỉ nằm trong rectangle:
           #
-          # Pipeline:
+          # x1 -> x2
+          # y1 -> y2
           #
-          # [source]
-          #      |
-          #      +--------------------+
-          #      |                    |
-          #      |                    |
-          #    main                blur copy
-          #                           |
-          #                         crop
-          #                           |
-          #                       boxblur
-          #                           |
-          #                           +------+
-          #                                  |
-          # main ------------------------- overlay
-          #                                  |
-          #                                ASS
+          # Chiều cao = khoảng 50px.
           #
-          # Kết quả:
-          # subtitle Trung cũ bị blur mềm,
-          # không phải interpolation của delogo.
+          # Sau đó ASS đặt subtitle Việt sao cho:
+          #
+          # đáy text
+          #      ↓
+          #      5px
+          #      ↓
+          # đáy blur
+          #
           # ============================================================
 
           def render_video(
@@ -2232,7 +2800,7 @@ jobs:
               )
 
               # ========================================================
-              # Validate
+              # VALIDATE
               # ========================================================
 
               if x1 < 0:
@@ -2267,12 +2835,6 @@ jobs:
                       f"Invalid blur height={h}"
                   )
 
-              if y2 >= height:
-                  raise RuntimeError(
-                      "Blur region unexpectedly "
-                      "touches bottom of frame."
-                  )
-
               print()
               print(
                   "=========================================="
@@ -2299,7 +2861,7 @@ jobs:
               )
 
               print(
-                  f"bottom gap={height - y2}px"
+                  f"bottom={y2}"
               )
 
               print(
@@ -2311,10 +2873,6 @@ jobs:
               )
 
               print()
-
-              # ========================================================
-              # ASS path
-              # ========================================================
 
               ass_path = (
                   str(ass)
@@ -2333,13 +2891,20 @@ jobs:
               )
 
               # ========================================================
-              # Blur filter
+              # FFmpeg FILTER
               #
-              # Dùng split thay vì delogo.
+              # split:
               #
-              # crop chính xác vùng subtitle,
-              # blur vùng đó,
-              # overlay trở lại vị trí cũ.
+              # [main]  = video gốc
+              # [blur]  = copy dùng để blur
+              #
+              # crop chính xác 50px.
+              #
+              # boxblur.
+              #
+              # overlay lại đúng vị trí.
+              #
+              # Sau đó ASS.
               # ========================================================
 
               video_filter = (
@@ -2348,6 +2913,7 @@ jobs:
                   "[main][blur];"
 
                   "[blur]"
+
                   f"crop="
                   f"w={w}:"
                   f"h={h}:"
@@ -2356,20 +2922,25 @@ jobs:
 
                   f"boxblur="
                   f"luma_radius={BLUR_SIGMA}:"
-                  f"luma_power=1:"
+                  f"luma_power=2:"
                   f"chroma_radius={BLUR_SIGMA}:"
-                  f"chroma_power=1"
+                  f"chroma_power=2"
+
                   "[blurred];"
 
                   "[main]"
+
                   "[blurred]"
+
                   f"overlay="
                   f"x={x1}:"
-                  f"y={y1}"
-                  ":eof_action=pass"
+                  f"y={y1}:"
+                  "eof_action=pass"
+
                   "[clean];"
 
                   "[clean]"
+
                   f"ass='{ass_path}'"
               )
 
@@ -2378,10 +2949,6 @@ jobs:
                   /
                   "video_vi.mp4"
               )
-
-              # ========================================================
-              # Remove old output
-              # ========================================================
 
               if output.exists():
                   output.unlink()
@@ -2479,15 +3046,8 @@ jobs:
                       f"Video không tồn tại: {VIDEO}"
                   )
 
-              (
-                  width,
-                  height,
-                  fps,
-                  duration
-              ) = probe_video()
-
               # ========================================================
-              # 1. Find initial subtitle region
+              # 1. Find initial region
               # ========================================================
 
               initial_region = (
@@ -2496,8 +3056,6 @@ jobs:
 
               # ========================================================
               # 2. OCR whole video
-              #
-              # Đồng thời tìm subtitle dài nhất.
               # ========================================================
 
               (
@@ -2514,7 +3072,7 @@ jobs:
                   )
 
               # ========================================================
-              # Save final region
+              # 3. Save region
               # ========================================================
 
               region_file = (
@@ -2533,7 +3091,7 @@ jobs:
               )
 
               # ========================================================
-              # 3. Chinese SRT
+              # 4. Chinese SRT
               # ========================================================
 
               chinese_srt = (
@@ -2549,7 +3107,7 @@ jobs:
               )
 
               # ========================================================
-              # 4. Translate
+              # 5. Translate
               # ========================================================
 
               translated = (
@@ -2559,7 +3117,7 @@ jobs:
               )
 
               # ========================================================
-              # 5. Vietnamese SRT
+              # 6. Vietnamese SRT
               # ========================================================
 
               vietnamese_srt = (
@@ -2575,7 +3133,7 @@ jobs:
               )
 
               # ========================================================
-              # 6. ASS
+              # 7. ASS
               # ========================================================
 
               ass = (
@@ -2586,7 +3144,7 @@ jobs:
               )
 
               # ========================================================
-              # 7. Render
+              # 8. Render
               # ========================================================
 
               output = (
@@ -2715,7 +3273,7 @@ jobs:
 
 
       # ==========================================================
-      # UPLOAD ARTIFACT
+      # UPLOAD
       # ==========================================================
 
       - name: Upload result
