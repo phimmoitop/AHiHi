@@ -106,6 +106,7 @@ jobs:
           cat > process.py <<'PY'
           import os, re, json, subprocess
           from pathlib import Path
+          from difflib import SequenceMatcher
           import cv2
           import numpy as np
           import pysubs2
@@ -132,9 +133,9 @@ jobs:
           SCAN_Y_RATIO = 0.75
 
           # Subtitle style (chữ Việt)
-          FONT_SIZE = 25
+          FONT_SIZE = 30
           LETTER_SPACING = -1
-          OUTLINE_SIZE = 2
+          OUTLINE_SIZE = 1
           SHADOW_SIZE = 0
 
           # ------------------------------------------------------------
@@ -163,6 +164,20 @@ jobs:
           MIN_CHINESE_COUNT = 2
           MIN_BOX_WIDTH = 40
           MIN_BOX_HEIGHT = 8
+
+          # ------------------------------------------------------------
+          # GỘP CUE THEO ĐỘ TƯƠNG ĐỒNG (chống OCR đọc lệch giữa các frame
+          # của CÙNG MỘT dòng sub, ví dụ "知天上公雀" / "不知天上公雀" /
+          # "下知天上公雀" chỉ lệch 1 ký tự do OCR nhận nhầm).
+          #
+          # Nếu 2 cue liền kề (khoảng cách < CUE_MERGE_MAX_GAP) có độ
+          # tương đồng text >= CUE_SIMILARITY_THRESHOLD -> coi là cùng
+          # 1 dòng sub, gộp lại. Text cuối cùng chọn theo biến thể có
+          # TỔNG THỜI LƯỢNG xuất hiện nhiều nhất (majority vote theo
+          # duration), không phải bản đọc cuối cùng.
+          # ------------------------------------------------------------
+          CUE_SIMILARITY_THRESHOLD = 0.5
+          CUE_MERGE_MAX_GAP = 0.6
 
 
           # ============================== FFPROBE ==============================
@@ -361,18 +376,51 @@ jobs:
               if previous_text and start_time is not None:
                   cues.append({"start": start_time, "end": duration, "text": previous_text})
 
-              # Cleanup + merge cue liền kề trùng text
-              cleaned = []
-              for cue in cues:
-                  if len(cue["text"]) < 2 or (cue["end"] - cue["start"]) < 0.15:
-                      continue
-                  if cleaned:
-                      previous = cleaned[-1]
-                      gap = cue["start"] - previous["end"]
-                      if cue["text"] == previous["text"] and gap < 0.6:
-                          previous["end"] = cue["end"]
+              # Cleanup cơ bản (bỏ cue quá ngắn / quá ít ký tự)
+              raw_cues = [c for c in cues if len(c["text"]) >= 2 and (c["end"] - c["start"]) >= 0.15]
+
+              # --------------------------------------------------------------
+              # GỘP CUE THEO ĐỘ TƯƠNG ĐỒNG
+              #
+              # cue liền kề (gap nhỏ) có text gần giống nhau -> rất có thể là
+              # CÙNG một dòng sub, chỉ khác nhau do OCR đọc lệch giữa các
+              # frame. Gộp lại và chọn biến thể xuất hiện lâu nhất làm text
+              # chính thức, thay vì để mỗi biến thể tạo ra 1 cue riêng rồi
+              # dịch trùng nhiều lần.
+              # --------------------------------------------------------------
+              def text_similarity(a, b):
+                  if not a or not b:
+                      return 0.0
+                  return SequenceMatcher(None, a, b).ratio()
+
+              merge_groups = []  # mỗi phần tử: {"start","end","variants": {text: total_duration}}
+              for cue in raw_cues:
+                  duration = cue["end"] - cue["start"]
+                  if merge_groups:
+                      group = merge_groups[-1]
+                      gap = cue["start"] - group["end"]
+                      best_variant = max(group["variants"].items(), key=lambda kv: kv[1])[0]
+                      sim = text_similarity(cue["text"], best_variant)
+                      if gap < CUE_MERGE_MAX_GAP and sim >= CUE_SIMILARITY_THRESHOLD:
+                          group["end"] = cue["end"]
+                          group["variants"][cue["text"]] = group["variants"].get(cue["text"], 0.0) + duration
                           continue
-                  cleaned.append(cue)
+                  merge_groups.append({
+                      "start": cue["start"], "end": cue["end"],
+                      "variants": {cue["text"]: duration},
+                  })
+
+              cleaned = []
+              for group in merge_groups:
+                  canonical_text, _ = max(group["variants"].items(), key=lambda kv: kv[1])
+                  cleaned.append({"start": group["start"], "end": group["end"], "text": canonical_text})
+                  if len(group["variants"]) > 1:
+                      variants_str = ", ".join(f"{t!r}({d:.1f}s)" for t, d in
+                                                sorted(group["variants"].items(), key=lambda kv: -kv[1]))
+                      print(f"[MERGE] {group['start']:.2f}s-{group['end']:.2f}s -> chọn {canonical_text!r} "
+                            f"trong số các biến thể OCR: {variants_str}")
+
+              print(f"\nRaw cues (trước khi gộp): {len(raw_cues)}  ->  Sau khi gộp theo độ tương đồng: {len(cleaned)}\n")
 
               # --------------------------------------------------------------
               # GẮN GEOMETRY CHO TỪNG CUE (dùng mốc thời gian GỐC, trước khi
@@ -672,7 +720,7 @@ jobs:
 
               print("\nRendering final video\n")
               cmd = ["ffmpeg", "-hide_banner", "-y", "-i", str(VIDEO), "-filter_complex", video_filter,
-                     "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                     "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
               subprocess.run(cmd, check=True)
 
