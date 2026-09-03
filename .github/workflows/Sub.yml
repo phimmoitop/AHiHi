@@ -2988,7 +2988,7 @@ jobs:
               "-movflags",
               "+faststart",
               str(output)
-            ]
+          ]
 
               subprocess.run(
                   command,
