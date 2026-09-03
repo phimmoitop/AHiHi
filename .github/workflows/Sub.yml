@@ -2907,42 +2907,35 @@ jobs:
               # Sau đó ASS.
               # ========================================================
 
-              video_filter = (
-
-                  "split=2"
-                  "[main][blur];"
-
-                  "[blur]"
-
-                  f"crop="
-                  f"w={w}:"
-                  f"h={h}:"
-                  f"x={x1}:"
-                  f"y={y1},"
-
-                  f"boxblur="
-                  f"luma_radius={BLUR_SIGMA}:"
-                  f"luma_power=2:"
-                  f"chroma_radius={BLUR_SIGMA}:"
-                  f"chroma_power=2"
-
-                  "[blurred];"
-
-                  "[main]"
-
-                  "[blurred]"
-
-                  f"overlay="
-                  f"x={x1}:"
-                  f"y={y1}:"
-                  "eof_action=pass"
-
-                  "[clean];"
-
-                  "[clean]"
-
-                  f"ass='{ass_path}'"
-              )
+          video_filter = (
+              "format=yuv420p,"
+              "split=2[main][blur];"
+              "[blur]"
+              f"crop="
+              f"w={w}:"
+              f"h={h}:"
+              f"x={x1}:"
+              f"y={y1},"
+              f"boxblur="
+              f"luma_radius={BLUR_SIGMA}:"
+              f"luma_power=2:"
+              f"chroma_radius={BLUR_SIGMA}:"
+              f"chroma_power=2,"
+              "format=yuv420p"
+              "[blurred];"
+              "[main]"
+              "[blurred]"
+              f"overlay="
+              f"x={x1}:"
+              f"y={y1}:"
+              "format=yuv420,"
+              "eof_action=pass"
+              "[ov];"
+              "[ov]"
+              f"ass='{ass_path}',"
+              "format=yuv420p"
+              "[vout]"
+          )
 
               output = (
                   OUTPUT
@@ -2968,49 +2961,34 @@ jobs:
 
               print()
 
-              command = [
-
-                  "ffmpeg",
-
-                  "-hide_banner",
-
-                  "-y",
-
-                  "-i",
-                  str(VIDEO),
-
-                  "-vf",
-                  video_filter,
-
-                  "-map",
-                  "0:v:0",
-
-                  "-map",
-                  "0:a?",
-
-                  "-c:v",
-                  "libx264",
-
-                  "-preset",
-                  "veryfast",
-
-                  "-crf",
-                  "21",
-
-                  "-pix_fmt",
-                  "yuv420p",
-
-                  "-c:a",
-                  "aac",
-
-                  "-b:a",
-                  "192k",
-
-                  "-movflags",
-                  "+faststart",
-
-                  str(output)
-              ]
+            command = [
+              "ffmpeg",
+              "-hide_banner",
+              "-y",
+              "-i",
+              str(VIDEO),
+              "-filter_complex",
+              video_filter,
+              "-map",
+              "[vout]",
+              "-map",
+              "0:a?",
+              "-c:v",
+              "libx264",
+              "-preset",
+              "veryfast",
+              "-crf",
+              "21",
+              "-pix_fmt",
+              "yuv420p",
+              "-c:a",
+              "aac",
+              "-b:a",
+              "192k",
+              "-movflags",
+              "+faststart",
+              str(output)
+            ]
 
               subprocess.run(
                   command,
