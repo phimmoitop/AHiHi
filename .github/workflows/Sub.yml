@@ -13,7 +13,7 @@ on:
         default: "1"
         type: string
       ocr_fps:
-        description: "FPS OCR, 1-2 là phù hợp"
+        description: "FPS OCR, 2-4 cho timing chuẩn hơn"
         required: false
         default: "2"
         type: string
@@ -121,19 +121,37 @@ jobs:
 
           SCAN_SECONDS = float(os.environ.get("SCAN_SECONDS", "1"))
           OCR_FPS = float(os.environ.get("OCR_FPS", "2"))
+          SAMPLE_STEP = 1.0 / OCR_FPS
 
           # Subtitle style
           FONT_SIZE = 25
           LETTER_SPACING = -1
           OUTLINE_SIZE = 2
           SHADOW_SIZE = 0
-          SUBTITLE_BOTTOM_MARGIN = 25
 
-          # Blur config
-          BLUR_PAD_X_RATIO = 0.012
-          BLUR_PAD_Y_RATIO = 0.008
+          # Khoảng cách giữa đáy vùng blur và đáy chữ phụ đề Việt.
+          SUBTITLE_GAP_BELOW_BLUR = 6
+
+          # ------------------------------------------------------------
+          # BLUR CONFIG
+          #
+          # Chiều cao blur = chiều cao chữ Trung (median, chống outlier)
+          #                  + một chút padding trên/dưới (pixel cố định,
+          #                  KHÔNG nhân theo % chiều cao video nữa).
+          #
+          # Chiều rộng blur = chiều rộng của dòng sub DÀI NHẤT toàn video
+          #                    + padding hai bên rộng rãi hơn, đủ để không
+          #                    bị hụt so với các dòng dài.
+          # ------------------------------------------------------------
+          BLUR_PAD_Y_TOP = 8
+          BLUR_PAD_Y_BOTTOM = 10
+
+          BLUR_PAD_X_RATIO = 0.02   # 2% chiều rộng video, mỗi bên
+          BLUR_EXTRA_X = 30         # cộng thêm cố định, mỗi bên (px)
+
           BLUR_SIGMA = 9
           MIN_BOTTOM_GAP = 8
+          MIN_BLUR_HEIGHT = 24
 
           MIN_CHINESE_COUNT = 2
           MIN_BOX_WIDTH = 40
@@ -261,8 +279,10 @@ jobs:
                       candidates.sort(reverse=True)
                       score, text, box = candidates[0]
                       x1, y1, x2, y2 = box
-                      padx = int(width * BLUR_PAD_X_RATIO)
-                      pady = int(height * BLUR_PAD_Y_RATIO)
+                      # Padding rất nhỏ ở bước tìm vùng ban đầu.
+                      # Vùng blur thật sẽ được tính lại sau khi OCR cả video.
+                      padx = int(width * 0.01)
+                      pady = int(height * 0.01)
                       x1 = max(0, x1 - padx)
                       y1 = max(0, y1 - pady)
                       x2 = min(width - 1, x2 + padx)
@@ -288,7 +308,7 @@ jobs:
               cues = []
               previous_text = ""
               start_time = None
-              subtitle_boxes = []
+              subtitle_boxes = []  # {"time","text","box"}
 
               for i in tqdm(range(samples), desc="OCR video"):
                   current_time = i / OCR_FPS
@@ -333,7 +353,7 @@ jobs:
               if previous_text and start_time is not None:
                   cues.append({"start": start_time, "end": duration, "text": previous_text})
 
-              # Cleanup
+              # Cleanup + merge cue liền kề trùng text
               cleaned = []
               for cue in cues:
                   if len(cue["text"]) < 2 or (cue["end"] - cue["start"]) < 0.15:
@@ -346,32 +366,93 @@ jobs:
                           continue
                   cleaned.append(cue)
 
+              # --------------------------------------------------------------
+              # GẮN GEOMETRY CHO TỪNG CUE (dùng mốc thời gian GỐC, trước khi
+              # bù trễ ở bước sau) để khớp đúng các observation OCR đã ghi
+              # nhận trong khoảng thời gian hiển thị thực tế của cue đó.
+              # --------------------------------------------------------------
+              half_step = SAMPLE_STEP / 2.0
+              for cue in cleaned:
+                  boxes_in_cue = [
+                      item["box"] for item in subtitle_boxes
+                      if cue["start"] - half_step - 1e-6 <= item["time"] <= cue["end"] + half_step + 1e-6
+                  ]
+                  if not boxes_in_cue:
+                      cue["_width"] = 0
+                      cue["_height"] = 0
+                      cue["_center_x"] = None
+                      continue
+                  widest = max(boxes_in_cue, key=lambda b: b["width"])
+                  heights = sorted(b["height"] for b in boxes_in_cue)
+                  cue["_width"] = widest["width"]
+                  cue["_height"] = heights[len(heights) // 2]  # median, chống outlier
+                  cue["_center_x"] = widest["center_x"]
+
+              cues_with_geo = [c for c in cleaned if c.get("_width", 0) > 0]
+              if not cues_with_geo:
+                  raise RuntimeError("Không gắn được geometry cho subtitle cue nào.")
+
+              # --------------------------------------------------------------
+              # BÙ TRỄ TIMING
+              #
+              # Vì lấy mẫu OCR mỗi SAMPLE_STEP giây, một subtitle chỉ được
+              # phát hiện SAU khi nó đã thực sự xuất hiện (trễ tối đa 1 step).
+              # Lùi cả start/end lại nửa bước lấy mẫu để bù trung bình,
+              # giúp thời gian hiển thị khớp thực tế hơn.
+              # --------------------------------------------------------------
+              for cue in cleaned:
+                  new_start = max(0.0, cue["start"] - half_step)
+                  new_end = max(new_start + 0.05, cue["end"] - half_step)
+                  cue["start"] = new_start
+                  cue["end"] = min(duration, new_end)
+
               print(f"\nSubtitle cues: {len(cleaned)}")
+              print(f"Timing compensation: -{half_step:.3f}s (half of {SAMPLE_STEP:.3f}s sample step)\n")
 
               if not subtitle_boxes:
                   raise RuntimeError("Không có geometry subtitle.")
 
-              longest = max(subtitle_boxes, key=lambda item: item["box"]["width"])
-              longest_box = longest["box"]
-              print(f"\nLONGEST SUBTITLE\nText: {longest['text']}  Time: {longest['time']:.2f}s")
-              print(f"X: {longest_box['x1']} -> {longest_box['x2']}  Y: {longest_box['y1']} -> {longest_box['y2']}")
-              print(f"Width: {longest_box['width']}  Height: {longest_box['height']}\n")
+              # --------------------------------------------------------------
+              # CHIỀU RỘNG BLUR = dòng dài nhất trong TOÀN BỘ các cue + padding
+              # --------------------------------------------------------------
+              longest_cue = max(cues_with_geo, key=lambda c: c["_width"])
+              longest_width = longest_cue["_width"]
+              center_x = longest_cue["_center_x"]
 
-              max_height = max(item["box"]["height"] for item in subtitle_boxes)
-              longest_width = longest_box["width"]
-              center_x = longest_box["center_x"]
+              print("LONGEST SUBTITLE")
+              print("Text:", longest_cue["text"])
+              print("Width:", longest_width)
 
-              blur_width = int(longest_width + width * BLUR_PAD_X_RATIO * 2)
-              blur_height = max(int(max_height + height * BLUR_PAD_Y_RATIO * 2), 20)
+              pad_x_each = int(width * BLUR_PAD_X_RATIO) + BLUR_EXTRA_X
+              blur_width = longest_width + pad_x_each * 2
 
               blur_x1 = int(center_x - blur_width / 2)
               blur_x2 = blur_x1 + blur_width
 
+              # --------------------------------------------------------------
+              # CHIỀU CAO BLUR = median chiều cao chữ (theo từng cue trước,
+              # rồi lấy median của các median đó) + padding cố định nhỏ.
+              #
+              # Cách này chống outlier tốt hơn nhiều so với dùng max() toàn
+              # bộ video, vốn là nguyên nhân khiến blur bị "cao quá".
+              # --------------------------------------------------------------
+              per_cue_heights = sorted(c["_height"] for c in cues_with_geo)
+              text_height = per_cue_heights[len(per_cue_heights) // 2]
+
+              blur_height = int(text_height + BLUR_PAD_Y_TOP + BLUR_PAD_Y_BOTTOM)
+              blur_height = max(blur_height, MIN_BLUR_HEIGHT)
+
+              # Vị trí dọc: dùng median center_y của TẤT CẢ observation
+              # (đã bị giới hạn trong crop ban đầu nên không thể lệch xa).
               centers_y = [item["box"]["center_y"] for item in subtitle_boxes]
               subtitle_center_y = float(np.median(centers_y))
+
               blur_y1 = int(subtitle_center_y - blur_height / 2)
               blur_y2 = blur_y1 + blur_height
 
+              # --------------------------------------------------------------
+              # Clamp
+              # --------------------------------------------------------------
               blur_x1 = max(0, blur_x1)
               blur_x2 = min(width, blur_x2)
               blur_y1 = max(0, blur_y1)
@@ -388,18 +469,20 @@ jobs:
                   "x1": int(blur_x1), "y1": int(blur_y1), "x2": int(blur_x2), "y2": int(blur_y2),
                   "width": width, "height": height, "fps": fps,
                   "found_at": initial_region["found_at"], "sample_text": initial_region["sample_text"],
-                  "longest_text": longest["text"], "longest_subtitle_width": int(longest_width),
-                  "longest_subtitle_height": int(max_height),
+                  "longest_text": longest_cue["text"], "longest_subtitle_width": int(longest_width),
+                  "text_height": int(text_height),
                   "blur_width": int(blur_x2 - blur_x1), "blur_height": int(blur_y2 - blur_y1),
                   "bottom_gap": int(height - blur_y2),
               }
 
               print("\nFINAL BLUR REGION")
               print(f"x1={blur_x1} y1={blur_y1} x2={blur_x2} y2={blur_y2}")
-              print(f"Blur width={blur_x2 - blur_x1}  Blur height={blur_y2 - blur_y1}")
+              print(f"Blur width={blur_x2 - blur_x1}  Blur height={blur_y2 - blur_y1}  (text_height={text_height})")
               print(f"Bottom gap={height - blur_y2}px\n")
 
-              return cleaned, final_region
+              # trả về cue sạch (bỏ field tạm _width/_height/_center_x)
+              output_cues = [{"start": c["start"], "end": c["end"], "text": c["text"]} for c in cleaned]
+              return output_cues, final_region
 
 
           # ============================== SAVE SRT ==============================
@@ -453,8 +536,16 @@ jobs:
 
           # ============================== CREATE ASS ==============================
           def create_ass(cues, region):
+              width = int(region["width"])
+              # Đáy vùng blur — sub Việt sẽ được neo NGAY TẠI ĐÂY,
+              # thay vì dùng margin cố định tính từ đáy video (đó là lý do
+              # trước đây sub Việt bị lệch thấp hơn hẳn vùng blur).
+              blur_y2 = int(region["y2"])
+              subtitle_y = blur_y2 - SUBTITLE_GAP_BELOW_BLUR
+
               font_name = find_font()
-              print(f"\nSUBTITLE STYLE\nFont: {font_name}  Size: {FONT_SIZE}  Spacing: {LETTER_SPACING}  Outline: {OUTLINE_SIZE}\n")
+              print(f"\nSUBTITLE STYLE\nFont: {font_name}  Size: {FONT_SIZE}  Spacing: {LETTER_SPACING}  Outline: {OUTLINE_SIZE}")
+              print(f"Subtitle Y (anchor, bottom-center): {subtitle_y}  (blur bottom={blur_y2}, gap={SUBTITLE_GAP_BELOW_BLUR}px)\n")
 
               subs = pysubs2.SSAFile()
               style = pysubs2.SSAStyle()
@@ -469,11 +560,20 @@ jobs:
               style.alignment = 2  # bottom-center
               style.marginl = 30
               style.marginr = 30
-              style.marginv = SUBTITLE_BOTTOM_MARGIN
+              style.marginv = 0
               subs.styles["Default"] = style
 
+              x = width // 2
               for cue in cues:
-                  text = "{\\fsp" + str(LETTER_SPACING) + "\\q2}" + cue["vi"]
+                  # \an2 + \pos() neo chữ vào đúng đáy vùng blur, không phụ
+                  # thuộc marginv của style nữa.
+                  text = (
+                      "{\\an2"
+                      f"\\pos({x},{subtitle_y})"
+                      f"\\fsp{LETTER_SPACING}"
+                      "\\q2}"
+                      + cue["vi"]
+                  )
                   subs.events.append(pysubs2.SSAEvent(
                       start=int(cue["start"] * 1000), end=int(cue["end"] * 1000), text=text))
 
