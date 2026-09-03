@@ -137,9 +137,6 @@ jobs:
           OUTLINE_SIZE = 2
           SHADOW_SIZE = 0
 
-          # Khoảng cách giữa đáy vùng blur và đáy chữ phụ đề Việt.
-          SUBTITLE_GAP_BELOW_BLUR = 6
-
           # ------------------------------------------------------------
           # BLUR CONFIG
           #
@@ -148,15 +145,16 @@ jobs:
           #
           # Chiều rộng/vị trí ngang blur = LẤY UNION (x nhỏ nhất -> x lớn
           #                  nhất) của TẤT CẢ các cue trong toàn bộ video,
-          #                  không dựa vào 1 cue/1 tâm duy nhất. Cách này
-          #                  đảm bảo dòng nào cũng được che trọn, kể cả khi
-          #                  các dòng không cùng căn giữa với nhau.
+          #                  sau đó SCALE lên theo BLUR_WIDTH_MULTIPLIER
+          #                  (mặc định x1.5) quanh tâm, để chắc chắn bao
+          #                  trọn cả dòng chữ dài nhất kể cả các dòng
+          #                  không cùng căn giữa với nhau.
           # ------------------------------------------------------------
           BLUR_PAD_Y_TOP = 8
           BLUR_PAD_Y_BOTTOM = 10
 
-          BLUR_PAD_X_RATIO = 0.03   # 3% chiều rộng video, mỗi bên
-          BLUR_EXTRA_X = 40         # cộng thêm cố định, mỗi bên (px)
+          BLUR_WIDTH_MULTIPLIER = 1.5   # tổng chiều rộng blur = 1.5x chiều rộng union thực của text
+          BLUR_EXTRA_X = 20             # cộng thêm cố định mỗi bên (px), sau khi đã scale x1.5
 
           BLUR_SIGMA = 9
           MIN_BOTTOM_GAP = 8
@@ -429,9 +427,9 @@ jobs:
               # CHIỀU RỘNG / VỊ TRÍ NGANG BLUR
               #
               # Lấy UNION (x nhỏ nhất -> x lớn nhất) trên TOÀN BỘ các cue,
-              # không chỉ dựa vào 1 cue dài nhất. Đảm bảo mọi dòng chữ,
-              # dù căn trái/phải/giữa khác nhau, đều nằm trọn trong vùng
-              # blur cuối cùng.
+              # sau đó SCALE quanh tâm theo BLUR_WIDTH_MULTIPLIER để đảm
+              # bảo bao trọn cả dòng chữ dài nhất, dù căn trái/phải/giữa
+              # khác nhau giữa các dòng.
               # --------------------------------------------------------------
               union_x1 = min(c["_x1"] for c in cues_with_geo)
               union_x2 = max(c["_x2"] for c in cues_with_geo)
@@ -441,7 +439,13 @@ jobs:
               print("Text:", widest_cue["text"])
               print(f"Union X range (all cues): {union_x1} -> {union_x2}")
 
-              pad_x_each = int(width * BLUR_PAD_X_RATIO) + BLUR_EXTRA_X
+              raw_width = union_x2 - union_x1
+              target_width = raw_width * BLUR_WIDTH_MULTIPLIER
+              extra_total = max(0, target_width - raw_width)
+              pad_x_each = int(extra_total / 2) + BLUR_EXTRA_X
+              print(f"Raw union width={raw_width}px -> target width (x{BLUR_WIDTH_MULTIPLIER})={target_width:.0f}px "
+                    f"-> pad each side={pad_x_each}px\n")
+
               blur_x1 = union_x1 - pad_x_each
               blur_x2 = union_x2 + pad_x_each
 
@@ -524,9 +528,31 @@ jobs:
                   with torch.no_grad():
                       output = model.generate(**inputs, max_length=256, num_beams=4)
                   translations = tokenizer.batch_decode(output, skip_special_tokens=True)
-                  for cue, vi in zip(batch, translations):
+                  for idx, (cue, vi) in enumerate(zip(batch, translations), start=offset):
                       vi = vi.strip() or cue["text"]
                       results.append({"start": cue["start"], "end": cue["end"], "text": cue["text"], "vi": vi})
+
+                      # ---------------------------------------------------------
+                      # DEBUG: in ra từng dòng gốc (ZH) và dịch (VI) để đối chiếu
+                      # trực tiếp trong log của step "OCR → Translate → Render".
+                      # Đánh dấu ⚠ SUSPICIOUS khi câu Việt ngắn bất thường so với
+                      # câu Hán gốc (dấu hiệu model dịch bị cụt/degenerate output).
+                      # ---------------------------------------------------------
+                      zh_len, vi_len = len(cue["text"]), len(vi)
+                      flag = "  ⚠ SUSPICIOUS (VI quá ngắn so với ZH)" if vi_len < zh_len * 0.6 else ""
+                      print(f"[{idx:03d}] {cue['start']:.2f}s-{cue['end']:.2f}s | "
+                            f"ZH({zh_len}): {cue['text']!r}  ->  VI({vi_len}): {vi!r}{flag}")
+
+              # Ghi file debug đầy đủ để tải về xem lại sau khi workflow chạy xong
+              debug_path = WORK / "translation_debug.txt"
+              with open(debug_path, "w", encoding="utf-8") as f:
+                  for idx, r in enumerate(results):
+                      zh_len, vi_len = len(r["text"]), len(r["vi"])
+                      flag = " [SUSPICIOUS]" if vi_len < zh_len * 0.6 else ""
+                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s{flag}\n")
+                      f.write(f"  ZH ({zh_len} ky tu): {r['text']}\n")
+                      f.write(f"  VI ({vi_len} ky tu): {r['vi']}\n\n")
+
               return results
 
 
@@ -552,13 +578,21 @@ jobs:
               width = int(region["width"])
               height = int(region["height"])
 
-              # Đáy vùng blur — sub Việt sẽ được neo NGAY TẠI ĐÂY.
+              # ------------------------------------------------------------
+              # Neo sub Việt vào ĐÚNG TÂM (giữa-giữa) của vùng blur, theo
+              # cả 2 hướng ngang và dọc, thay vì chỉ bám đáy như trước.
+              # ------------------------------------------------------------
+              blur_x1 = int(region["x1"])
+              blur_x2 = int(region["x2"])
+              blur_y1 = int(region["y1"])
               blur_y2 = int(region["y2"])
-              subtitle_y = blur_y2 - SUBTITLE_GAP_BELOW_BLUR
+              subtitle_x = (blur_x1 + blur_x2) // 2
+              subtitle_y = (blur_y1 + blur_y2) // 2
 
               font_name = find_font()
               print(f"\nSUBTITLE STYLE\nFont: {font_name}  Size: {FONT_SIZE}  Spacing: {LETTER_SPACING}  Outline: {OUTLINE_SIZE}")
-              print(f"Subtitle Y (anchor, bottom-center): {subtitle_y}  (blur bottom={blur_y2}, gap={SUBTITLE_GAP_BELOW_BLUR}px)\n")
+              print(f"Subtitle anchor (center of blur box): x={subtitle_x} y={subtitle_y}  "
+                    f"(blur box: x1={blur_x1} y1={blur_y1} x2={blur_x2} y2={blur_y2})\n")
 
               subs = pysubs2.SSAFile()
 
@@ -584,18 +618,17 @@ jobs:
               style.backcolor = pysubs2.Color(0, 0, 0, 0)
               style.outline = OUTLINE_SIZE
               style.shadow = SHADOW_SIZE
-              style.alignment = 2  # bottom-center
+              style.alignment = 5  # middle-center (giữa-giữa)
               style.marginl = 30
               style.marginr = 30
               style.marginv = 0
               subs.styles["Default"] = style
 
-              x = width // 2
               for cue in cues:
-                  # \an2 + \pos() neo chữ vào đúng đáy vùng blur.
+                  # \an5 + \pos() neo chữ vào ĐÚNG TÂM vùng blur (cả ngang lẫn dọc).
                   text = (
-                      "{\\an2"
-                      f"\\pos({x},{subtitle_y})"
+                      "{\\an5"
+                      f"\\pos({subtitle_x},{subtitle_y})"
                       f"\\fsp{LETTER_SPACING}"
                       "\\q2}"
                       + cue["vi"]
@@ -678,6 +711,7 @@ jobs:
               print(f"Video: {output}")
               print(f"Chinese SRT: {chinese_srt}")
               print(f"Vietnamese SRT: {vietnamese_srt}")
+              print(f"Translation debug: {WORK / 'translation_debug.txt'}")
               print(f"Region: {region_file}\n")
               print("FINAL REGION:")
               print(json.dumps(region, ensure_ascii=False, indent=2))
@@ -705,6 +739,8 @@ jobs:
           ls -lh work/*.srt work/*.ass 2>/dev/null || true
           echo "Subtitle region:"
           cat work/subtitle_region.json 2>/dev/null || true
+          echo "Translation debug (ZH vs VI, per line):"
+          cat work/translation_debug.txt 2>/dev/null || true
           echo "Final video information:"
           ffprobe -hide_banner -v error -show_entries format=duration,size \
             -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1 output/video_vi.mp4
@@ -719,6 +755,7 @@ jobs:
             work/vietnamese.srt
             work/vietnamese.ass
             work/subtitle_region.json
+            work/translation_debug.txt
           retention-days: 7
 
       - name: Cleanup cookies
