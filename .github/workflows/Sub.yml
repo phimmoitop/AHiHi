@@ -172,7 +172,7 @@ jobs:
 
           SCAN_Y_RATIO = 0.75
 
-          FONT_SIZE = 30
+          FONT_SIZE = 35
           LETTER_SPACING = -1
           OUTLINE_SIZE = 1
           SHADOW_SIZE = 0
