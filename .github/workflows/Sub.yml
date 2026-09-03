@@ -24,7 +24,6 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: "1"
-      HF_HOME: "${{ github.workspace }}/work/huggingface"
 
     steps:
       - name: Checkout repository
@@ -94,7 +93,7 @@ jobs:
         run: |
           set -eux
           python -m pip install --upgrade pip
-          python -m pip install yt-dlp numpy==1.26.4 opencv-python-headless==4.10.0.84 pillow tqdm pysubs2 sentencepiece safetensors torch==2.4.1 transformers==4.47.1
+          python -m pip install yt-dlp numpy==1.26.4 opencv-python-headless==4.10.0.84 pillow tqdm pysubs2 google-genai
           python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
           python -m pip install paddleocr==3.3.2
 
@@ -151,7 +150,7 @@ jobs:
       - name: Create processing script
         run: |
           cat > process.py <<'PY'
-          import os, re, json, subprocess
+          import os, re, json, time, random, subprocess
           from pathlib import Path
           from difflib import SequenceMatcher
           import cv2
@@ -159,12 +158,12 @@ jobs:
           import pysubs2
           from tqdm import tqdm
           from paddleocr import PaddleOCR
-          from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+          from google import genai
+          from google.genai import types
 
           WORK = Path("work")
           OUTPUT = Path("output")
           VIDEO = WORK / "source.mp4"
-          MODEL_NAME = "Helsinki-NLP/opus-mt-zh-vi"
 
           SCAN_SECONDS = float(os.environ.get("SCAN_SECONDS", "1"))
           OCR_FPS = float(os.environ.get("OCR_FPS", "2"))
@@ -199,6 +198,35 @@ jobs:
           CUE_SIMILARITY_THRESHOLD = 0.5
           CUE_MERGE_MAX_GAP = 0.6
 
+          GEMINI_MODEL = "gemini-2.5-flash"
+          GEMINI_BATCH_SIZE = 100
+          GEMINI_MAX_RETRIES = 10
+
+          RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
+          GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
+
+          SYSTEM_INSTRUCTION = (
+              "You are a professional video subtitle translator. Translate the text into natural, fluent Vietnamese.\n"
+              "CRITICAL RULES:\n"
+              "1. You MUST output EVERY line with its exact index. Never skip any index.\n"
+              "2. Maintain the exact same line identifiers like [0], [1], [2], etc. Do not merge, skip, or group any lines.\n"
+              "3. If a line is empty or just '...', output the identifier with '...'.\n"
+              "4. Translate naturally based on the surrounding context of the whole video.\n"
+              "5. Output ONLY the translated numbered lines. No markdown, no notes, no extra text.\n"
+              "6. PRONOUN SAFETY (VERY IMPORTANT): The source is Chinese, where family/relationship terms "
+              "(mother, older brother, uncle, etc.) are usually explicit in the dialogue itself. When translating "
+              "to Vietnamese, ALWAYS use the correct relational pronoun based on the clear relationship stated or "
+              "implied (mẹ/con, anh/em, cô/cháu, etc.) — never swap the roles.\n"
+              "7. If the relationship between speaker and listener is AMBIGUOUS or CANNOT be determined from the "
+              "given line alone, DO NOT guess a specific relational pronoun. Instead, rephrase the sentence to be "
+              "SHORTER and more NEUTRAL — using no pronoun, an implied subject, or a generic/neutral phrasing — "
+              "so the sentence still sounds natural in Vietnamese without committing to an incorrect relationship."
+          )
+
+
+          def log(msg):
+              print(msg, flush=True)
+
 
           def probe_video():
               cmd = ["ffprobe", "-hide_banner", "-v", "error", "-select_streams", "v:0",
@@ -224,7 +252,7 @@ jobs:
               return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-          print("Loading PaddleOCR")
+          log("Loading PaddleOCR")
           ocr = PaddleOCR(lang="ch")
 
 
@@ -237,7 +265,7 @@ jobs:
                       if callable(data):
                           data = data()
                   except Exception as e:
-                      print("page.json ERROR:", repr(e))
+                      log(f"page.json ERROR: {e!r}")
                       continue
                   if isinstance(data, str):
                       try:
@@ -279,7 +307,7 @@ jobs:
 
           def find_subtitle_region():
               width, height, fps, duration = probe_video()
-              print(f"VIDEO: {width}x{height} FPS={fps:.2f} Duration={duration:.2f}s")
+              log(f"VIDEO: {width}x{height} FPS={fps:.2f} Duration={duration:.2f}s")
 
               y0 = int(height * SCAN_Y_RATIO)
               max_scan = min(duration, 90)
@@ -321,7 +349,7 @@ jobs:
 
                       region = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "width": width, "height": height,
                                 "fps": fps, "found_at": time_sec, "sample_text": text}
-                      print(f"INITIAL SUBTITLE REGION FOUND: {region}")
+                      log(f"INITIAL SUBTITLE REGION FOUND: {region}")
                       return region
 
                   time_sec += SCAN_SECONDS
@@ -333,7 +361,7 @@ jobs:
               width, height, fps, duration = probe_video()
               rx1, ry1, rx2, ry2 = (initial_region[k] for k in ("x1", "y1", "x2", "y2"))
               samples = max(1, int(duration * OCR_FPS))
-              print(f"OCR FPS: {OCR_FPS} OCR samples: {samples}")
+              log(f"OCR FPS: {OCR_FPS} OCR samples: {samples}")
 
               cues = []
               previous_text = ""
@@ -412,7 +440,7 @@ jobs:
                   canonical_text, _ = max(group["variants"].items(), key=lambda kv: kv[1])
                   cleaned.append({"start": group["start"], "end": group["end"], "text": canonical_text})
 
-              print(f"Raw cues: {len(raw_cues)} -> Sau khi gop: {len(cleaned)}")
+              log(f"Raw cues: {len(raw_cues)} -> Sau khi gop: {len(cleaned)}")
 
               half_step = SAMPLE_STEP / 2.0
               for cue in cleaned:
@@ -421,7 +449,7 @@ jobs:
                   cue["start"] = new_start
                   cue["end"] = min(duration, new_end)
 
-              print(f"Subtitle cues: {len(cleaned)}")
+              log(f"Subtitle cues: {len(cleaned)}")
 
               if not subtitle_boxes:
                   raise RuntimeError("Khong co geometry subtitle.")
@@ -469,7 +497,7 @@ jobs:
                   "feather_px": int(feather_px),
               }
 
-              print(f"FINAL BLUR REGION: {final_region}")
+              log(f"FINAL BLUR REGION: {final_region}")
 
               output_cues = [{"start": c["start"], "end": c["end"], "text": c["text"]} for c in cleaned]
               return output_cues, final_region
@@ -483,28 +511,129 @@ jobs:
               subs.save(str(path), encoding="utf-8")
 
 
+          def get_random_gemini_client():
+              key = random.choice(GEMINI_API_KEYS)
+              return genai.Client(api_key=key), key
+
+
+          def call_gemini_with_retry(prompt_text, max_retries=GEMINI_MAX_RETRIES):
+              for attempt in range(max_retries):
+                  wait = 6 * (2 ** attempt)
+                  client, key = get_random_gemini_client()
+                  key_idx = GEMINI_API_KEYS.index(key) + 1
+                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Key #{key_idx} | {time.strftime('%H:%M:%S')}")
+                  try:
+                      t_start = time.time()
+                      response = client.models.generate_content(
+                          model=GEMINI_MODEL,
+                          contents=prompt_text,
+                          config=types.GenerateContentConfig(
+                              system_instruction=SYSTEM_INSTRUCTION,
+                              temperature=0.3,
+                          )
+                      )
+                      elapsed = time.time() - t_start
+                      log(f"<< NHAN KET QUA - Thanh cong sau {elapsed:.1f}s")
+                      return response.text
+                  except Exception as e:
+                      error_str = str(e)
+                      log(f"<< LOI API: {error_str}")
+                      if "503" in error_str or "429" in error_str or "UNAVAILABLE" in error_str or "500" in error_str:
+                          log(f"   Server ban/qua tai/limit. Doi key va cho {wait}s...")
+                          time.sleep(wait)
+                      else:
+                          log("   Loi khong the retry. Dung thu lai.")
+                          break
+              return None
+
+
+          def parse_translated(response_text):
+              translated_dict = {}
+              for line in response_text.strip().split("\n"):
+                  if "]" in line:
+                      try:
+                          parts = line.split("]", 1)
+                          idx_str = parts[0].replace("[", "").strip()
+                          val = parts[1].strip()
+                          if val == "...":
+                              val = ""
+                          translated_dict[int(idx_str)] = val
+                      except Exception:
+                          pass
+              return translated_dict
+
+
           def translate_cues(cues):
-              print(f"Loading translation model: {MODEL_NAME}")
-              tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-              model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-              model.eval()
+              if not GEMINI_API_KEYS:
+                  raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
+
+              total_lines = len(cues)
+              total_batches = (total_lines + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
+              log(f"BAT DAU DICH - {total_lines} dong / {total_batches} batch")
 
               results = []
-              batch_size = 8
-              import torch
-              for offset in tqdm(range(0, len(cues), batch_size), desc="Translate"):
-                  batch = cues[offset:offset + batch_size]
-                  texts = [x["text"] for x in batch]
-                  inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-                  with torch.no_grad():
-                      output = model.generate(**inputs, max_length=256, num_beams=4)
-                  translations = tokenizer.batch_decode(output, skip_special_tokens=True)
-                  for idx, (cue, vi) in enumerate(zip(batch, translations), start=offset):
-                      vi = vi.strip() or cue["text"]
+
+              for i in range(0, total_lines, GEMINI_BATCH_SIZE):
+                  batch = cues[i:i + GEMINI_BATCH_SIZE]
+                  batch_num = (i // GEMINI_BATCH_SIZE) + 1
+                  line_start = i + 1
+                  line_end = min(i + GEMINI_BATCH_SIZE, total_lines)
+
+                  log(f"[BATCH {batch_num}/{total_batches}] Dong {line_start}-{line_end} ({len(batch)} dong)")
+
+                  prompt_text = ""
+                  for idx, cue in enumerate(batch):
+                      clean_text = cue["text"].strip() or "..."
+                      prompt_text += f"[{idx}] {clean_text}\n"
+
+                  log(">> NOI DUNG GUI LEN API:")
+                  for line in prompt_text.strip().split("\n"):
+                      log(f"   {line}")
+
+                  response_text = call_gemini_with_retry(prompt_text)
+                  if response_text is None:
+                      raise RuntimeError(f"[THAT BAI] Khong the dich batch {batch_num} sau nhieu lan thu.")
+
+                  log(">> KET QUA DICH TU AI:")
+                  for line in response_text.strip().split("\n"):
+                      log(f"   {line}")
+
+                  translated_dict = parse_translated(response_text)
+
+                  missing_indices = [idx for idx in range(len(batch)) if idx not in translated_dict or not translated_dict.get(idx)]
+                  if missing_indices:
+                      log(f">> CANH BAO: AI bo sot {len(missing_indices)} dong: {missing_indices}. Retry...")
+
+                      retry_prompt = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
+                      for idx in missing_indices:
+                          clean_text = batch[idx]["text"].strip() or "..."
+                          retry_prompt += f"[{idx}] {clean_text}\n"
+                      retry_prompt += "\nOutput ONLY the missing lines with their exact [index] prefix."
+
+                      retry_response = call_gemini_with_retry(retry_prompt)
+                      if retry_response:
+                          log(">> KET QUA RETRY:")
+                          for line in retry_response.strip().split("\n"):
+                              log(f"   {line}")
+                          retry_dict = parse_translated(retry_response)
+                          translated_dict.update(retry_dict)
+
+                  fallback_count = 0
+                  for idx, cue in enumerate(batch):
+                      abs_line = i + idx + 1
+                      if idx in translated_dict and translated_dict[idx]:
+                          vi = translated_dict[idx]
+                      else:
+                          vi = cue["text"]
+                          fallback_count += 1
+                          log(f"   [{abs_line:04d}] FALLBACK (giu nguyen goc): {cue['text']!r}")
                       results.append({"start": cue["start"], "end": cue["end"], "text": cue["text"], "vi": vi})
-                      zh_len, vi_len = len(cue["text"]), len(vi)
-                      flag = " SUSPICIOUS" if vi_len < zh_len * 0.6 else ""
-                      print(f"[{idx:03d}] {cue['start']:.2f}s-{cue['end']:.2f}s | ZH: {cue['text']!r} -> VI: {vi!r}{flag}")
+
+                  if fallback_count > 0:
+                      log(f">> Batch {batch_num}: {fallback_count} dong giu nguyen tieng Trung do AI bo sot.")
+
+                  log(f"[BATCH {batch_num}/{total_batches}] Hoan thanh")
+                  time.sleep(3)
 
               debug_path = WORK / "translation_debug.txt"
               with open(debug_path, "w", encoding="utf-8") as f:
@@ -550,7 +679,7 @@ jobs:
               region["crop_x2"] = int(crop_x2)
               region["crop_y2"] = int(crop_y2)
 
-              print(f"FEATHER MASK: crop=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) size={crop_w}x{crop_h} feather={feather}px")
+              log(f"FEATHER MASK: crop=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) size={crop_w}x{crop_h} feather={feather}px")
 
               return mask_path
 
@@ -567,7 +696,7 @@ jobs:
               subtitle_y = (blur_y1 + blur_y2) // 2
 
               font_name = FONT_NAME
-              print(f"SUBTITLE STYLE Font: {font_name} Size: {FONT_SIZE}")
+              log(f"SUBTITLE STYLE Font: {font_name} Size: {FONT_SIZE}")
 
               subs = pysubs2.SSAFile()
               subs.info["PlayResX"] = width
@@ -606,7 +735,7 @@ jobs:
               subs.save(str(path), encoding="utf-8")
 
               invalid = [ev for ev in subs.events if ev.end <= ev.start]
-              print(f"ASS EVENTS WRITTEN: {len(subs.events)} (loi end<=start: {len(invalid)})")
+              log(f"ASS EVENTS WRITTEN: {len(subs.events)} (loi end<=start: {len(invalid)})")
               if len(subs.events) == 0:
                   raise RuntimeError("Khong co event nao duoc ghi vao file .ass.")
               if invalid:
@@ -624,7 +753,7 @@ jobs:
               if cx1 < 0 or cy1 < 0 or cx2 > width or cy2 > height or cw <= 0 or ch <= 0:
                   raise RuntimeError(f"Invalid feather crop region: x1={cx1} y1={cy1} x2={cx2} y2={cy2}")
 
-              print(f"FEATHER CROP REGION x={cx1} y={cy1} w={cw} h={ch} sigma={BLUR_SIGMA}")
+              log(f"FEATHER CROP REGION x={cx1} y={cy1} w={cw} h={ch} sigma={BLUR_SIGMA}")
 
               ass_path = str(ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
               mask_str = str(mask_path)
@@ -686,12 +815,12 @@ jobs:
               ass = create_ass(translated, region)
               output = render_video(ass, region, mask_path)
 
-              print("PROCESS COMPLETE")
-              print(f"Video: {output}")
-              print(f"Chinese SRT: {chinese_srt}")
-              print(f"Vietnamese SRT: {vietnamese_srt}")
-              print(f"Translation debug: {WORK / 'translation_debug.txt'}")
-              print(f"Region: {region_file}")
+              log("PROCESS COMPLETE")
+              log(f"Video: {output}")
+              log(f"Chinese SRT: {chinese_srt}")
+              log(f"Vietnamese SRT: {vietnamese_srt}")
+              log(f"Translation debug: {WORK / 'translation_debug.txt'}")
+              log(f"Region: {region_file}")
 
 
           if __name__ == "__main__":
@@ -703,6 +832,7 @@ jobs:
           SCAN_SECONDS: ${{ inputs.scan_seconds }}
           OCR_FPS: ${{ inputs.ocr_fps }}
           FONT_NAME: ${{ env.FONT_FAMILY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           DISABLE_MODEL_SOURCE_CHECK: "True"
           PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
         run: |
