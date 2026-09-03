@@ -15,7 +15,7 @@ on:
       ocr_fps:
         description: "FPS OCR, 2-4 cho timing chuẩn hơn"
         required: false
-        default: "2"
+        default: "1"
         type: string
 
 jobs:
