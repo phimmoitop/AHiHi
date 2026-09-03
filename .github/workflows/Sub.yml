@@ -123,7 +123,15 @@ jobs:
           OCR_FPS = float(os.environ.get("OCR_FPS", "2"))
           SAMPLE_STEP = 1.0 / OCR_FPS
 
-          # Subtitle style
+          # ------------------------------------------------------------
+          # Vùng quét tìm subtitle gốc ban đầu.
+          #
+          # Chỉ quét 1/4 chiều cao DƯỚI CÙNG của video (0.75 -> 1.0),
+          # tránh bắt nhầm chữ/logo nằm ở phía trên khung hình.
+          # ------------------------------------------------------------
+          SCAN_Y_RATIO = 0.75
+
+          # Subtitle style (chữ Việt)
           FONT_SIZE = 25
           LETTER_SPACING = -1
           OUTLINE_SIZE = 2
@@ -135,19 +143,20 @@ jobs:
           # ------------------------------------------------------------
           # BLUR CONFIG
           #
-          # Chiều cao blur = chiều cao chữ Trung (median, chống outlier)
-          #                  + một chút padding trên/dưới (pixel cố định,
-          #                  KHÔNG nhân theo % chiều cao video nữa).
+          # Chiều cao blur = chiều cao chữ Trung (median theo từng cue,
+          #                  chống outlier) + padding cố định trên/dưới.
           #
-          # Chiều rộng blur = chiều rộng của dòng sub DÀI NHẤT toàn video
-          #                    + padding hai bên rộng rãi hơn, đủ để không
-          #                    bị hụt so với các dòng dài.
+          # Chiều rộng/vị trí ngang blur = LẤY UNION (x nhỏ nhất -> x lớn
+          #                  nhất) của TẤT CẢ các cue trong toàn bộ video,
+          #                  không dựa vào 1 cue/1 tâm duy nhất. Cách này
+          #                  đảm bảo dòng nào cũng được che trọn, kể cả khi
+          #                  các dòng không cùng căn giữa với nhau.
           # ------------------------------------------------------------
           BLUR_PAD_Y_TOP = 8
           BLUR_PAD_Y_BOTTOM = 10
 
-          BLUR_PAD_X_RATIO = 0.02   # 2% chiều rộng video, mỗi bên
-          BLUR_EXTRA_X = 30         # cộng thêm cố định, mỗi bên (px)
+          BLUR_PAD_X_RATIO = 0.03   # 3% chiều rộng video, mỗi bên
+          BLUR_EXTRA_X = 40         # cộng thêm cố định, mỗi bên (px)
 
           BLUR_SIGMA = 9
           MIN_BOTTOM_GAP = 8
@@ -247,7 +256,8 @@ jobs:
               width, height, fps, duration = probe_video()
               print(f"\nVIDEO: {width}x{height}  FPS={fps:.2f}  Duration={duration:.2f}s\n")
 
-              y0 = int(height * 0.55)
+              # Chỉ quét 1/4 chiều cao dưới cùng của video.
+              y0 = int(height * SCAN_Y_RATIO)
               max_scan = min(duration, 90)
               time_sec = 0
 
@@ -370,6 +380,10 @@ jobs:
               # GẮN GEOMETRY CHO TỪNG CUE (dùng mốc thời gian GỐC, trước khi
               # bù trễ ở bước sau) để khớp đúng các observation OCR đã ghi
               # nhận trong khoảng thời gian hiển thị thực tế của cue đó.
+              #
+              # Với mỗi cue, lấy x1 NHỎ NHẤT và x2 LỚN NHẤT trong toàn bộ
+              # box quan sát được trong khoảng thời gian của cue -> đây là
+              # phạm vi ngang thực sự của dòng chữ đó (không chỉ 1 frame).
               # --------------------------------------------------------------
               half_step = SAMPLE_STEP / 2.0
               for cue in cleaned:
@@ -378,17 +392,16 @@ jobs:
                       if cue["start"] - half_step - 1e-6 <= item["time"] <= cue["end"] + half_step + 1e-6
                   ]
                   if not boxes_in_cue:
-                      cue["_width"] = 0
+                      cue["_x1"] = None
+                      cue["_x2"] = None
                       cue["_height"] = 0
-                      cue["_center_x"] = None
                       continue
-                  widest = max(boxes_in_cue, key=lambda b: b["width"])
+                  cue["_x1"] = min(b["x1"] for b in boxes_in_cue)
+                  cue["_x2"] = max(b["x2"] for b in boxes_in_cue)
                   heights = sorted(b["height"] for b in boxes_in_cue)
-                  cue["_width"] = widest["width"]
                   cue["_height"] = heights[len(heights) // 2]  # median, chống outlier
-                  cue["_center_x"] = widest["center_x"]
 
-              cues_with_geo = [c for c in cleaned if c.get("_width", 0) > 0]
+              cues_with_geo = [c for c in cleaned if c.get("_x1") is not None]
               if not cues_with_geo:
                   raise RuntimeError("Không gắn được geometry cho subtitle cue nào.")
 
@@ -413,28 +426,28 @@ jobs:
                   raise RuntimeError("Không có geometry subtitle.")
 
               # --------------------------------------------------------------
-              # CHIỀU RỘNG BLUR = dòng dài nhất trong TOÀN BỘ các cue + padding
+              # CHIỀU RỘNG / VỊ TRÍ NGANG BLUR
+              #
+              # Lấy UNION (x nhỏ nhất -> x lớn nhất) trên TOÀN BỘ các cue,
+              # không chỉ dựa vào 1 cue dài nhất. Đảm bảo mọi dòng chữ,
+              # dù căn trái/phải/giữa khác nhau, đều nằm trọn trong vùng
+              # blur cuối cùng.
               # --------------------------------------------------------------
-              longest_cue = max(cues_with_geo, key=lambda c: c["_width"])
-              longest_width = longest_cue["_width"]
-              center_x = longest_cue["_center_x"]
+              union_x1 = min(c["_x1"] for c in cues_with_geo)
+              union_x2 = max(c["_x2"] for c in cues_with_geo)
 
-              print("LONGEST SUBTITLE")
-              print("Text:", longest_cue["text"])
-              print("Width:", longest_width)
+              widest_cue = max(cues_with_geo, key=lambda c: c["_x2"] - c["_x1"])
+              print("WIDEST SUBTITLE OBSERVED")
+              print("Text:", widest_cue["text"])
+              print(f"Union X range (all cues): {union_x1} -> {union_x2}")
 
               pad_x_each = int(width * BLUR_PAD_X_RATIO) + BLUR_EXTRA_X
-              blur_width = longest_width + pad_x_each * 2
-
-              blur_x1 = int(center_x - blur_width / 2)
-              blur_x2 = blur_x1 + blur_width
+              blur_x1 = union_x1 - pad_x_each
+              blur_x2 = union_x2 + pad_x_each
 
               # --------------------------------------------------------------
               # CHIỀU CAO BLUR = median chiều cao chữ (theo từng cue trước,
               # rồi lấy median của các median đó) + padding cố định nhỏ.
-              #
-              # Cách này chống outlier tốt hơn nhiều so với dùng max() toàn
-              # bộ video, vốn là nguyên nhân khiến blur bị "cao quá".
               # --------------------------------------------------------------
               per_cue_heights = sorted(c["_height"] for c in cues_with_geo)
               text_height = per_cue_heights[len(per_cue_heights) // 2]
@@ -469,7 +482,7 @@ jobs:
                   "x1": int(blur_x1), "y1": int(blur_y1), "x2": int(blur_x2), "y2": int(blur_y2),
                   "width": width, "height": height, "fps": fps,
                   "found_at": initial_region["found_at"], "sample_text": initial_region["sample_text"],
-                  "longest_text": longest_cue["text"], "longest_subtitle_width": int(longest_width),
+                  "widest_text": widest_cue["text"], "union_x1": int(union_x1), "union_x2": int(union_x2),
                   "text_height": int(text_height),
                   "blur_width": int(blur_x2 - blur_x1), "blur_height": int(blur_y2 - blur_y1),
                   "bottom_gap": int(height - blur_y2),
@@ -480,7 +493,7 @@ jobs:
               print(f"Blur width={blur_x2 - blur_x1}  Blur height={blur_y2 - blur_y1}  (text_height={text_height})")
               print(f"Bottom gap={height - blur_y2}px\n")
 
-              # trả về cue sạch (bỏ field tạm _width/_height/_center_x)
+              # trả về cue sạch (bỏ field tạm _x1/_x2/_height)
               output_cues = [{"start": c["start"], "end": c["end"], "text": c["text"]} for c in cleaned]
               return output_cues, final_region
 
@@ -537,9 +550,9 @@ jobs:
           # ============================== CREATE ASS ==============================
           def create_ass(cues, region):
               width = int(region["width"])
-              # Đáy vùng blur — sub Việt sẽ được neo NGAY TẠI ĐÂY,
-              # thay vì dùng margin cố định tính từ đáy video (đó là lý do
-              # trước đây sub Việt bị lệch thấp hơn hẳn vùng blur).
+              height = int(region["height"])
+
+              # Đáy vùng blur — sub Việt sẽ được neo NGAY TẠI ĐÂY.
               blur_y2 = int(region["y2"])
               subtitle_y = blur_y2 - SUBTITLE_GAP_BELOW_BLUR
 
@@ -548,6 +561,20 @@ jobs:
               print(f"Subtitle Y (anchor, bottom-center): {subtitle_y}  (blur bottom={blur_y2}, gap={SUBTITLE_GAP_BELOW_BLUR}px)\n")
 
               subs = pysubs2.SSAFile()
+
+              # ----------------------------------------------------------
+              # QUAN TRỌNG:
+              #
+              # Phải khai báo PlayResX/PlayResY khớp với độ phân giải
+              # video thật. Nếu không, libass sẽ dùng độ phân giải mặc
+              # định (thường 384x288) để quy đổi toạ độ \pos(), khiến
+              # subtitle bị đẩy lệch hẳn ra ngoài khung hình -> KHÔNG
+              # HIỆN. Đây chính là lý do sub Việt bị mất ở bản trước.
+              # ----------------------------------------------------------
+              subs.info["PlayResX"] = width
+              subs.info["PlayResY"] = height
+              subs.info["ScaledBorderAndShadow"] = "yes"
+
               style = pysubs2.SSAStyle()
               style.fontname = font_name
               style.fontsize = FONT_SIZE
@@ -565,8 +592,7 @@ jobs:
 
               x = width // 2
               for cue in cues:
-                  # \an2 + \pos() neo chữ vào đúng đáy vùng blur, không phụ
-                  # thuộc marginv của style nữa.
+                  # \an2 + \pos() neo chữ vào đúng đáy vùng blur.
                   text = (
                       "{\\an2"
                       f"\\pos({x},{subtitle_y})"
