@@ -167,7 +167,13 @@ jobs:
 
           SCAN_SECONDS = float(os.environ.get("SCAN_SECONDS", "1"))
           OCR_FPS = float(os.environ.get("OCR_FPS", "2"))
+          if OCR_FPS <= 0:
+              OCR_FPS = 2.0
           SAMPLE_STEP = 1.0 / OCR_FPS
+          OCR_CHANGE_THRESHOLD = 5.0
+          OCR_FORCE_INTERVAL = 3.0
+          OCR_SIGNATURE_WIDTH = 192
+          OCR_SIGNATURE_HEIGHT = 64
           FONT_NAME = os.environ.get("FONT_NAME", "Arial")
 
           SCAN_Y_RATIO = 0.75
@@ -357,156 +363,611 @@ jobs:
               raise RuntimeError("Khong tim thay subtitle tieng Trung trong 90 giay dau.")
 
 
+
+          def subtitle_signature(frame):
+              gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+              gray = cv2.resize(
+                  gray,
+                  (OCR_SIGNATURE_WIDTH, OCR_SIGNATURE_HEIGHT),
+                  interpolation=cv2.INTER_AREA,
+              )
+              gray = cv2.GaussianBlur(gray, (3, 3), 0)
+              return gray
+
+
+          def subtitle_frame_changed(previous_signature, current_signature):
+              if previous_signature is None:
+                  return True, 255.0
+
+              diff = cv2.absdiff(
+                  previous_signature,
+                  current_signature,
+              )
+
+              score = float(np.mean(diff))
+
+              return (
+                  score >= OCR_CHANGE_THRESHOLD,
+                  score,
+              )
+
+
+          def stream_subtitle_frames(rx1, ry1, rx2, ry2, sample_fps):
+              crop_w = int(rx2 - rx1)
+              crop_h = int(ry2 - ry1)
+
+              if crop_w <= 0 or crop_h <= 0:
+                  raise RuntimeError(
+                      f"Invalid OCR crop size: {crop_w}x{crop_h}"
+                  )
+
+              cmd = [
+                  "ffmpeg",
+                  "-hide_banner",
+                  "-loglevel", "error",
+                  "-i", str(VIDEO),
+                  "-vf", (
+                      f"fps={sample_fps},"
+                      f"crop={crop_w}:{crop_h}:{rx1}:{ry1}"
+                  ),
+                  "-an", "-sn", "-dn",
+                  "-f", "rawvideo",
+                  "-pix_fmt", "bgr24",
+                  "pipe:1",
+              ]
+
+              process = subprocess.Popen(
+                  cmd,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  bufsize=10**8,
+              )
+
+              frame_size = crop_w * crop_h * 3
+              index = 0
+
+              try:
+                  while True:
+                      raw = process.stdout.read(frame_size)
+
+                      if len(raw) != frame_size:
+                          break
+
+                      frame = np.frombuffer(
+                          raw,
+                          dtype=np.uint8,
+                      ).reshape((crop_h, crop_w, 3))
+
+                      current_time = index / sample_fps
+
+                      yield current_time, frame
+
+                      index += 1
+
+              finally:
+                  if process.stdout:
+                      process.stdout.close()
+
+                  stderr_data = b""
+
+                  if process.stderr:
+                      stderr_data = process.stderr.read()
+                      process.stderr.close()
+
+                  return_code = process.wait()
+
+                  if return_code not in (0, None):
+                      error_text = stderr_data.decode(
+                          "utf-8",
+                          errors="replace",
+                      )
+                      raise RuntimeError(
+                          "FFmpeg OCR stream failed: "
+                          f"{error_text}"
+                      )
+
+
           def extract_subtitles(initial_region):
               width, height, fps, duration = probe_video()
-              rx1, ry1, rx2, ry2 = (initial_region[k] for k in ("x1", "y1", "x2", "y2"))
-              samples = max(1, int(duration * OCR_FPS))
-              log(f"OCR FPS: {OCR_FPS} OCR samples: {samples}")
+
+              rx1, ry1, rx2, ry2 = (
+                  initial_region[k]
+                  for k in ("x1", "y1", "x2", "y2")
+              )
+
+              estimated_samples = max(
+                  1,
+                  int(duration * OCR_FPS),
+              )
+
+              log(
+                  f"OCR STREAM FPS: {OCR_FPS} | "
+                  f"estimated frames: {estimated_samples}"
+              )
+              log(
+                  "OCR optimization enabled: "
+                  "1 FFmpeg process + change detection"
+              )
 
               cues = []
               previous_text = ""
               start_time = None
               subtitle_boxes = []
 
-              for i in tqdm(range(samples), desc="OCR video"):
-                  current_time = i / OCR_FPS
-                  frame = get_frame(current_time, width, height)
-                  if frame is None:
-                      continue
+              previous_signature = None
+              last_ocr_time = -1e9
 
-                  crop = frame[ry1:ry2, rx1:rx2]
-                  texts, boxes = ocr_image(crop)
+              scanned_frames = 0
+              ocr_frames = 0
+              skipped_frames = 0
 
-                  valid = []
-                  for text, box in zip(texts, boxes):
-                      if chinese_count(text) < MIN_CHINESE_COUNT:
+              progress = tqdm(
+                  total=estimated_samples,
+                  desc="OCR video",
+              )
+
+              try:
+                  for current_time, crop in stream_subtitle_frames(
+                      rx1,
+                      ry1,
+                      rx2,
+                      ry2,
+                      OCR_FPS,
+                  ):
+                      scanned_frames += 1
+                      progress.update(1)
+
+                      signature = subtitle_signature(crop)
+
+                      changed, change_score = subtitle_frame_changed(
+                          previous_signature,
+                          signature,
+                      )
+
+                      force_ocr = (
+                          current_time - last_ocr_time
+                          >= OCR_FORCE_INTERVAL
+                      )
+
+                      previous_signature = signature
+
+                      if not changed and not force_ocr:
+                          skipped_frames += 1
                           continue
-                      x1, y1, x2, y2 = box
-                      abs_x1, abs_y1, abs_x2, abs_y2 = x1 + rx1, y1 + ry1, x2 + rx1, y2 + ry1
-                      if (abs_x2 - abs_x1) < MIN_BOX_WIDTH or (abs_y2 - abs_y1) < MIN_BOX_HEIGHT:
-                          continue
-                      valid.append((text, (abs_x1, abs_y1, abs_x2, abs_y2)))
 
-                  valid.sort(key=lambda item: item[1][0])
-                  text = re.sub(r"\s+", " ", " ".join(item[0] for item in valid)).strip()
+                      ocr_frames += 1
+                      last_ocr_time = current_time
 
-                  if valid:
-                      all_x1 = min(item[1][0] for item in valid)
-                      all_y1 = min(item[1][1] for item in valid)
-                      all_x2 = max(item[1][2] for item in valid)
-                      all_y2 = max(item[1][3] for item in valid)
-                      geometry = {"x1": all_x1, "y1": all_y1, "x2": all_x2, "y2": all_y2,
-                                  "width": all_x2 - all_x1, "height": all_y2 - all_y1,
-                                  "center_x": (all_x1 + all_x2) / 2, "center_y": (all_y1 + all_y2) / 2}
-                      subtitle_boxes.append({"time": current_time, "text": text, "box": geometry})
+                      texts, boxes = ocr_image(crop)
 
-                  if text != previous_text:
-                      if previous_text and start_time is not None:
-                          cues.append({"start": start_time, "end": current_time, "text": previous_text})
-                      if text:
-                          previous_text, start_time = text, current_time
-                      else:
-                          previous_text, start_time = "", None
+                      valid = []
+
+                      for text, box in zip(
+                          texts,
+                          boxes,
+                      ):
+                          if chinese_count(text) < MIN_CHINESE_COUNT:
+                              continue
+
+                          x1, y1, x2, y2 = box
+
+                          abs_x1 = x1 + rx1
+                          abs_y1 = y1 + ry1
+                          abs_x2 = x2 + rx1
+                          abs_y2 = y2 + ry1
+
+                          if (
+                              abs_x2 - abs_x1
+                              < MIN_BOX_WIDTH
+                              or
+                              abs_y2 - abs_y1
+                              < MIN_BOX_HEIGHT
+                          ):
+                              continue
+
+                          valid.append(
+                              (
+                                  text,
+                                  (
+                                      abs_x1,
+                                      abs_y1,
+                                      abs_x2,
+                                      abs_y2,
+                                  ),
+                              )
+                          )
+
+                      valid.sort(
+                          key=lambda item: item[1][0]
+                      )
+
+                      text = re.sub(
+                          r"\s+",
+                          " ",
+                          " ".join(
+                              item[0]
+                              for item in valid
+                          ),
+                      ).strip()
+
+                      if valid:
+                          all_x1 = min(
+                              item[1][0]
+                              for item in valid
+                          )
+                          all_y1 = min(
+                              item[1][1]
+                              for item in valid
+                          )
+                          all_x2 = max(
+                              item[1][2]
+                              for item in valid
+                          )
+                          all_y2 = max(
+                              item[1][3]
+                              for item in valid
+                          )
+
+                          geometry = {
+                              "x1": all_x1,
+                              "y1": all_y1,
+                              "x2": all_x2,
+                              "y2": all_y2,
+                              "width": all_x2 - all_x1,
+                              "height": all_y2 - all_y1,
+                              "center_x": (
+                                  all_x1 + all_x2
+                              ) / 2,
+                              "center_y": (
+                                  all_y1 + all_y2
+                              ) / 2,
+                          }
+
+                          subtitle_boxes.append(
+                              {
+                                  "time": current_time,
+                                  "text": text,
+                                  "box": geometry,
+                              }
+                          )
+
+                      if text != previous_text:
+                          if (
+                              previous_text
+                              and
+                              start_time is not None
+                          ):
+                              cues.append(
+                                  {
+                                      "start": start_time,
+                                      "end": current_time,
+                                      "text": previous_text,
+                                  }
+                              )
+
+                          if text:
+                              previous_text = text
+                              start_time = current_time
+                          else:
+                              previous_text = ""
+                              start_time = None
+
+              finally:
+                  progress.close()
 
               if previous_text and start_time is not None:
-                  cues.append({"start": start_time, "end": duration, "text": previous_text})
+                  cues.append(
+                      {
+                          "start": start_time,
+                          "end": duration,
+                          "text": previous_text,
+                      }
+                  )
 
-              raw_cues = [c for c in cues if len(c["text"]) >= 2 and (c["end"] - c["start"]) >= 0.15]
+              log(
+                  f"OCR STATS: scanned={scanned_frames} "
+                  f"ocr={ocr_frames} "
+                  f"skipped={skipped_frames}"
+              )
+
+              raw_cues = [
+                  c
+                  for c in cues
+                  if len(c["text"]) >= 2
+                  and (
+                      c["end"] - c["start"]
+                  ) >= 0.15
+              ]
 
               def text_similarity(a, b):
                   if not a or not b:
                       return 0.0
-                  return SequenceMatcher(None, a, b).ratio()
+
+                  return SequenceMatcher(
+                      None,
+                      a,
+                      b,
+                  ).ratio()
 
               merge_groups = []
+
               for cue in raw_cues:
-                  variant_span = cue["end"] - cue["start"]
+                  variant_span = (
+                      cue["end"] - cue["start"]
+                  )
+
                   if merge_groups:
                       group = merge_groups[-1]
-                      gap = cue["start"] - group["end"]
-                      best_variant = max(group["variants"].items(), key=lambda kv: kv[1])[0]
-                      sim = text_similarity(cue["text"], best_variant)
-                      if gap < CUE_MERGE_MAX_GAP and sim >= CUE_SIMILARITY_THRESHOLD:
+
+                      gap = (
+                          cue["start"]
+                          - group["end"]
+                      )
+
+                      best_variant = max(
+                          group["variants"].items(),
+                          key=lambda kv: kv[1],
+                      )[0]
+
+                      sim = text_similarity(
+                          cue["text"],
+                          best_variant,
+                      )
+
+                      if (
+                          gap < CUE_MERGE_MAX_GAP
+                          and
+                          sim >= CUE_SIMILARITY_THRESHOLD
+                      ):
                           group["end"] = cue["end"]
-                          group["variants"][cue["text"]] = group["variants"].get(cue["text"], 0.0) + variant_span
+
+                          group["variants"][
+                              cue["text"]
+                          ] = (
+                              group["variants"].get(
+                                  cue["text"],
+                                  0.0,
+                              )
+                              + variant_span
+                          )
+
                           continue
-                  merge_groups.append({
-                      "start": cue["start"], "end": cue["end"],
-                      "variants": {cue["text"]: variant_span},
-                  })
+
+                  merge_groups.append(
+                      {
+                          "start": cue["start"],
+                          "end": cue["end"],
+                          "variants": {
+                              cue["text"]: variant_span,
+                          },
+                      }
+                  )
 
               cleaned = []
-              for group in merge_groups:
-                  canonical_text, _ = max(group["variants"].items(), key=lambda kv: kv[1])
-                  cleaned.append({"start": group["start"], "end": group["end"], "text": canonical_text})
 
-              log(f"Raw cues: {len(raw_cues)} -> Sau khi gop: {len(cleaned)}")
+              for group in merge_groups:
+                  canonical_text, _ = max(
+                      group["variants"].items(),
+                      key=lambda kv: kv[1],
+                  )
+
+                  cleaned.append(
+                      {
+                          "start": group["start"],
+                          "end": group["end"],
+                          "text": canonical_text,
+                      }
+                  )
+
+              log(
+                  f"Raw cues: {len(raw_cues)} "
+                  f"-> Sau khi gop: {len(cleaned)}"
+              )
 
               half_step = SAMPLE_STEP / 2.0
-              for cue in cleaned:
-                  new_start = max(0.0, cue["start"] - half_step)
-                  new_end = max(new_start + 0.05, cue["end"] - half_step)
-                  cue["start"] = new_start
-                  cue["end"] = min(duration, new_end)
 
-              log(f"Subtitle cues: {len(cleaned)}")
+              for cue in cleaned:
+                  new_start = max(
+                      0.0,
+                      cue["start"] - half_step,
+                  )
+
+                  new_end = max(
+                      new_start + 0.05,
+                      cue["end"] - half_step,
+                  )
+
+                  cue["start"] = new_start
+                  cue["end"] = min(
+                      duration,
+                      new_end,
+                  )
+
+              log(
+                  f"Subtitle cues: {len(cleaned)}"
+              )
 
               if not subtitle_boxes:
-                  raise RuntimeError("Khong co geometry subtitle.")
+                  raise RuntimeError(
+                      "Khong co geometry subtitle."
+                  )
 
-              band_width = int(width * BLUR_BAND_WIDTH_RATIO)
-              blur_x1 = int(width / 2 - band_width / 2)
-              blur_x2 = blur_x1 + band_width
+              band_width = int(
+                  width * BLUR_BAND_WIDTH_RATIO
+              )
 
-              heights_all = sorted(item["box"]["height"] for item in subtitle_boxes)
-              text_height = heights_all[len(heights_all) // 2]
+              blur_x1 = int(
+                  width / 2
+                  - band_width / 2
+              )
 
-              blur_height = int(text_height + BLUR_PAD_Y_TOP + BLUR_PAD_Y_BOTTOM)
-              blur_height = max(blur_height, MIN_BLUR_HEIGHT)
+              blur_x2 = (
+                  blur_x1
+                  + band_width
+              )
 
-              centers_y = [item["box"]["center_y"] for item in subtitle_boxes]
-              subtitle_center_y = float(np.median(centers_y))
+              heights_all = sorted(
+                  item["box"]["height"]
+                  for item in subtitle_boxes
+              )
 
-              blur_y1 = int(subtitle_center_y - blur_height / 2)
-              blur_y2 = blur_y1 + blur_height
+              text_height = heights_all[
+                  len(heights_all) // 2
+              ]
 
-              blur_x1 = max(0, blur_x1)
-              blur_x2 = min(width, blur_x2)
-              blur_y1 = max(0, blur_y1)
+              blur_height = int(
+                  text_height
+                  + BLUR_PAD_Y_TOP
+                  + BLUR_PAD_Y_BOTTOM
+              )
 
-              if blur_y2 > height - MIN_BOTTOM_GAP:
-                  shift_up = blur_y2 - (height - MIN_BOTTOM_GAP)
+              blur_height = max(
+                  blur_height,
+                  MIN_BLUR_HEIGHT,
+              )
+
+              centers_y = [
+                  item["box"]["center_y"]
+                  for item in subtitle_boxes
+              ]
+
+              subtitle_center_y = float(
+                  np.median(centers_y)
+              )
+
+              blur_y1 = int(
+                  subtitle_center_y
+                  - blur_height / 2
+              )
+
+              blur_y2 = (
+                  blur_y1
+                  + blur_height
+              )
+
+              blur_x1 = max(
+                  0,
+                  blur_x1,
+              )
+
+              blur_x2 = min(
+                  width,
+                  blur_x2,
+              )
+
+              blur_y1 = max(
+                  0,
+                  blur_y1,
+              )
+
+              if (
+                  blur_y2
+                  > height - MIN_BOTTOM_GAP
+              ):
+                  shift_up = (
+                      blur_y2
+                      - (
+                          height
+                          - MIN_BOTTOM_GAP
+                      )
+                  )
+
                   blur_y1 -= shift_up
                   blur_y2 -= shift_up
 
-              blur_y1 = max(0, blur_y1)
-              blur_y2 = min(height - MIN_BOTTOM_GAP, blur_y2)
+              blur_y1 = max(
+                  0,
+                  blur_y1,
+              )
 
-              if (blur_x2 - blur_x1) % 2 != 0:
+              blur_y2 = min(
+                  height - MIN_BOTTOM_GAP,
+                  blur_y2,
+              )
+
+              if (
+                  blur_x2 - blur_x1
+              ) % 2 != 0:
                   blur_x2 -= 1
-              if (blur_y2 - blur_y1) % 2 != 0:
+
+              if (
+                  blur_y2 - blur_y1
+              ) % 2 != 0:
                   blur_y2 -= 1
 
-              feather_px = int((blur_x2 - blur_x1) * BLUR_FEATHER_RATIO)
-              feather_px = max(MIN_FEATHER_PX, feather_px)
-              feather_px = min(feather_px, (blur_x2 - blur_x1) // 2, (blur_y2 - blur_y1) // 2)
-              feather_px = max(MIN_FEATHER_PX, feather_px)
+              feather_px = int(
+                  (
+                      blur_x2 - blur_x1
+                  )
+                  * BLUR_FEATHER_RATIO
+              )
+
+              feather_px = max(
+                  MIN_FEATHER_PX,
+                  feather_px,
+              )
+
+              feather_px = min(
+                  feather_px,
+                  (
+                      blur_x2 - blur_x1
+                  ) // 2,
+                  (
+                      blur_y2 - blur_y1
+                  ) // 2,
+              )
+
+              feather_px = max(
+                  MIN_FEATHER_PX,
+                  feather_px,
+              )
 
               final_region = {
-                  "x1": int(blur_x1), "y1": int(blur_y1), "x2": int(blur_x2), "y2": int(blur_y2),
-                  "width": width, "height": height, "fps": fps,
-                  "found_at": initial_region["found_at"], "sample_text": initial_region["sample_text"],
-                  "text_height": int(text_height),
-                  "blur_width": int(blur_x2 - blur_x1), "blur_height": int(blur_y2 - blur_y1),
-                  "bottom_gap": int(height - blur_y2),
-                  "feather_px": int(feather_px),
+                  "x1": int(blur_x1),
+                  "y1": int(blur_y1),
+                  "x2": int(blur_x2),
+                  "y2": int(blur_y2),
+                  "width": width,
+                  "height": height,
+                  "fps": fps,
+                  "found_at": initial_region[
+                      "found_at"
+                  ],
+                  "sample_text": initial_region[
+                      "sample_text"
+                  ],
+                  "text_height": int(
+                      text_height
+                  ),
+                  "blur_width": int(
+                      blur_x2 - blur_x1
+                  ),
+                  "blur_height": int(
+                      blur_y2 - blur_y1
+                  ),
+                  "bottom_gap": int(
+                      height - blur_y2
+                  ),
+                  "feather_px": int(
+                      feather_px
+                  ),
               }
 
-              log(f"FINAL BLUR REGION: {final_region}")
+              log(
+                  f"FINAL BLUR REGION: "
+                  f"{final_region}"
+              )
 
-              output_cues = [{"start": c["start"], "end": c["end"], "text": c["text"]} for c in cleaned]
+              output_cues = [
+                  {
+                      "start": c["start"],
+                      "end": c["end"],
+                      "text": c["text"],
+                  }
+                  for c in cleaned
+              ]
+
               return output_cues, final_region
-
 
           def save_srt(cues, path, field):
               subs = pysubs2.SSAFile()
@@ -662,7 +1123,6 @@ jobs:
               crop_x2 = min(width, x2 + feather)
               crop_y2 = min(height, y2 + feather)
 
-              # Ép crop_w/crop_h thành số chẵn (yuv420p bắt buộc chẵn cả 2 chiều)
               if (crop_x2 - crop_x1) % 2 != 0:
                   crop_x2 -= 1
               if (crop_y2 - crop_y1) % 2 != 0:
@@ -670,12 +1130,14 @@ jobs:
 
               crop_w = crop_x2 - crop_x1
               crop_h = crop_y2 - crop_y1
+              if crop_w <= 0 or crop_h <= 0:
+                  raise RuntimeError(f"Invalid mask size: {crop_w}x{crop_h}")
 
               mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
-              inner_x1 = x1 - crop_x1
-              inner_y1 = y1 - crop_y1
-              inner_x2 = x2 - crop_x1
-              inner_y2 = y2 - crop_y1
+              inner_x1 = max(0, x1 - crop_x1)
+              inner_y1 = max(0, y1 - crop_y1)
+              inner_x2 = min(crop_w, x2 - crop_x1)
+              inner_y2 = min(crop_h, y2 - crop_y1)
               mask[inner_y1:inner_y2, inner_x1:inner_x2] = 255
 
               ksize = int(feather) * 2 + 1
@@ -683,7 +1145,17 @@ jobs:
               mask = cv2.GaussianBlur(mask, (ksize, ksize), sigma)
 
               mask_path = WORK / "blur_mask.png"
-              cv2.imwrite(str(mask_path), mask)
+              if not cv2.imwrite(str(mask_path), mask):
+                  raise RuntimeError("Khong ghi duoc blur_mask.png")
+
+              saved_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+              if saved_mask is None:
+                  raise RuntimeError("Khong doc lai duoc blur_mask.png")
+              actual_h, actual_w = saved_mask.shape[:2]
+              if actual_w != crop_w or actual_h != crop_h:
+                  raise RuntimeError(
+                      f"Mask size mismatch after save: expected {crop_w}x{crop_h}, got {actual_w}x{actual_h}"
+                  )
 
               region["crop_x1"] = int(crop_x1)
               region["crop_y1"] = int(crop_y1)
@@ -691,9 +1163,7 @@ jobs:
               region["crop_y2"] = int(crop_y2)
 
               log(f"FEATHER MASK: crop=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) size={crop_w}x{crop_h} feather={feather}px")
-
               return mask_path
-
 
           def create_ass(cues, region):
               width = int(region["width"])
@@ -763,18 +1233,31 @@ jobs:
 
               if cx1 < 0 or cy1 < 0 or cx2 > width or cy2 > height or cw <= 0 or ch <= 0:
                   raise RuntimeError(f"Invalid feather crop region: x1={cx1} y1={cy1} x2={cx2} y2={cy2}")
+              if cw % 2 != 0 or ch % 2 != 0:
+                  raise RuntimeError(f"Crop size must be even for yuv420p: {cw}x{ch}")
+
+              mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+              if mask_img is None:
+                  raise RuntimeError(f"Cannot read mask: {mask_path}")
+              mask_h, mask_w = mask_img.shape[:2]
+              log(f"RENDER CROP: {cw}x{ch} | MASK: {mask_w}x{mask_h}")
+
+              if mask_w != cw or mask_h != ch:
+                  log(f"WARNING: Resize mask {mask_w}x{mask_h} -> {cw}x{ch}")
+                  mask_img = cv2.resize(mask_img, (cw, ch), interpolation=cv2.INTER_NEAREST)
+                  if not cv2.imwrite(str(mask_path), mask_img):
+                      raise RuntimeError("Khong ghi lai mask da resize")
 
               log(f"FEATHER CROP REGION x={cx1} y={cy1} w={cw} h={ch} sigma={BLUR_SIGMA}")
 
               ass_path = str(ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-              mask_str = str(mask_path)
 
               video_filter = (
                   f"[0:v]format=yuv420p,split=2[base1][base2];"
                   f"[base1]crop=w={cw}:h={ch}:x={cx1}:y={cy1},"
                   f"boxblur=luma_radius={BLUR_SIGMA}:luma_power=1:chroma_radius={BLUR_SIGMA}:chroma_power=1,"
-                  f"format=yuv420p[blur_crop];"
-                  f"[1:v]format=gray,scale={cw}:{ch}[mask];"
+                  f"format=yuv420p,setsar=1[blur_crop];"
+                  f"[1:v]format=gray,scale=w={cw}:h={ch}:flags=neighbor,setsar=1[mask];"
                   f"[blur_crop][mask]alphamerge,format=yuva420p[blur_rgba];"
                   f"[base2][blur_rgba]overlay=x={cx1}:y={cy1}:format=yuv420[ov];"
                   f"[ov]ass='{ass_path}',format=yuv420p[vout]"
@@ -784,14 +1267,19 @@ jobs:
               if output.exists():
                   output.unlink()
 
-              cmd = ["ffmpeg", "-hide_banner", "-y",
-                     "-i", str(VIDEO),
-                     "-loop", "1", "-i", mask_str,
-                     "-filter_complex", video_filter,
-                     "-map", "[vout]", "-map", "0:a?",
-                     "-c:v", "libx264", "-preset", "fast", "-crf", "21",
-                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                     "-movflags", "+faststart", "-shortest", str(output)]
+              cmd = [
+                  "ffmpeg", "-hide_banner", "-y",
+                  "-i", str(VIDEO),
+                  "-loop", "1", "-i", str(mask_path),
+                  "-filter_complex", video_filter,
+                  "-map", "[vout]", "-map", "0:a?",
+                  "-c:v", "libx264", "-preset", "fast", "-crf", "21",
+                  "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "192k",
+                  "-movflags", "+faststart",
+                  "-shortest", str(output)
+              ]
+
               subprocess.run(cmd, check=True)
 
               if not output.exists():
@@ -799,7 +1287,6 @@ jobs:
               if output.stat().st_size < 10000:
                   raise RuntimeError("Output video bat thuong (file qua nho).")
               return output
-
 
           def main():
               if not VIDEO.exists():
