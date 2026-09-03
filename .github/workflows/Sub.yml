@@ -630,13 +630,13 @@ jobs:
               mask_str = str(mask_path)
 
               video_filter = (
-                  f"[0:v]format=yuv420p[base];"
-                  f"[base]crop=w={cw}:h={ch}:x={cx1}:y={cy1},"
+                  f"[0:v]format=yuv420p,split=2[base1][base2];"
+                  f"[base1]crop=w={cw}:h={ch}:x={cx1}:y={cy1},"
                   f"boxblur=luma_radius={BLUR_SIGMA}:luma_power=1:chroma_radius={BLUR_SIGMA}:chroma_power=1,"
                   f"format=yuv420p[blur_crop];"
                   f"[1:v]format=gray,scale={cw}:{ch}[mask];"
                   f"[blur_crop][mask]alphamerge,format=yuva420p[blur_rgba];"
-                  f"[base][blur_rgba]overlay=x={cx1}:y={cy1}:format=yuv420[ov];"
+                  f"[base2][blur_rgba]overlay=x={cx1}:y={cy1}:format=yuv420[ov];"
                   f"[ov]ass='{ass_path}',format=yuv420p[vout]"
               )
 
