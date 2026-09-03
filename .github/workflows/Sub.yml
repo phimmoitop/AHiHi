@@ -482,6 +482,11 @@ jobs:
               blur_y1 = max(0, blur_y1)
               blur_y2 = min(height - MIN_BOTTOM_GAP, blur_y2)
 
+              if (blur_x2 - blur_x1) % 2 != 0:
+                  blur_x2 -= 1
+              if (blur_y2 - blur_y1) % 2 != 0:
+                  blur_y2 -= 1
+
               feather_px = int((blur_x2 - blur_x1) * BLUR_FEATHER_RATIO)
               feather_px = max(MIN_FEATHER_PX, feather_px)
               feather_px = min(feather_px, (blur_x2 - blur_x1) // 2, (blur_y2 - blur_y1) // 2)
@@ -656,6 +661,12 @@ jobs:
               crop_y1 = max(0, y1 - feather)
               crop_x2 = min(width, x2 + feather)
               crop_y2 = min(height, y2 + feather)
+
+              # Ép crop_w/crop_h thành số chẵn (yuv420p bắt buộc chẵn cả 2 chiều)
+              if (crop_x2 - crop_x1) % 2 != 0:
+                  crop_x2 -= 1
+              if (crop_y2 - crop_y1) % 2 != 0:
+                  crop_y2 -= 1
 
               crop_w = crop_x2 - crop_x1
               crop_h = crop_y2 - crop_y1
