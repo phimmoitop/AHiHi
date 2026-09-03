@@ -778,7 +778,7 @@ jobs:
                      "-loop", "1", "-i", mask_str,
                      "-filter_complex", video_filter,
                      "-map", "[vout]", "-map", "0:a?",
-                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                     "-c:v", "libx264", "-preset", "fast", "-crf", "21",
                      "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                      "-movflags", "+faststart", "-shortest", str(output)]
               subprocess.run(cmd, check=True)
