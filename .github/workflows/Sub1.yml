@@ -821,7 +821,7 @@ jobs:
               )
 
               log(
-                  "FUZZY MERGE: DISABLED"
+                  "TEMPORAL + LENGTH-AWARE MERGE: ENABLED"
               )
 
               log(
@@ -1079,135 +1079,381 @@ jobs:
 
 
           # ============================================================
-          # CONVERT SAMPLES TO RAW SRT CUES
+          # TEMPORAL + LENGTH-AWARE SUBTITLE MERGE
           # ============================================================
 
-          def samples_to_raw_cues(
-              samples,
-              duration,
+          # OCR frame sau thường nét hơn.
+          # Vì vậy:
+          #   - ưu tiên representative ở các frame cuối
+          #   - nhưng không lấy frame cuối tuyệt đối một cách mù quáng
+          #   - dùng frequency + recency trong tail window
+          #
+          # Merge phụ thuộc đồng thời vào:
+          #   1. thời gian giữa hai sample non-empty
+          #   2. độ dài subtitle
+          #   3. số ký tự giống nhau theo đúng thứ tự (LCS)
+          #
+          # Câu ngắn: rất khắt khe.
+          # Câu dài: cho phép sai vài ký tự OCR.
+
+
+          def lcs_length(a, b):
+              previous = [0] * (len(b) + 1)
+
+              for char_a in a:
+                  current = [0]
+
+                  for j, char_b in enumerate(b, 1):
+                      if char_a == char_b:
+                          current.append(
+                              previous[j - 1] + 1
+                          )
+                      else:
+                          current.append(
+                              max(
+                                  previous[j],
+                                  current[-1],
+                              )
+                          )
+
+                  previous = current
+
+              return previous[-1]
+
+
+          def required_common_chars(length):
+              # 1-2 ký tự: strict
+              if length <= 2:
+                  return length
+
+              # 3-4 ký tự: ví dụ 4 cần khớp ít nhất 3
+              if length <= 4:
+                  return max(2, length - 1)
+
+              # 5-6 ký tự: thiếu tối đa 1
+              if length <= 6:
+                  return length - 1
+
+              # 7-8 ký tự: thiếu tối đa 2
+              if length <= 8:
+                  return length - 2
+
+              # Câu dài: ít nhất 75%
+              return int(
+                  np.ceil(length * 0.75)
+              )
+
+
+          def allowed_gap_for_length(length):
+              # Gap tolerance phụ thuộc độ dài câu.
+              # Đây không phải duration chính xác của subtitle.
+              if length <= 2:
+                  return 0.45
+
+              if length <= 4:
+                  return 0.65
+
+              if length <= 6:
+                  return 0.90
+
+              if length <= 8:
+                  return 1.25
+
+              return min(
+                  2.20,
+                  1.25
+                  + (length - 8) * 0.15,
+              )
+
+
+          def text_match_details(a, b, time_gap):
+              if not a or not b:
+                  return False, {
+                      "common": 0,
+                      "reason": "empty",
+                  }
+
+              common = lcs_length(a, b)
+              max_len = max(len(a), len(b))
+              ratio = common / max(1, max_len)
+
+              details = {
+                  "common": common,
+                  "max_len": max_len,
+                  "ratio": round(ratio, 4),
+                  "time_gap": round(time_gap, 4),
+                  "gap_limit": round(
+                      allowed_gap_for_length(max_len),
+                      4,
+                  ),
+              }
+
+              if time_gap > allowed_gap_for_length(max_len):
+                  details["reason"] = "gap_too_large"
+                  return False, details
+
+              # 1 ký tự phải giống hoàn toàn.
+              if max_len == 1:
+                  details["required"] = 1
+                  details["reason"] = "single_char"
+                  return a == b, details
+
+              # 2 ký tự:
+              # - bình thường phải giống hoàn toàn
+              # - cho phép OCR sai 1 ký tự chỉ khi cực gần nhau
+              if max_len == 2:
+                  if a == b:
+                      details["required"] = 2
+                      details["reason"] = "short_exact"
+                      return True, details
+
+                  matched = (
+                      common == 1
+                      and time_gap <= 0.30
+                  )
+
+                  details["required"] = (
+                      "exact, or 1 common if gap<=0.30"
+                  )
+                  details["reason"] = "short_exception"
+                  return matched, details
+
+              required = required_common_chars(max_len)
+
+              details["required"] = required
+              details["reason"] = "length_aware_lcs"
+
+              return common >= required, details
+
+
+          def choose_tail_representative(
+              segment,
+              tail_size=4,
           ):
+              # Chỉ nhìn các sample cuối.
+              # Frequency cao hơn thắng.
+              # Nếu bằng nhau, sample xuất hiện muộn hơn thắng.
+              # Vì vậy frame cuối/gần cuối được ưu tiên.
+              tail = segment[-tail_size:]
+              grouped = {}
+
+              for sample in tail:
+                  text = sample["text"]
+
+                  if not text:
+                      continue
+
+                  stats = grouped.setdefault(
+                      text,
+                      {
+                          "count": 0,
+                          "last_index": -1,
+                          "last_time": -1.0,
+                      },
+                  )
+
+                  stats["count"] += 1
+                  stats["last_index"] = max(
+                      stats["last_index"],
+                      sample["index"],
+                  )
+                  stats["last_time"] = max(
+                      stats["last_time"],
+                      float(sample["time"]),
+                  )
+
+              if not grouped:
+                  return ""
+
+              return max(
+                  grouped.items(),
+                  key=lambda item: (
+                      item[1]["count"],
+                      item[1]["last_index"],
+                      len(item[0]),
+                  ),
+              )[0]
+
+
+          def finalize_segment(segment, duration):
+              if not segment:
+                  return None
+
+              candidate = choose_tail_representative(segment)
+
+              if not candidate:
+                  return None
+
+              # Tail candidate là mặc định cuối cùng.
+              # Chỉ override nếu một text khác có đồng thuận mạnh hơn
+              # rõ rệt (nhiều hơn ít nhất 2 sample).
+              counts = Counter(
+                  sample["text"]
+                  for sample in segment
+                  if sample["text"]
+              )
+
+              candidate_count = counts.get(candidate, 0)
+
+              alternatives = [
+                  (text, count)
+                  for text, count in counts.items()
+                  if text != candidate
+              ]
+
+              if alternatives:
+                  best_text, best_count = max(
+                      alternatives,
+                      key=lambda item: (
+                          item[1],
+                          len(item[0]),
+                      ),
+                  )
+
+                  if best_count >= candidate_count + 2:
+                      candidate = best_text
+
+              start = float(segment[0]["time"])
+              end = min(
+                  duration,
+                  float(segment[-1]["time"])
+                  + (1.0 / OCR_FPS),
+              )
+
+              return {
+                  "start": start,
+                  "end": max(start + 0.001, end),
+                  "text": candidate,
+                  "sample_count": len(segment),
+                  "tail_candidate": choose_tail_representative(
+                      segment
+                  ),
+              }
+
+
+          def samples_to_raw_cues(samples, duration):
               """
-              Debug mode:
+              Merge subtitle bằng:
+                  temporal continuity
+                  + length-aware LCS
+                  + tail representative
 
-              Chỉ gộp các sample liên tiếp
-              có TEXT GIỐNG HỆT nhau.
-
-              Không dùng fuzzy similarity.
-
-              Ví dụ:
-
-              A
-              A
-              A
-              B
-              B
-              EMPTY
-
-              ->
-
-              A: start -> B
-              B: B -> EMPTY
+              EMPTY không đóng segment ngay lập tức.
+              Chỉ đóng khi sample non-empty tiếp theo:
+                  - cách quá xa
+                  HOẶC
+                  - không đủ giống representative hiện tại.
               """
 
               if not samples:
-                  return []
-
-              step = (
-                  1.0
-                  / OCR_FPS
-              )
+                  return [], []
 
               cues = []
+              merge_debug = []
 
-              active_text = None
-              active_start = None
-              last_time = None
+              active_segment = []
+              last_nonempty_time = None
 
               for sample in samples:
+                  current_text = sample["text"]
 
-                  current_time = (
-                      float(
-                          sample["time"]
-                      )
-                  )
-
-                  current_text = (
-                      sample["text"]
-                  )
-
-                  if (
-                      current_text
-                      == active_text
-                  ):
-                      last_time = (
-                          current_time
-                      )
+                  if not current_text:
                       continue
 
-                  if (
-                      active_text
-                      and active_start
-                      is not None
-                  ):
-                      cues.append(
-                          {
-                              "start": active_start,
-                              "end": max(
-                                  active_start
-                                  + 0.001,
-                                  current_time,
-                              ),
-                              "text": active_text,
-                          }
+                  current_time = float(sample["time"])
+
+                  if not active_segment:
+                      active_segment = [sample]
+                      last_nonempty_time = current_time
+                      continue
+
+                  representative = (
+                      choose_tail_representative(
+                          active_segment
                       )
-
-                  if current_text:
-
-                      active_text = (
-                          current_text
-                      )
-
-                      active_start = (
-                          current_time
-                      )
-
-                  else:
-
-                      active_text = None
-                      active_start = None
-
-                  last_time = (
-                      current_time
                   )
 
-              if (
-                  active_text
-                  and active_start
-                  is not None
-              ):
-                  cues.append(
+                  time_gap = (
+                      current_time
+                      - last_nonempty_time
+                  )
+
+                  matched, details = text_match_details(
+                      current_text,
+                      representative,
+                      time_gap,
+                  )
+
+                  merge_debug.append(
                       {
-                          "start": active_start,
-                          "end": min(
-                              duration,
-                              (
-                                  last_time
-                                  + step
-                              ),
-                          ),
-                          "text": active_text,
+                          "time": current_time,
+                          "text": current_text,
+                          "representative": representative,
+                          "matched": matched,
+                          "details": details,
                       }
                   )
 
-              return [
-                  cue
-                  for cue in cues
-                  if (
-                      cue["text"]
-                      and cue["end"]
-                      > cue["start"]
+                  if matched:
+                      active_segment.append(sample)
+                      last_nonempty_time = current_time
+                      continue
+
+                  cue = finalize_segment(
+                      active_segment,
+                      duration,
                   )
-              ]
+
+                  if cue:
+                      cues.append(cue)
+
+                  active_segment = [sample]
+                  last_nonempty_time = current_time
+
+              if active_segment:
+                  cue = finalize_segment(
+                      active_segment,
+                      duration,
+                  )
+
+                  if cue:
+                      cues.append(cue)
+
+              # Safety cleanup:
+              # Hai cue text giống hệt nhau chỉ được nối nếu khoảng cách
+              # phù hợp với độ dài subtitle.
+              cleaned = []
+
+              for cue in cues:
+                  if not cleaned:
+                      cleaned.append(cue)
+                      continue
+
+                  previous = cleaned[-1]
+
+                  gap = (
+                      cue["start"]
+                      - previous["end"]
+                  )
+
+                  if (
+                      cue["text"] == previous["text"]
+                      and gap <= allowed_gap_for_length(
+                          len(cue["text"])
+                      )
+                  ):
+                      previous["end"] = max(
+                          previous["end"],
+                          cue["end"],
+                      )
+                      previous["sample_count"] += cue.get(
+                          "sample_count",
+                          0,
+                      )
+                  else:
+                      cleaned.append(cue)
+
+              return cleaned, merge_debug
 
 
           # ============================================================
@@ -1274,11 +1520,12 @@ jobs:
                   region
               )
 
-              cues = (
-                  samples_to_raw_cues(
-                      samples,
-                      duration,
-                  )
+              (
+                  cues,
+                  merge_debug,
+              ) = samples_to_raw_cues(
+                  samples,
+                  duration,
               )
 
               save_srt(
@@ -1311,6 +1558,7 @@ jobs:
                   ),
                   "samples": samples,
                   "cues": cues,
+                  "merge_debug": merge_debug,
               }
 
               DEBUG_JSON.write_text(
