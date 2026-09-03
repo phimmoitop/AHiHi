@@ -1,0 +1,247 @@
+name: Bilibili OCR Debug → Chinese SRT
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Bilibili video URL"
+        required: true
+        type: string
+      scan_seconds:
+        description: "Khoảng cách quét tìm vùng subtitle ban đầu"
+        required: false
+        default: "0.5"
+        type: string
+      ocr_fps:
+        description: "FPS OCR thực tế để debug"
+        required: false
+        default: "8"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp numpy==1.26.4 opencv-python-headless==4.10.0.84 tqdm pysubs2
+          python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+          python -m pip install paddleocr==3.3.2
+
+      - name: Prepare directories
+        run: |
+          mkdir -p work
+          rm -f chinese.srt
+
+      - name: Prepare Bilibili cookies
+        env:
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
+        run: |
+          set -euo pipefail
+          test -n "${BILIBILI_COOKIES:-}"
+          printf '%s\n' "$BILIBILI_COOKIES" > work/cookies.txt
+          chmod 600 work/cookies.txt
+
+      - name: Download Bilibili video
+        env:
+          BILIBILI_URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          yt-dlp --cookies work/cookies.txt --no-playlist --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
+            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
+            --add-header "Referer: https://www.bilibili.com/" \
+            --add-header "Origin: https://www.bilibili.com" \
+            -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" \
+            --merge-output-format mp4 -o "work/source.%(ext)s" "$BILIBILI_URL"
+
+      - name: Create OCR debug script
+        run: |
+          cat > process.py <<'PY'
+          import os, re, json, subprocess
+          from pathlib import Path
+          from collections import Counter
+          import numpy as np
+          import pysubs2
+          from tqdm import tqdm
+          from paddleocr import PaddleOCR
+
+          WORK = Path("work")
+          VIDEO = WORK / "source.mp4"
+          OUTPUT_SRT = Path("chinese.srt")
+          DEBUG_JSON = WORK / "ocr_debug.json"
+
+          SCAN_SECONDS = float(os.environ.get("SCAN_SECONDS", "0.5"))
+          OCR_FPS = float(os.environ.get("OCR_FPS", "8"))
+          SCAN_Y_RATIO = 0.75
+          MIN_CHINESE_COUNT = 1
+          MIN_BOX_WIDTH = 8
+          MIN_BOX_HEIGHT = 5
+          MIN_BOTTOM_GAP = 8
+
+          def log(x): print(x, flush=True)
+
+          def probe_video():
+              cmd=["ffprobe","-hide_banner","-v","error","-select_streams","v:0","-show_entries","stream=width,height,r_frame_rate","-show_entries","format=duration","-of","json",str(VIDEO)]
+              d=json.loads(subprocess.run(cmd,stdout=subprocess.PIPE,text=True,check=True).stdout)
+              s=d["streams"][0]; a,b=s["r_frame_rate"].split("/")
+              return int(s["width"]),int(s["height"]),float(a)/float(b),float(d["format"]["duration"])
+
+          def get_frame(t):
+              cmd=["ffmpeg","-hide_banner","-loglevel","error","-ss",str(t),"-i",str(VIDEO),"-frames:v","1","-f","image2pipe","-vcodec","mjpeg","-"]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              if not p.stdout: return None
+              import cv2
+              return cv2.imdecode(np.frombuffer(p.stdout,np.uint8),cv2.IMREAD_COLOR)
+
+          log("Loading PaddleOCR")
+          ocr=PaddleOCR(lang="ch")
+
+          def chinese_count(t): return len(re.findall(r"[\u3400-\u9fff]",t))
+          def normalize(t): return re.sub(r"\s+","",t).strip()
+
+          def ocr_image(img):
+              out=[]
+              for page in ocr.predict(img):
+                  try:
+                      data=page.json() if callable(page.json) else page.json
+                  except Exception as e:
+                      log(f"page.json ERROR: {e!r}"); continue
+                  if isinstance(data,str):
+                      try: data=json.loads(data)
+                      except Exception: continue
+                  if isinstance(data,dict) and isinstance(data.get("res"),dict): data=data["res"]
+                  if not isinstance(data,dict): continue
+                  texts=data.get("rec_texts",[]); scores=data.get("rec_scores",[]); polys=data.get("rec_polys",[])
+                  for i,text in enumerate(texts):
+                      text=str(text).strip()
+                      if not text or i>=len(polys): continue
+                      pts=np.asarray(polys[i])
+                      if pts.ndim!=2 or pts.shape[1]!=2: continue
+                      score=float(scores[i]) if i<len(scores) else 1.0
+                      out.append({"text":text,"score":score,"box":[int(pts[:,0].min()),int(pts[:,1].min()),int(pts[:,0].max()),int(pts[:,1].max())]})
+              return out
+
+          def find_region():
+              w,h,fps,duration=probe_video(); y0=int(h*SCAN_Y_RATIO); t=0.0
+              log(f"VIDEO: {w}x{h} FPS={fps:.3f} Duration={duration:.3f}s")
+              while t<duration:
+                  log(f"REGION SCAN: {t:.3f}s")
+                  fr=get_frame(t)
+                  if fr is not None:
+                      cand=[]
+                      for it in ocr_image(fr[y0:h,0:w]):
+                          if chinese_count(it['text'])<MIN_CHINESE_COUNT: continue
+                          x1,y1,x2,y2=it['box']; y1+=y0; y2+=y0
+                          if x2-x1<MIN_BOX_WIDTH or y2-y1<MIN_BOX_HEIGHT: continue
+                          cand.append(((x2-x1)*max(1,chinese_count(it['text']))*(1+y2/h),it['text'],[x1,y1,x2,y2]))
+                      if cand:
+                          cand.sort(reverse=True); _,text,b=cand[0]; x1,y1,x2,y2=b
+                          padx=max(10,int(w*.01)); pady=max(6,int(h*.01))
+                          r={"x1":max(0,x1-padx),"y1":max(0,y1-pady),"x2":min(w,x2+padx),"y2":min(h-MIN_BOTTOM_GAP,y2+pady),"width":w,"height":h,"fps":fps,"found_at":t,"sample_text":text}
+                          log("INITIAL SUBTITLE REGION FOUND: "+json.dumps(r,ensure_ascii=False)); return r
+                  t+=SCAN_SECONDS
+              raise RuntimeError("Khong tim thay subtitle trong toan bo video.")
+
+          def extract(region):
+              w,h,vfps,duration=probe_video(); x1,y1,x2,y2=[int(region[k]) for k in ('x1','y1','x2','y2')]; cw,ch=x2-x1,y2-y1
+              total=max(1,int(np.ceil(duration*OCR_FPS)))
+              log("OCR DEBUG MODE: OCR EVERY SAMPLE, NO CHANGE DETECTION, NO SKIP, NO FUZZY MERGE")
+              log(f"OCR region: x={x1} y={y1} w={cw} h={ch}")
+              log(f"OCR FPS={OCR_FPS} expected_samples={total}")
+              cmd=["ffmpeg","-hide_banner","-loglevel","error","-i",str(VIDEO),"-vf",f"fps={OCR_FPS},crop={cw}:{ch}:{x1}:{y1}","-an","-sn","-dn","-pix_fmt","bgr24","-f","rawvideo","-"]
+              p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=10**8); fs=cw*ch*3; samples=[]; i=0
+              bar=tqdm(total=total,desc="OCR DEBUG")
+              while True:
+                  raw=p.stdout.read(fs)
+                  if len(raw)!=fs: break
+                  t=i/OCR_FPS; frame=np.frombuffer(raw,np.uint8).reshape((ch,cw,3)); valid=[]
+                  for it in ocr_image(frame):
+                      if chinese_count(it['text'])>=MIN_CHINESE_COUNT:
+                          bx=it['box']; valid.append({"text":it['text'],"score":it['score'],"box":[bx[0]+x1,bx[1]+y1,bx[2]+x1,bx[3]+y1]})
+                  valid.sort(key=lambda z:(z['box'][1],z['box'][0])); text=normalize(''.join(z['text'] for z in valid))
+                  samples.append({"index":i,"time":round(t,6),"text":text,"detections":valid})
+                  log(f"[OCR {i:05d}] {t:8.3f}s TEXT={text!r}" if text else f"[OCR {i:05d}] {t:8.3f}s TEXT=<EMPTY>")
+                  i+=1; bar.update(1)
+              bar.close(); p.stdout.close(); err=p.stderr.read().decode('utf-8','replace'); rc=p.wait()
+              if rc!=0: raise RuntimeError("FFmpeg OCR stream failed:\n"+err)
+              log(f"OCR DEBUG STATS: scanned={len(samples)} ocr={len(samples)} skipped=0")
+              return samples,duration
+
+          def to_cues(samples,duration):
+              if not samples:return []
+              step=1/OCR_FPS; cues=[]; active=""; start=None; last=0
+              for s in samples:
+                  t=s['time']; text=s['text']
+                  if text==active: last=t; continue
+                  if active and start is not None: cues.append({"start":start,"end":max(start+.05,t),"text":active})
+                  active=text; start=t if text else None; last=t
+              if active and start is not None: cues.append({"start":start,"end":min(duration,last+step),"text":active})
+              return [c for c in cues if c['end']>c['start'] and c['text']]
+
+          def save(cues):
+              subs=pysubs2.SSAFile()
+              for c in cues: subs.events.append(pysubs2.SSAEvent(start=int(c['start']*1000),end=int(c['end']*1000),text=c['text']))
+              subs.save(str(OUTPUT_SRT),encoding='utf-8')
+
+          def main():
+              r=find_region(); samples,d=extract(r); cues=to_cues(samples,d); save(cues)
+              DEBUG_JSON.write_text(json.dumps({"region":r,"ocr_fps":OCR_FPS,"sample_count":len(samples),"cue_count":len(cues),"samples":samples,"cues":cues},ensure_ascii=False,indent=2),encoding='utf-8')
+              cnt=Counter(s['text'] for s in samples if s['text'])
+              log("========== OCR DEBUG SUMMARY =========="); log(f"Total samples : {len(samples)}"); log(f"Non-empty     : {sum(1 for s in samples if s['text'])}"); log(f"Raw SRT cues  : {len(cues)}"); log(f"Output        : {OUTPUT_SRT}")
+              for text,n in cnt.most_common(20): log(f"  {n:4d}x {text!r}")
+              log("=======================================")
+          if __name__=='__main__': main()
+          PY
+
+      - name: OCR Debug only
+        env:
+          SCAN_SECONDS: ${{ inputs.scan_seconds }}
+          OCR_FPS: ${{ inputs.ocr_fps }}
+          DISABLE_MODEL_SOURCE_CHECK: "True"
+          PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+        run: python process.py
+
+      - name: Check Chinese subtitle
+        run: |
+          set -euo pipefail
+          test -s chinese.srt
+          cat chinese.srt
+
+      - name: Commit Chinese subtitle to repository
+        run: |
+          set -euo pipefail
+          test -s chinese.srt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add chinese.srt
+          if git diff --cached --quiet; then
+            echo "chinese.srt khong thay doi."
+          else
+            git commit -m "debug: update Chinese OCR subtitle"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Cleanup cookies
+        if: always()
+        run: rm -f work/cookies.txt
