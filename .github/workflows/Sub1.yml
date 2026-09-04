@@ -13,7 +13,7 @@ on:
         default: "0.5"
         type: string
       ocr_fps:
-        description: "FPS OCR thực tế. Debug nên dùng 4-8"
+        description: "FPS OCR thực tế. Nên dùng 6-8 để merge/vote hoạt động tốt"
         required: false
         default: "8"
         type: string
@@ -179,7 +179,7 @@ jobs:
           MIN_BOX_HEIGHT = 5
 
           # ------------------------------------------------------------
-          # NÂNG CẤP OCR QUALITY
+          # NÂNG CẤP OCR QUALITY (giai đoạn 1)
           # ------------------------------------------------------------
           #
           # Vấn đề gốc: ảnh crop full-width (vd 1920xN) khi đưa vào
@@ -188,30 +188,41 @@ jobs:
           # (crop cao ~100px) bị co lại rất nhỏ trước khi qua detection.
           # Chữ Hán nhiều nét, xuống dưới ngưỡng đó model rất dễ mất nét,
           # gộp nhầm ký tự, hoặc bỏ sót ký tự đầu/cuối dòng.
-          #
-          # Cách xử lý:
-          #   1. Tăng giới hạn cạnh dài khi detect (không cho model tự
-          #      downsize ảnh xuống quá nhỏ).
-          #   2. Upscale ảnh crop trước khi OCR để chữ "to" hơn khi vào
-          #      model.
-          #   3. Tăng tương phản chữ/nền bằng CLAHE để giảm nhiễu từ nền
-          #      video động phía sau phụ đề.
-          #
-          # Các tham số này an toàn để chỉnh mà không phá cấu trúc dữ
-          # liệu debug hiện có (samples/cues/merge_debug không đổi).
 
           OCR_UPSCALE_FACTOR = 2.0
           OCR_DET_LIMIT_SIDE_LEN = 2000
           OCR_APPLY_CLAHE = True
 
+          # ------------------------------------------------------------
+          # NÂNG CẤP MERGE QUALITY (giai đoạn 2)
+          # ------------------------------------------------------------
+          #
+          # Vấn đề: khi OCR_FPS thấp, mỗi cue chỉ có 1-2 sample, không đủ
+          # dữ liệu để "vote" ra bản đúng nhất trong lúc merge samples
+          # thành cue (samples_to_raw_cues). Kết quả là nhiều cue liền kề
+          # thực chất là CÙNG MỘT câu thoại nhưng bị OCR sai khác nhau,
+          # và bước cleanup cũ chỉ gộp khi text giống HỆT NHAU nên bỏ sót.
+          #
+          # Cách xử lý: thêm một post-merge pass thứ hai, dùng lại đúng
+          # hàm text_match_details() (LCS + length-aware threshold) để so
+          # sánh MỖI CẶP cue liền kề, không chỉ so sánh tuyệt đối. Nếu đủ
+          # giống và gap thời gian hợp lý theo độ dài câu -> gộp, chọn
+          # text có sample_count cao hơn (nếu bằng nhau thì câu dài hơn)
+          # làm đại diện.
+          #
+          # Pass này chạy sau samples_to_raw_cues() và trước khi ghi SRT,
+          # không đụng vào logic vote/tail-representative đã có.
+
+          ENABLE_ADJACENT_CUE_FUZZY_MERGE = True
+
+          # Số lần lặp tối đa để merge dây chuyền (A-B-C đều giống nhau)
+          ADJACENT_MERGE_MAX_PASSES = 5
+
           # Debug mode:
           #
           # - Không dùng change detection.
           # - Không skip frame.
-          # - Không fuzzy merge.
-          # - Không similarity merge.
-          #
-          # OCR tất cả sample.
+          # - OCR tất cả sample.
           #
           # Mục tiêu:
           # kiểm tra chính xác OCR đọc được gì ở từng thời điểm.
@@ -257,9 +268,8 @@ jobs:
                  phụ đề.
 
               Không thay đổi tỉ lệ khung hình, chỉ scale đều 2 chiều,
-              nên không cần scale ngược tọa độ box theo chiều phức tạp
-              (chỉ cần chia lại cho OCR_UPSCALE_FACTOR nếu cần map box
-              về ảnh gốc).
+              nên box được scale ngược lại bằng scale_back trong
+              ocr_image().
               """
 
               if image is None or image.size == 0:
@@ -929,6 +939,12 @@ jobs:
                   f"OCR FPS={OCR_FPS}"
               )
 
+              if OCR_FPS < 4.0:
+                  log(
+                      "WARNING: OCR_FPS < 4.0. Moi cue se qua it sample "
+                      "de vote/merge chinh xac. Nen dung 6-8 fps."
+                  )
+
               log(
                   f"EXPECTED SAMPLES="
                   f"{expected_samples}"
@@ -1521,7 +1537,7 @@ jobs:
                   if cue:
                       cues.append(cue)
 
-              # Safety cleanup:
+              # Safety cleanup (pass 1):
               # Hai cue text giống hệt nhau chỉ được nối nếu khoảng cách
               # phù hợp với độ dài subtitle.
               cleaned = []
@@ -1556,6 +1572,125 @@ jobs:
                       cleaned.append(cue)
 
               return cleaned, merge_debug
+
+
+          # ============================================================
+          # POST-MERGE: FUZZY MERGE CUE LIỀN KỀ (giai đoạn 2)
+          # ============================================================
+          #
+          # Khác với pass "Safety cleanup" ở trên (chỉ merge khi text
+          # giống HỆT NHAU), pass này dùng text_match_details() để merge
+          # cả khi hai cue liền kề chỉ GIỐNG NHAU MỘT PHẦN (do OCR sai
+          # khác nhau ở giữa) nhưng rõ ràng là cùng một câu thoại.
+          #
+          # An toàn vì:
+          #   - Chỉ xét 2 cue LIỀN KỀ (không nhảy cóc).
+          #   - Vẫn dùng đúng ngưỡng LCS + gap theo độ dài câu đã tune.
+          #   - Có giới hạn số vòng lặp (ADJACENT_MERGE_MAX_PASSES) để
+          #     tránh merge dây chuyền vô hạn nếu dữ liệu bất thường.
+          #   - Log lại toàn bộ quyết định merge vào debug JSON để bạn
+          #     kiểm tra/tinh chỉnh threshold nếu cần.
+
+          def fuzzy_merge_adjacent_cues(cues):
+
+              if not cues or not ENABLE_ADJACENT_CUE_FUZZY_MERGE:
+                  return cues, []
+
+              merge_log = []
+
+              current = list(cues)
+
+              for pass_index in range(ADJACENT_MERGE_MAX_PASSES):
+
+                  merged_any = False
+                  result = []
+
+                  index = 0
+
+                  while index < len(current):
+
+                      cue = current[index]
+
+                      if not result:
+                          result.append(dict(cue))
+                          index += 1
+                          continue
+
+                      previous = result[-1]
+
+                      gap = (
+                          cue["start"]
+                          - previous["end"]
+                      )
+
+                      max_len = max(
+                          len(previous["text"]),
+                          len(cue["text"]),
+                      )
+
+                      matched, details = text_match_details(
+                          cue["text"],
+                          previous["text"],
+                          gap,
+                      )
+
+                      merge_log.append(
+                          {
+                              "pass": pass_index,
+                              "previous_text": previous["text"],
+                              "current_text": cue["text"],
+                              "gap": round(gap, 4),
+                              "matched": matched,
+                              "details": details,
+                          }
+                      )
+
+                      if matched:
+
+                          merged_any = True
+
+                          previous_count = previous.get(
+                              "sample_count",
+                              0,
+                          )
+
+                          cue_count = cue.get(
+                              "sample_count",
+                              0,
+                          )
+
+                          # Chọn text đại diện: sample_count cao hơn
+                          # thắng; nếu bằng nhau, câu dài hơn thắng
+                          # (thường là bản đọc đầy đủ hơn).
+                          if cue_count > previous_count or (
+                              cue_count == previous_count
+                              and len(cue["text"])
+                              > len(previous["text"])
+                          ):
+                              previous["text"] = cue["text"]
+
+                          previous["end"] = max(
+                              previous["end"],
+                              cue["end"],
+                          )
+
+                          previous["sample_count"] = (
+                              previous_count + cue_count
+                          )
+
+                          previous["fuzzy_merged"] = True
+
+                      else:
+                          result.append(dict(cue))
+
+                      index += 1
+
+                  current = result
+
+                  if not merged_any:
+                      break
+
+              return current, merge_log
 
 
           # ============================================================
@@ -1625,11 +1760,18 @@ jobs:
               )
 
               (
-                  cues,
+                  raw_cues,
                   merge_debug,
               ) = samples_to_raw_cues(
                   samples,
                   duration,
+              )
+
+              (
+                  cues,
+                  adjacent_merge_log,
+              ) = fuzzy_merge_adjacent_cues(
+                  raw_cues
               )
 
               save_srt(
@@ -1654,18 +1796,26 @@ jobs:
                   "ocr_upscale_factor": OCR_UPSCALE_FACTOR,
                   "ocr_det_limit_side_len": OCR_DET_LIMIT_SIDE_LEN,
                   "ocr_apply_clahe": OCR_APPLY_CLAHE,
+                  "adjacent_fuzzy_merge_enabled": (
+                      ENABLE_ADJACENT_CUE_FUZZY_MERGE
+                  ),
                   "sample_count": len(
                       samples
                   ),
                   "nonempty_sample_count": len(
                       nonempty_samples
                   ),
+                  "raw_cue_count": len(
+                      raw_cues
+                  ),
                   "cue_count": len(
                       cues
                   ),
                   "samples": samples,
+                  "raw_cues": raw_cues,
                   "cues": cues,
                   "merge_debug": merge_debug,
+                  "adjacent_merge_log": adjacent_merge_log,
               }
 
               DEBUG_JSON.write_text(
@@ -1705,7 +1855,13 @@ jobs:
 
               log(
                   f"Raw SRT cues  : "
-                  f"{len(cues)}"
+                  f"{len(raw_cues)}"
+              )
+
+              log(
+                  f"Final cues    : "
+                  f"{len(cues)} "
+                  f"(sau fuzzy merge liền kề)"
               )
 
               log(
@@ -1801,6 +1957,11 @@ jobs:
           print(
               "nonempty_sample_count:",
               data["nonempty_sample_count"]
+          )
+
+          print(
+              "raw_cue_count:",
+              data["raw_cue_count"]
           )
 
           print(
