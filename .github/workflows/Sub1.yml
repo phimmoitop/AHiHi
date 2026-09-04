@@ -178,6 +178,32 @@ jobs:
           MIN_BOX_WIDTH = 5
           MIN_BOX_HEIGHT = 5
 
+          # ------------------------------------------------------------
+          # NÂNG CẤP OCR QUALITY
+          # ------------------------------------------------------------
+          #
+          # Vấn đề gốc: ảnh crop full-width (vd 1920xN) khi đưa vào
+          # PaddleOCR sẽ bị model tự resize xuống theo giới hạn cạnh dài
+          # mặc định (det_limit_side_len), khiến dòng chữ vốn đã mỏng
+          # (crop cao ~100px) bị co lại rất nhỏ trước khi qua detection.
+          # Chữ Hán nhiều nét, xuống dưới ngưỡng đó model rất dễ mất nét,
+          # gộp nhầm ký tự, hoặc bỏ sót ký tự đầu/cuối dòng.
+          #
+          # Cách xử lý:
+          #   1. Tăng giới hạn cạnh dài khi detect (không cho model tự
+          #      downsize ảnh xuống quá nhỏ).
+          #   2. Upscale ảnh crop trước khi OCR để chữ "to" hơn khi vào
+          #      model.
+          #   3. Tăng tương phản chữ/nền bằng CLAHE để giảm nhiễu từ nền
+          #      video động phía sau phụ đề.
+          #
+          # Các tham số này an toàn để chỉnh mà không phá cấu trúc dữ
+          # liệu debug hiện có (samples/cues/merge_debug không đổi).
+
+          OCR_UPSCALE_FACTOR = 2.0
+          OCR_DET_LIMIT_SIDE_LEN = 2000
+          OCR_APPLY_CLAHE = True
+
           # Debug mode:
           #
           # - Không dùng change detection.
@@ -219,6 +245,58 @@ jobs:
               )
 
               return text
+
+
+          def preprocess_for_ocr(image):
+              """
+              Tiền xử lý ảnh trước khi OCR để tăng độ ổn định:
+
+              1. Upscale ảnh (chữ nhỏ -> chữ to hơn khi vào model).
+              2. CLAHE trên kênh sáng (L trong LAB) để tăng tương phản
+                 chữ/nền, giảm ảnh hưởng của nền video động phía sau
+                 phụ đề.
+
+              Không thay đổi tỉ lệ khung hình, chỉ scale đều 2 chiều,
+              nên không cần scale ngược tọa độ box theo chiều phức tạp
+              (chỉ cần chia lại cho OCR_UPSCALE_FACTOR nếu cần map box
+              về ảnh gốc).
+              """
+
+              if image is None or image.size == 0:
+                  return image
+
+              processed = image
+
+              if OCR_UPSCALE_FACTOR and OCR_UPSCALE_FACTOR != 1.0:
+                  processed = cv2.resize(
+                      processed,
+                      None,
+                      fx=OCR_UPSCALE_FACTOR,
+                      fy=OCR_UPSCALE_FACTOR,
+                      interpolation=cv2.INTER_CUBIC,
+                  )
+
+              if OCR_APPLY_CLAHE:
+                  lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
+                  l_channel, a_channel, b_channel = cv2.split(lab)
+
+                  clahe = cv2.createCLAHE(
+                      clipLimit=2.0,
+                      tileGridSize=(8, 8),
+                  )
+
+                  l_channel = clahe.apply(l_channel)
+
+                  lab = cv2.merge(
+                      (l_channel, a_channel, b_channel)
+                  )
+
+                  processed = cv2.cvtColor(
+                      lab,
+                      cv2.COLOR_LAB2BGR,
+                  )
+
+              return processed
 
 
           # ============================================================
@@ -336,7 +414,7 @@ jobs:
           # PADDLEOCR RESULT PARSER
           # ============================================================
 
-          def ocr_image(image):
+          def ocr_image(image, scale_back=1.0):
               """
               Chạy PaddleOCR và trả về:
 
@@ -347,6 +425,9 @@ jobs:
                       "box": [x1, y1, x2, y2]
                   }
               ]
+
+              scale_back: nếu ảnh đưa vào OCR đã bị upscale trước đó,
+              truyền hệ số để quy đổi box về tọa độ ảnh gốc (crop gốc).
               """
 
               result = ocr.predict(
@@ -446,24 +527,28 @@ jobs:
                           np.min(
                               points[:, 0]
                           )
+                          / scale_back
                       )
 
                       y1 = int(
                           np.min(
                               points[:, 1]
                           )
+                          / scale_back
                       )
 
                       x2 = int(
                           np.max(
                               points[:, 0]
                           )
+                          / scale_back
                       )
 
                       y2 = int(
                           np.max(
                               points[:, 1]
                           )
+                          / scale_back
                       )
 
                       if (
@@ -568,8 +653,13 @@ jobs:
                       0:width,
                   ]
 
-                  items = ocr_image(
+                  processed_crop = preprocess_for_ocr(
                       search_crop
+                  )
+
+                  items = ocr_image(
+                      processed_crop,
+                      scale_back=OCR_UPSCALE_FACTOR,
                   )
 
                   candidates = []
@@ -829,6 +919,13 @@ jobs:
               )
 
               log(
+                  "OCR PREPROCESS: "
+                  f"upscale={OCR_UPSCALE_FACTOR}x "
+                  f"clahe={OCR_APPLY_CLAHE} "
+                  f"det_limit_side_len={OCR_DET_LIMIT_SIDE_LEN}"
+              )
+
+              log(
                   f"OCR FPS={OCR_FPS}"
               )
 
@@ -944,8 +1041,13 @@ jobs:
                           )
                       )
 
-                      items = ocr_image(
+                      processed_frame = preprocess_for_ocr(
                           frame
+                      )
+
+                      items = ocr_image(
+                          processed_frame,
+                          scale_back=OCR_UPSCALE_FACTOR,
                       )
 
                       valid = []
@@ -1506,7 +1608,9 @@ jobs:
               global ocr
 
               ocr = PaddleOCR(
-                  lang="ch"
+                  lang="ch",
+                  text_det_limit_side_len=OCR_DET_LIMIT_SIDE_LEN,
+                  text_det_limit_type="max",
               )
 
               region = (
@@ -1547,6 +1651,9 @@ jobs:
                   "region": region,
                   "scan_seconds": SCAN_SECONDS,
                   "ocr_fps": OCR_FPS,
+                  "ocr_upscale_factor": OCR_UPSCALE_FACTOR,
+                  "ocr_det_limit_side_len": OCR_DET_LIMIT_SIDE_LEN,
+                  "ocr_apply_clahe": OCR_APPLY_CLAHE,
                   "sample_count": len(
                       samples
                   ),
