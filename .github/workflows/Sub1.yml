@@ -1,4 +1,4 @@
-name: Bilibili Hard Subtitle Extractor → Accurate Timing + Midpoint OCR
+name: Bilibili Hard Subtitle → Accurate Timing → Midpoint OCR
 
 on:
   workflow_dispatch:
@@ -9,41 +9,32 @@ on:
         type: string
 
       scan_fps:
-        description: "FPS phân tích timing. 10-15 cho timing tốt."
+        description: "FPS dùng để phát hiện timing. 10-15 là hợp lý"
         required: false
         default: "12"
         type: string
 
-      roi_top:
-        description: "Top của vùng subtitle (% chiều cao video)"
+      refine_iterations:
+        description: "Số vòng binary search để refine START/END"
         required: false
-        default: "70"
+        default: "8"
         type: string
 
-      roi_bottom:
-        description: "Bottom của vùng subtitle (% chiều cao video)"
-        required: false
-        default: "100"
-        type: string
-
-      min_duration:
+      min_subtitle_seconds:
         description: "Subtitle tối thiểu (giây)"
         required: false
-        default: "0.25"
-        type: string
-
-      threshold:
-        description: "Brightness threshold cho subtitle trắng"
-        required: false
-        default: "180"
+        default: "0.20"
         type: string
 
 permissions:
   contents: write
 
 jobs:
+
   process:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 360
 
     env:
@@ -73,7 +64,7 @@ jobs:
 
 
       # ============================================================
-      # SYSTEM PACKAGES
+      # SYSTEM
       # ============================================================
 
       - name: Install system packages
@@ -122,17 +113,15 @@ jobs:
           set -eux
 
           mkdir -p work
-          mkdir -p work/cues
-          mkdir -p work/debug
 
           rm -f chinese.srt
           rm -f work/timing.json
           rm -f work/ocr.json
-          rm -f work/debug/*
+          rm -f work/cookies.txt
 
 
       # ============================================================
-      # BILIBILI COOKIES
+      # COOKIES
       # ============================================================
 
       - name: Prepare Bilibili cookies
@@ -177,13 +166,8 @@ jobs:
             "$BILIBILI_URL"
 
           if [ ! -f work/source.mp4 ]; then
-            echo "::error::Không tìm thấy work/source.mp4."
-
-            find work \
-              -maxdepth 2 \
-              -type f \
-              -ls
-
+            echo "::error::Không tìm thấy work/source.mp4"
+            find work -maxdepth 2 -type f -ls
             exit 1
           fi
 
@@ -191,10 +175,10 @@ jobs:
 
 
       # ============================================================
-      # CREATE PROCESSOR
+      # CREATE PROCESS SCRIPT
       # ============================================================
 
-      - name: Create subtitle processor
+      - name: Create processing script
         run: |
 
           cat > process.py <<'PY'
@@ -202,16 +186,13 @@ jobs:
           import os
           import re
           import json
-          import math
           import subprocess
           from pathlib import Path
-          from collections import Counter
 
           import cv2
           import numpy as np
           import pysubs2
           from tqdm import tqdm
-
           from paddleocr import PaddleOCR
 
 
@@ -229,10 +210,6 @@ jobs:
 
           OUTPUT_SRT = Path("chinese.srt")
 
-          CUE_DIR = WORK / "cues"
-
-          DEBUG_DIR = WORK / "debug"
-
 
           # ============================================================
           # CONFIG
@@ -241,120 +218,100 @@ jobs:
           SCAN_FPS = float(
               os.environ.get(
                   "SCAN_FPS",
-                  "12",
+                  "12"
               )
           )
 
-          ROI_TOP_PERCENT = float(
+          REFINE_ITERATIONS = int(
               os.environ.get(
-                  "ROI_TOP",
-                  "70",
+                  "REFINE_ITERATIONS",
+                  "8"
               )
           )
 
-          ROI_BOTTOM_PERCENT = float(
+          MIN_SUBTITLE_SECONDS = float(
               os.environ.get(
-                  "ROI_BOTTOM",
-                  "100",
-              )
-          )
-
-          MIN_DURATION = float(
-              os.environ.get(
-                  "MIN_DURATION",
-                  "0.25",
-              )
-          )
-
-          BRIGHTNESS_THRESHOLD = int(
-              os.environ.get(
-                  "BRIGHTNESS_THRESHOLD",
-                  "180",
+                  "MIN_SUBTITLE_SECONDS",
+                  "0.20"
               )
           )
 
 
-          # ------------------------------------------------------------
-          # Timing detection
-          # ------------------------------------------------------------
-
+          # ============================================================
+          # ROI
+          # ============================================================
           #
-          # Subtitle thay đổi thường tạo ra pixel difference.
+          # Subtitle tiếng Trung hard-sub thường nằm ở 65-100%.
           #
-          # Nhưng video bản thân nó cũng chuyển động.
-          #
-          # Vì vậy KHÔNG so sánh toàn bộ ROI.
-          #
-          # Ta:
-          #
-          #   1. grayscale
-          #   2. threshold brightness
-          #   3. morphology
-          #   4. tính occupancy của bright subtitle pixels
-          #
-          # Với subtitle trắng:
-          #
-          # background thay đổi
-          # nhưng subtitle vẫn tạo ra vùng bright ổn định.
-          #
-          # Ngoài ra dùng frame-to-frame difference để bắt
-          # thời điểm subtitle xuất hiện / biến mất.
+          # Không crop quá sát lúc đầu vì subtitle có thể nằm hơi cao.
           #
 
-          OCCUPANCY_MIN = 0.0008
+          ROI_Y1_RATIO = 0.62
 
-          DIFF_PERCENTILE = 98.0
+          ROI_Y2_RATIO = 0.98
 
-          START_CONFIRM_FRAMES = 2
 
-          END_CONFIRM_FRAMES = 2
+          # ============================================================
+          # TEMPORAL DETECTION CONFIG
+          # ============================================================
 
-          # Cho phép gap nhỏ do video compression / fade.
-          MAX_EMPTY_GAP = 0.20
+          #
+          # Ta không dùng một occupancy threshold cố định.
+          #
+          # Mỗi frame được biến thành:
+          #
+          #   "subtitle mask"
+          #
+          # sau đó so sánh temporal.
+          #
 
-          # ------------------------------------------------------------
-          # Subtitle morphology
-          # ------------------------------------------------------------
+          BLUR_SIZE = 3
 
-          MORPH_OPEN = 1
+          ADAPTIVE_BLOCK_SIZE = 31
 
-          MORPH_CLOSE = 3
+          ADAPTIVE_C = 8
 
-          # ------------------------------------------------------------
+          MORPH_KERNEL = 3
+
+          MIN_COMPONENT_AREA = 8
+
+          MIN_TEXT_HEIGHT = 5
+
+          MAX_TEXT_HEIGHT_RATIO = 0.25
+
+
+          #
+          # Subtitle thường là những vùng:
+          #
+          # - sáng hơn background
+          # - hoặc rất sáng sau threshold
+          #
+          # Ta chạy cả:
+          #
+          #   grayscale bright
+          #   local adaptive threshold
+          #
+          # rồi OR chúng lại.
+          #
+
+
+          # ============================================================
           # OCR
-          # ------------------------------------------------------------
+          # ============================================================
 
           OCR_UPSCALE = 3.0
 
-          OCR_DET_LIMIT = 2500
+          OCR_DET_LIMIT = 3000
 
           OCR_MIN_SCORE = 0.35
 
 
           # ============================================================
-          # LOG
+          # UTILS
           # ============================================================
 
           def log(message):
-
-              print(
-                  message,
-                  flush=True,
-              )
-
-
-          # ============================================================
-          # CHINESE
-          # ============================================================
-
-          def chinese_count(text):
-
-              return len(
-                  re.findall(
-                      r"[\u3400-\u9fff]",
-                      str(text),
-                  )
-              )
+              print(message, flush=True)
 
 
           def normalize_text(text):
@@ -364,10 +321,20 @@ jobs:
               text = re.sub(
                   r"\s+",
                   "",
-                  text,
+                  text
               )
 
               return text
+
+
+          def chinese_count(text):
+
+              return len(
+                  re.findall(
+                      r"[\u3400-\u9fff]",
+                      str(text)
+                  )
+              )
 
 
           # ============================================================
@@ -389,7 +356,7 @@ jobs:
                   "format=duration",
                   "-of",
                   "json",
-                  str(VIDEO),
+                  str(VIDEO)
               ]
 
               result = subprocess.run(
@@ -397,7 +364,7 @@ jobs:
                   stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE,
                   text=True,
-                  check=True,
+                  check=True
               )
 
               data = json.loads(
@@ -414,14 +381,14 @@ jobs:
                   stream["height"]
               )
 
-              num, den = (
+              fps_num, fps_den = (
                   stream["r_frame_rate"]
                   .split("/")
               )
 
               fps = (
-                  float(num)
-                  / float(den)
+                  float(fps_num)
+                  / float(fps_den)
               )
 
               duration = float(
@@ -432,41 +399,54 @@ jobs:
                   width,
                   height,
                   fps,
-                  duration,
+                  duration
               )
 
 
           # ============================================================
-          # ROI
+          # FRAME EXTRACTION
           # ============================================================
 
-          def get_roi(height):
+          def get_frame(time_sec):
 
-              y1 = int(
-                  height
-                  * ROI_TOP_PERCENT
-                  / 100.0
+              cmd = [
+                  "ffmpeg",
+                  "-hide_banner",
+                  "-loglevel",
+                  "error",
+                  "-ss",
+                  f"{max(0, time_sec):.6f}",
+                  "-i",
+                  str(VIDEO),
+                  "-frames:v",
+                  "1",
+                  "-f",
+                  "image2pipe",
+                  "-vcodec",
+                  "mjpeg",
+                  "-"
+              ]
+
+              result = subprocess.run(
+                  cmd,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE
               )
 
-              y2 = int(
-                  height
-                  * ROI_BOTTOM_PERCENT
-                  / 100.0
+              if (
+                  result.returncode != 0
+                  or not result.stdout
+              ):
+                  return None
+
+              raw = np.frombuffer(
+                  result.stdout,
+                  dtype=np.uint8
               )
 
-              y1 = max(
-                  0,
-                  min(height - 1, y1),
-              )
-
-              y2 = max(
-                  y1 + 1,
-                  min(height, y2),
-              )
-
-              return (
-                  y1,
-                  y2,
+              return cv2.imdecode(
+                  raw,
+                  cv2.IMREAD_COLOR
               )
 
 
@@ -474,906 +454,67 @@ jobs:
           # SUBTITLE MASK
           # ============================================================
 
-          def subtitle_mask(frame):
+          def build_subtitle_mask(frame):
 
-              gray = cv2.cvtColor(
-                  frame,
-                  cv2.COLOR_BGR2GRAY,
+              h, w = frame.shape[:2]
+
+              y1 = int(
+                  h * ROI_Y1_RATIO
               )
 
-              # --------------------------------------------------------
-              # Bright pixel threshold
-              # --------------------------------------------------------
-
-              _, mask = cv2.threshold(
-                  gray,
-                  BRIGHTNESS_THRESHOLD,
-                  255,
-                  cv2.THRESH_BINARY,
+              y2 = int(
+                  h * ROI_Y2_RATIO
               )
-
-              # --------------------------------------------------------
-              # Remove isolated noise
-              # --------------------------------------------------------
-
-              if MORPH_OPEN > 0:
-
-                  kernel = cv2.getStructuringElement(
-                      cv2.MORPH_ELLIPSE,
-                      (
-                          MORPH_OPEN,
-                          MORPH_OPEN,
-                      ),
-                  )
-
-                  mask = cv2.morphologyEx(
-                      mask,
-                      cv2.MORPH_OPEN,
-                      kernel,
-                  )
-
-              # --------------------------------------------------------
-              # Connect letters
-              # --------------------------------------------------------
-
-              if MORPH_CLOSE > 0:
-
-                  kernel = cv2.getStructuringElement(
-                      cv2.MORPH_RECT,
-                      (
-                          MORPH_CLOSE,
-                          MORPH_CLOSE,
-                      ),
-                  )
-
-                  mask = cv2.morphologyEx(
-                      mask,
-                      cv2.MORPH_CLOSE,
-                      kernel,
-                  )
-
-              return mask
-
-
-          # ============================================================
-          # MASK SCORE
-          # ============================================================
-
-          def mask_score(mask):
-
-              if mask is None:
-                  return 0.0
-
-              white = cv2.countNonZero(
-                  mask
-              )
-
-              total = (
-                  mask.shape[0]
-                  * mask.shape[1]
-              )
-
-              if total <= 0:
-                  return 0.0
-
-              return (
-                  white
-                  / total
-              )
-
-
-          # ============================================================
-          # FRAME DIFFERENCE
-          # ============================================================
-
-          def frame_difference(
-              previous,
-              current,
-          ):
-
-              if (
-                  previous is None
-                  or current is None
-              ):
-                  return 0.0
-
-              prev_gray = cv2.cvtColor(
-                  previous,
-                  cv2.COLOR_BGR2GRAY,
-              )
-
-              curr_gray = cv2.cvtColor(
-                  current,
-                  cv2.COLOR_BGR2GRAY,
-              )
-
-              diff = cv2.absdiff(
-                  prev_gray,
-                  curr_gray,
-              )
-
-              # Không dùng mean vì background movement
-              # có thể làm mean lớn.
-              #
-              # percentile giúp bắt những vùng thay đổi mạnh.
-
-              return float(
-                  np.percentile(
-                      diff,
-                      DIFF_PERCENTILE,
-                  )
-              )
-
-
-          # ============================================================
-          # BUILD FRAME STREAM
-          # ============================================================
-
-          def frame_stream(
-              width,
-              height,
-              y1,
-              y2,
-              duration,
-          ):
-
-              roi_width = width
-
-              roi_height = (
-                  y2 - y1
-              )
-
-              filter_graph = (
-                  f"fps={SCAN_FPS},"
-                  f"crop="
-                  f"{roi_width}:"
-                  f"{roi_height}:"
-                  f"0:"
-                  f"{y1}"
-              )
-
-              cmd = [
-                  "ffmpeg",
-                  "-hide_banner",
-                  "-loglevel",
-                  "error",
-                  "-i",
-                  str(VIDEO),
-                  "-vf",
-                  filter_graph,
-                  "-an",
-                  "-sn",
-                  "-dn",
-                  "-pix_fmt",
-                  "bgr24",
-                  "-f",
-                  "rawvideo",
-                  "-",
-              ]
-
-              process = subprocess.Popen(
-                  cmd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  bufsize=1024 * 1024 * 64,
-              )
-
-              frame_size = (
-                  roi_width
-                  * roi_height
-                  * 3
-              )
-
-              index = 0
-
-              try:
-
-                  while True:
-
-                      raw = (
-                          process.stdout.read(
-                              frame_size
-                          )
-                      )
-
-                      if len(raw) != frame_size:
-                          break
-
-                      frame = (
-                          np.frombuffer(
-                              raw,
-                              dtype=np.uint8,
-                          )
-                          .reshape(
-                              (
-                                  roi_height,
-                                  roi_width,
-                                  3,
-                              )
-                          )
-                      )
-
-                      time_sec = (
-                          index
-                          / SCAN_FPS
-                      )
-
-                      yield (
-                          index,
-                          time_sec,
-                          frame,
-                      )
-
-                      index += 1
-
-              finally:
-
-                  if process.stdout:
-                      process.stdout.close()
-
-                  stderr = b""
-
-                  if process.stderr:
-
-                      stderr = (
-                          process.stderr.read()
-                      )
-
-                      process.stderr.close()
-
-                  code = (
-                      process.wait()
-                  )
-
-                  if code != 0:
-
-                      raise RuntimeError(
-                          "FFmpeg frame stream failed:\n"
-                          + stderr.decode(
-                              "utf-8",
-                              errors="replace",
-                          )
-                      )
-
-
-          # ============================================================
-          # TIMING DETECTION
-          # ============================================================
-
-          def detect_timings():
-
-              (
-                  width,
-                  height,
-                  video_fps,
-                  duration,
-              ) = probe_video()
-
-              y1, y2 = get_roi(
-                  height
-              )
-
-              log("")
-              log(
-                  "=========================================="
-              )
-              log(
-                  "PASS 1 — SUBTITLE TIMING DETECTION"
-              )
-              log(
-                  "=========================================="
-              )
-
-              log(
-                  f"VIDEO       : {width}x{height}"
-              )
-
-              log(
-                  f"VIDEO FPS   : {video_fps:.3f}"
-              )
-
-              log(
-                  f"DURATION    : {duration:.3f}s"
-              )
-
-              log(
-                  f"SCAN FPS    : {SCAN_FPS}"
-              )
-
-              log(
-                  f"ROI         : y={y1}..{y2}"
-              )
-
-              log(
-                  "OCR         : DISABLED"
-              )
-
-              log(
-                  "Timing      : PIXEL ANALYSIS ONLY"
-              )
-
-              # --------------------------------------------------------
-              # First pass:
-              #
-              # determine baseline statistics
-              #
-              # --------------------------------------------------------
-
-              samples = []
-
-              previous_frame = None
-
-              pbar = tqdm(
-                  total=int(
-                      math.ceil(
-                          duration
-                          * SCAN_FPS
-                      )
-                  ),
-                  desc="Timing scan",
-              )
-
-              for (
-                  index,
-                  time_sec,
-                  frame,
-              ) in frame_stream(
-                  width,
-                  height,
-                  y1,
-                  y2,
-                  duration,
-              ):
-
-                  mask = subtitle_mask(
-                      frame
-                  )
-
-                  occupancy = mask_score(
-                      mask
-                  )
-
-                  diff = frame_difference(
-                      previous_frame,
-                      frame,
-                  )
-
-                  samples.append(
-                      {
-                          "index": index,
-                          "time": time_sec,
-                          "occupancy": occupancy,
-                          "diff": diff,
-                      }
-                  )
-
-                  previous_frame = frame
-
-                  pbar.update(1)
-
-              pbar.close()
-
-              if not samples:
-
-                  raise RuntimeError(
-                      "Không đọc được frame nào."
-                  )
-
-              # --------------------------------------------------------
-              # Dynamic occupancy threshold
-              #
-              # Background bright pixels có thể rất nhiều.
-              #
-              # Ta dùng percentile thấp + absolute floor.
-              # --------------------------------------------------------
-
-              occupancy_values = np.array(
-                  [
-                      x["occupancy"]
-                      for x in samples
-                  ],
-                  dtype=np.float32,
-              )
-
-              dynamic_threshold = max(
-                  OCCUPANCY_MIN,
-                  float(
-                      np.percentile(
-                          occupancy_values,
-                          65,
-                      )
-                      * 1.8
-                  ),
-              )
-
-              log(
-                  f"Occupancy threshold = "
-                  f"{dynamic_threshold:.6f}"
-              )
-
-              # --------------------------------------------------------
-              # Detect raw active states
-              # --------------------------------------------------------
-
-              active = []
-
-              for item in samples:
-
-                  is_active = (
-                      item["occupancy"]
-                      >= dynamic_threshold
-                  )
-
-                  active.append(
-                      is_active
-                  )
-
-              # --------------------------------------------------------
-              # Temporal smoothing
-              #
-              # Subtitle có thể fade nhẹ hoặc compression làm
-              # occupancy dao động.
-              #
-              # Không cho một vài frame empty phá cue.
-              # --------------------------------------------------------
-
-              gap_frames = max(
-                  1,
-                  int(
-                      MAX_EMPTY_GAP
-                      * SCAN_FPS
-                  ),
-              )
-
-              # Fill short false gaps.
-
-              i = 0
-
-              while i < len(active):
-
-                  if active[i]:
-
-                      i += 1
-                      continue
-
-                  start = i
-
-                  while (
-                      i < len(active)
-                      and not active[i]
-                  ):
-                      i += 1
-
-                  end = i
-
-                  gap_length = (
-                      end - start
-                  )
-
-                  if (
-                      gap_length
-                      <= gap_frames
-                      and start > 0
-                      and end < len(active)
-                      and active[start - 1]
-                      and active[end]
-                  ):
-
-                      for j in range(
-                          start,
-                          end,
-                      ):
-                          active[j] = True
-
-
-              # --------------------------------------------------------
-              # Convert active states → raw cues
-              # --------------------------------------------------------
-
-              raw_cues = []
-
-              start_index = None
-
-              for index, state in enumerate(
-                  active
-              ):
-
-                  if (
-                      state
-                      and start_index is None
-                  ):
-
-                      start_index = index
-
-                  elif (
-                      not state
-                      and start_index is not None
-                  ):
-
-                      end_index = (
-                          index - 1
-                      )
-
-                      start_time = (
-                          samples[
-                              start_index
-                          ]["time"]
-                      )
-
-                      end_time = min(
-                          duration,
-                          (
-                              samples[
-                                  end_index
-                              ]["time"]
-                              + 1.0 / SCAN_FPS
-                          ),
-                      )
-
-                      if (
-                          end_time
-                          - start_time
-                          >= MIN_DURATION
-                      ):
-
-                          raw_cues.append(
-                              {
-                                  "start": start_time,
-                                  "end": end_time,
-                              }
-                          )
-
-                      start_index = None
-
-              # Last cue
-
-              if start_index is not None:
-
-                  end_index = (
-                      len(samples)
-                      - 1
-                  )
-
-                  start_time = (
-                      samples[
-                          start_index
-                      ]["time"]
-                  )
-
-                  end_time = min(
-                      duration,
-                      samples[
-                          end_index
-                      ]["time"]
-                      + 1.0 / SCAN_FPS,
-                  )
-
-                  if (
-                      end_time
-                      - start_time
-                      >= MIN_DURATION
-                  ):
-
-                      raw_cues.append(
-                          {
-                              "start": start_time,
-                              "end": end_time,
-                          }
-                      )
-
-              # --------------------------------------------------------
-              # Merge cues separated by tiny gaps.
-              #
-              # Important:
-              #
-              # This is NOT OCR merge.
-              #
-              # It is purely temporal.
-              # --------------------------------------------------------
-
-              cues = []
-
-              for cue in raw_cues:
-
-                  if not cues:
-
-                      cues.append(
-                          dict(cue)
-                      )
-
-                      continue
-
-                  previous = cues[-1]
-
-                  gap = (
-                      cue["start"]
-                      - previous["end"]
-                  )
-
-                  if gap <= MAX_EMPTY_GAP:
-
-                      previous["end"] = max(
-                          previous["end"],
-                          cue["end"],
-                      )
-
-                  else:
-
-                      cues.append(
-                          dict(cue)
-                      )
-
-              # --------------------------------------------------------
-              # Remove absurd overlaps
-              # --------------------------------------------------------
-
-              cleaned = []
-
-              for cue in cues:
-
-                  if not cleaned:
-
-                      cleaned.append(cue)
-
-                      continue
-
-                  previous = cleaned[-1]
-
-                  if (
-                      cue["start"]
-                      < previous["end"]
-                  ):
-
-                      midpoint = (
-                          previous["end"]
-                          + cue["start"]
-                      ) / 2.0
-
-                      previous["end"] = midpoint
-
-                      cue["start"] = midpoint
-
-                  if (
-                      cue["end"]
-                      > cue["start"]
-                  ):
-
-                      cleaned.append(cue)
-
-              cues = cleaned
-
-              # --------------------------------------------------------
-              # Add midpoint
-              # --------------------------------------------------------
-
-              for index, cue in enumerate(
-                  cues,
-                  start=1,
-              ):
-
-                  cue["id"] = index
-
-                  cue["midpoint"] = (
-                      cue["start"]
-                      + cue["end"]
-                  ) / 2.0
-
-                  cue["duration"] = (
-                      cue["end"]
-                      - cue["start"]
-                  )
-
-              # --------------------------------------------------------
-              # Save timing
-              # --------------------------------------------------------
-
-              timing_data = {
-                  "video": {
-                      "width": width,
-                      "height": height,
-                      "fps": video_fps,
-                      "duration": duration,
-                  },
-                  "scan": {
-                      "fps": SCAN_FPS,
-                      "roi_top": ROI_TOP_PERCENT,
-                      "roi_bottom": ROI_BOTTOM_PERCENT,
-                      "y1": y1,
-                      "y2": y2,
-                      "brightness_threshold": BRIGHTNESS_THRESHOLD,
-                      "occupancy_threshold": dynamic_threshold,
-                  },
-                  "cue_count": len(cues),
-                  "cues": cues,
-              }
-
-              TIMING_JSON.write_text(
-                  json.dumps(
-                      timing_data,
-                      ensure_ascii=False,
-                      indent=2,
-                  ),
-                  encoding="utf-8",
-              )
-
-              log("")
-              log(
-                  f"TIMING CUES = {len(cues)}"
-              )
-
-              for cue in cues[:30]:
-
-                  log(
-                      f"[{cue['id']:04d}] "
-                      f"{cue['start']:.3f} → "
-                      f"{cue['end']:.3f} "
-                      f"(mid="
-                      f"{cue['midpoint']:.3f})"
-                  )
-
-              if len(cues) > 30:
-
-                  log(
-                      f"... "
-                      f"{len(cues) - 30} cues khác"
-                  )
-
-              return timing_data
-
-
-          # ============================================================
-          # EXTRACT EXACT MIDPOINT FRAME
-          # ============================================================
-
-          def extract_frame_at_time(
-              time_sec,
-          ):
-
-              cmd = [
-                  "ffmpeg",
-                  "-hide_banner",
-                  "-loglevel",
-                  "error",
-
-                  # Seek trước input để nhanh,
-                  # sau đó decode chính xác.
-
-                  "-ss",
-                  f"{time_sec:.6f}",
-
-                  "-i",
-                  str(VIDEO),
-
-                  "-frames:v",
-                  "1",
-
-                  "-f",
-                  "image2pipe",
-
-                  "-vcodec",
-                  "png",
-
-                  "-",
-              ]
-
-              result = subprocess.run(
-                  cmd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-              )
-
-              if (
-                  result.returncode != 0
-                  or not result.stdout
-              ):
-
-                  raise RuntimeError(
-                      "Không extract được frame "
-                      f"tại {time_sec:.3f}s"
-                  )
-
-              raw = np.frombuffer(
-                  result.stdout,
-                  dtype=np.uint8,
-              )
-
-              frame = cv2.imdecode(
-                  raw,
-                  cv2.IMREAD_COLOR,
-              )
-
-              if frame is None:
-
-                  raise RuntimeError(
-                      "cv2 không decode được frame."
-                  )
-
-              return frame
-
-
-          # ============================================================
-          # CLEAN OCR IMAGE
-          # ============================================================
-
-          def prepare_ocr_image(
-              frame,
-              y1,
-              y2,
-          ):
 
               roi = frame[
                   y1:y2,
-                  :,
+                  :
               ]
-
-              if (
-                  roi is None
-                  or roi.size == 0
-              ):
-
-                  return None
-
-              # --------------------------------------------------------
-              # Upscale
-              # --------------------------------------------------------
-
-              roi = cv2.resize(
-                  roi,
-                  None,
-                  fx=OCR_UPSCALE,
-                  fy=OCR_UPSCALE,
-                  interpolation=cv2.INTER_CUBIC,
-              )
-
-              # --------------------------------------------------------
-              # Grayscale
-              # --------------------------------------------------------
 
               gray = cv2.cvtColor(
                   roi,
-                  cv2.COLOR_BGR2GRAY,
+                  cv2.COLOR_BGR2GRAY
               )
 
-              # --------------------------------------------------------
-              # CLAHE
-              # --------------------------------------------------------
-
-              clahe = cv2.createCLAHE(
-                  clipLimit=2.0,
-                  tileGridSize=(8, 8),
-              )
-
-              gray = clahe.apply(
-                  gray
-              )
-
-              # --------------------------------------------------------
-              # Otsu
-              #
-              # Ta tạo một binary version.
-              #
-              # Nhưng không nhất thiết OCR binary tốt hơn grayscale.
-              #
-              # Vì vậy trả về cả hai.
-              # --------------------------------------------------------
-
-              _, otsu = cv2.threshold(
+              gray = cv2.GaussianBlur(
                   gray,
-                  0,
-                  255,
-                  cv2.THRESH_BINARY
-                  + cv2.THRESH_OTSU,
+                  (
+                      BLUR_SIZE,
+                      BLUR_SIZE
+                  ),
+                  0
               )
 
               # --------------------------------------------------------
-              # Bright subtitle mask
+              # Method 1:
+              # Bright pixels
               # --------------------------------------------------------
 
               _, bright = cv2.threshold(
                   gray,
-                  BRIGHTNESS_THRESHOLD,
+                  0,
                   255,
+                  cv2.THRESH_BINARY
+                  + cv2.THRESH_OTSU
+              )
+
+              # --------------------------------------------------------
+              # Method 2:
+              # Adaptive threshold
+              # --------------------------------------------------------
+
+              adaptive = cv2.adaptiveThreshold(
+                  gray,
+                  255,
+                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                   cv2.THRESH_BINARY,
+                  ADAPTIVE_BLOCK_SIZE,
+                  ADAPTIVE_C
+              )
+
+              mask = cv2.bitwise_or(
+                  bright,
+                  adaptive
               )
 
               # --------------------------------------------------------
@@ -1382,519 +523,1091 @@ jobs:
 
               kernel = cv2.getStructuringElement(
                   cv2.MORPH_RECT,
-                  (3, 3),
+                  (
+                      MORPH_KERNEL,
+                      MORPH_KERNEL
+                  )
               )
 
-              bright = cv2.morphologyEx(
-                  bright,
+              mask = cv2.morphologyEx(
+                  mask,
+                  cv2.MORPH_OPEN,
+                  kernel
+              )
+
+              mask = cv2.morphologyEx(
+                  mask,
                   cv2.MORPH_CLOSE,
-                  kernel,
+                  kernel
               )
 
-              # --------------------------------------------------------
-              # Black background + white subtitle
+              return mask
+
+
+          # ============================================================
+          # TEXT-LIKE SCORE
+          # ============================================================
+
+          def subtitle_score(frame):
+
+              mask = build_subtitle_mask(
+                  frame
+              )
+
+              h, w = mask.shape
+
+              total_pixels = h * w
+
+              if total_pixels <= 0:
+                  return 0.0
+
               #
-              # Đây là ảnh rất tốt cho debug.
-              # --------------------------------------------------------
+              # Connected components.
+              #
 
-              binary = bright
+              num_labels, labels, stats, _ = (
+                  cv2.connectedComponentsWithStats(
+                      mask,
+                      connectivity=8
+                  )
+              )
 
-              return {
-                  "gray": gray,
-                  "otsu": otsu,
-                  "binary": binary,
-              }
+              good_area = 0
 
+              good_components = 0
 
-          # ============================================================
-          # OCR
-          # ============================================================
+              for i in range(
+                  1,
+                  num_labels
+              ):
 
-          def run_ocr(
-              ocr,
-              image,
-          ):
+                  x = stats[
+                      i,
+                      cv2.CC_STAT_LEFT
+                  ]
 
-              if image is None:
-                  return []
+                  y = stats[
+                      i,
+                      cv2.CC_STAT_TOP
+                  ]
 
-              results = []
+                  cw = stats[
+                      i,
+                      cv2.CC_STAT_WIDTH
+                  ]
 
-              # --------------------------------------------------------
-              # Thử grayscale trước
-              # --------------------------------------------------------
+                  ch = stats[
+                      i,
+                      cv2.CC_STAT_HEIGHT
+                  ]
 
-              variants = [
-                  (
-                      "gray",
-                      image["gray"],
-                  ),
-                  (
-                      "binary",
-                      image["binary"],
-                  ),
-                  (
-                      "otsu",
-                      image["otsu"],
-                  ),
-              ]
+                  area = stats[
+                      i,
+                      cv2.CC_STAT_AREA
+                  ]
 
-              for variant_name, variant_image in variants:
-
-                  try:
-
-                      output = ocr.predict(
-                          variant_image
-                      )
-
-                  except Exception as error:
-
-                      log(
-                          "OCR ERROR "
-                          f"{variant_name}: "
-                          f"{error!r}"
-                      )
-
+                  if area < MIN_COMPONENT_AREA:
                       continue
 
-                  for page in output:
+                  if ch < MIN_TEXT_HEIGHT:
+                      continue
 
-                      try:
+                  if ch > (
+                      h
+                      * MAX_TEXT_HEIGHT_RATIO
+                  ):
+                      continue
 
-                          data = page.json
+                  #
+                  # Chinese subtitle thường tạo ra
+                  # nhiều connected components nhỏ.
+                  #
 
-                          if callable(data):
+                  good_area += area
 
-                              data = data()
+                  good_components += 1
 
-                      except Exception:
+              occupancy = (
+                  good_area
+                  / max(1, total_pixels)
+              )
 
-                          continue
-
-                      if isinstance(
-                          data,
-                          str,
-                      ):
-
-                          try:
-
-                              data = json.loads(
-                                  data
-                              )
-
-                          except Exception:
-
-                              continue
-
-                      if not isinstance(
-                          data,
-                          dict,
-                      ):
-
-                          continue
-
-                      if isinstance(
-                          data.get("res"),
-                          dict,
-                      ):
-
-                          data = data["res"]
-
-                      texts = data.get(
-                          "rec_texts",
-                          [],
-                      )
-
-                      scores = data.get(
-                          "rec_scores",
-                          [],
-                      )
-
-                      for index, raw_text in enumerate(
-                          texts
-                      ):
-
-                          text = normalize_text(
-                              raw_text
-                          )
-
-                          if not text:
-                              continue
-
-                          try:
-
-                              score = float(
-                                  scores[index]
-                              )
-
-                          except Exception:
-
-                              score = 0.0
-
-                          if (
-                              score
-                              < OCR_MIN_SCORE
-                          ):
-
-                              continue
-
-                          results.append(
-                              {
-                                  "variant": variant_name,
-                                  "text": text,
-                                  "score": score,
-                                  "chinese": chinese_count(
-                                      text
-                                  ),
-                              }
-                          )
-
-              return results
-
-
-          # ============================================================
-          # CHOOSE OCR RESULT
-          # ============================================================
-
-          def choose_ocr_result(
-              results
-          ):
-
-              if not results:
-                  return ""
-
-              # --------------------------------------------------------
-              # Group exact text.
-              # --------------------------------------------------------
-
-              grouped = {}
-
-              for item in results:
-
-                  text = item["text"]
-
-                  bucket = grouped.setdefault(
-                      text,
-                      {
-                          "count": 0,
-                          "score": 0.0,
-                          "chinese": 0,
-                      },
-                  )
-
-                  bucket["count"] += 1
-
-                  bucket["score"] += float(
-                      item["score"]
-                  )
-
-                  bucket["chinese"] = max(
-                      bucket["chinese"],
-                      item["chinese"],
-                  )
-
-              # --------------------------------------------------------
-              # Score:
               #
-              # 1. xuất hiện ở nhiều preprocessing variant
-              # 2. confidence cao
-              # 3. nhiều Chinese chars
+              # Không chỉ dùng occupancy.
               #
-              # Không dùng "text dài hơn = tốt hơn" một cách mù quáng.
-              # --------------------------------------------------------
+              # Số component cũng là tín hiệu.
+              #
 
-              best_text = max(
-                  grouped.items(),
-                  key=lambda item: (
-                      item[1]["count"],
-                      item[1]["score"],
-                      item[1]["chinese"],
-                  ),
-              )[0]
+              component_signal = min(
+                  1.0,
+                  good_components / 30.0
+              )
 
-              return best_text
+              score = (
+                  occupancy * 0.65
+                  + component_signal * 0.35
+              )
+
+              return float(score)
 
 
           # ============================================================
-          # OCR ALL MIDPOINTS
+          # TEMPORAL FRAME ANALYSIS
           # ============================================================
 
-          def ocr_midpoints(
-              timing_data
-          ):
+          def load_scan_frames():
 
               (
                   width,
                   height,
                   video_fps,
-                  duration,
+                  duration
               ) = probe_video()
 
-              y1, y2 = get_roi(
-                  height
+              total = int(
+                  np.ceil(
+                      duration
+                      * SCAN_FPS
+                  )
               )
 
               log("")
               log(
                   "=========================================="
               )
+
               log(
-                  "PASS 2 — MIDPOINT OCR"
+                  "PASS 1 — SUBTITLE TIMING DETECTION"
               )
+
               log(
                   "=========================================="
               )
 
               log(
-                  "Timing source = PASS 1"
+                  f"VIDEO       : "
+                  f"{width}x{height}"
               )
 
               log(
-                  "OCR frame = cue midpoint"
+                  f"VIDEO FPS   : "
+                  f"{video_fps:.3f}"
               )
 
               log(
-                  f"Total cues = "
-                  f"{len(timing_data['cues'])}"
+                  f"DURATION    : "
+                  f"{duration:.3f}s"
               )
 
               log(
-                  f"ROI = y={y1}..{y2}"
+                  f"SCAN FPS    : "
+                  f"{SCAN_FPS}"
               )
-
-              # --------------------------------------------------------
-              # Load PaddleOCR once
-              # --------------------------------------------------------
 
               log(
-                  "Loading PaddleOCR..."
+                  f"ROI         : "
+                  f"y={int(height*ROI_Y1_RATIO)}.."
+                  f"{int(height*ROI_Y2_RATIO)}"
               )
 
-              ocr = PaddleOCR(
-                  lang="ch",
-                  text_det_limit_side_len=OCR_DET_LIMIT,
-                  text_det_limit_type="max",
+              log(
+                  "OCR         : DISABLED"
               )
 
-              output_cues = []
+              log(
+                  "Timing      : TEMPORAL PIXEL ANALYSIS"
+              )
 
-              ocr_debug = []
+              frames = []
 
-              for cue in tqdm(
-                  timing_data["cues"],
-                  desc="Midpoint OCR",
+              times = []
+
+              scores = []
+
+              for index in tqdm(
+                  range(total),
+                  desc="Timing scan"
               ):
 
-                  cue_id = cue["id"]
-
-                  start = float(
-                      cue["start"]
+                  t = (
+                      index
+                      / SCAN_FPS
                   )
 
-                  end = float(
-                      cue["end"]
-                  )
+                  if t >= duration:
+                      break
 
-                  midpoint = float(
-                      cue["midpoint"]
-                  )
+                  frame = get_frame(t)
 
-                  log("")
-                  log(
-                      f"========== CUE {cue_id} =========="
-                  )
-
-                  log(
-                      f"time     : "
-                      f"{start:.3f} → "
-                      f"{end:.3f}"
-                  )
-
-                  log(
-                      f"midpoint : "
-                      f"{midpoint:.3f}"
-                  )
-
-                  # ----------------------------------------------------
-                  # Extract EXACT midpoint frame
-                  # ----------------------------------------------------
-
-                  frame = extract_frame_at_time(
-                      midpoint
-                  )
-
-                  # ----------------------------------------------------
-                  # Save original midpoint for debugging
-                  # ----------------------------------------------------
-
-                  original_path = (
-                      DEBUG_DIR
-                      / f"{cue_id:05d}_original.png"
-                  )
-
-                  cv2.imwrite(
-                      str(original_path),
-                      frame,
-                  )
-
-                  # ----------------------------------------------------
-                  # Prepare images
-                  # ----------------------------------------------------
-
-                  prepared = prepare_ocr_image(
-                      frame,
-                      y1,
-                      y2,
-                  )
-
-                  if prepared is None:
-
-                      log(
-                          "OCR IMAGE = EMPTY"
-                      )
-
+                  if frame is None:
                       continue
 
-                  # ----------------------------------------------------
-                  # Save OCR variants
-                  # ----------------------------------------------------
-
-                  cv2.imwrite(
-                      str(
-                          DEBUG_DIR
-                          / f"{cue_id:05d}_gray.png"
-                      ),
-                      prepared["gray"],
+                  score = subtitle_score(
+                      frame
                   )
 
-                  cv2.imwrite(
-                      str(
-                          DEBUG_DIR
-                          / f"{cue_id:05d}_binary.png"
-                      ),
-                      prepared["binary"],
+                  frames.append(
+                      frame
                   )
 
-                  cv2.imwrite(
-                      str(
-                          DEBUG_DIR
-                          / f"{cue_id:05d}_otsu.png"
-                      ),
-                      prepared["otsu"],
-                  )
+                  times.append(t)
 
-                  # ----------------------------------------------------
-                  # OCR
-                  # ----------------------------------------------------
+                  scores.append(score)
 
-                  results = run_ocr(
-                      ocr,
-                      prepared,
-                  )
-
-                  text = choose_ocr_result(
-                      results
-                  )
-
-                  log(
-                      f"OCR = {text!r}"
-                  )
-
-                  # ----------------------------------------------------
-                  # Debug OCR alternatives
-                  # ----------------------------------------------------
-
-                  ocr_debug.append(
-                      {
-                          "id": cue_id,
-                          "start": start,
-                          "end": end,
-                          "midpoint": midpoint,
-                          "selected_text": text,
-                          "results": results,
-                      }
-                  )
-
-                  # ----------------------------------------------------
-                  # Empty OCR
-                  # ----------------------------------------------------
-
-                  if not text:
-
-                      log(
-                          "WARNING: OCR EMPTY"
-                      )
-
-                      continue
-
-                  # ----------------------------------------------------
-                  # Save cue
-                  # ----------------------------------------------------
-
-                  output_cues.append(
-                      {
-                          "id": cue_id,
-                          "start": start,
-                          "end": end,
-                          "midpoint": midpoint,
-                          "text": text,
-                      }
-                  )
-
-              # --------------------------------------------------------
-              # Save OCR debug
-              # --------------------------------------------------------
-
-              OCR_JSON.write_text(
-                  json.dumps(
-                      ocr_debug,
-                      ensure_ascii=False,
-                      indent=2,
-                  ),
-                  encoding="utf-8",
+              return (
+                  frames,
+                  times,
+                  scores,
+                  duration
               )
 
-              return output_cues
+
+          # ============================================================
+          # ROBUST THRESHOLD
+          # ============================================================
+
+          def calculate_threshold(scores):
+
+              values = np.asarray(
+                  scores,
+                  dtype=np.float32
+              )
+
+              if len(values) == 0:
+                  return 0.0
+
+              #
+              # Không dùng threshold cố định.
+              #
+              # Tính distribution.
+              #
+
+              p50 = float(
+                  np.percentile(
+                      values,
+                      50
+                  )
+              )
+
+              p75 = float(
+                  np.percentile(
+                      values,
+                      75
+                  )
+              )
+
+              p90 = float(
+                  np.percentile(
+                      values,
+                      90
+                  )
+              )
+
+              p95 = float(
+                  np.percentile(
+                      values,
+                      95
+                  )
+              )
+
+              #
+              # Subtitle frame thường tạo peak.
+              #
+              # Chọn threshold giữa baseline và peak.
+              #
+
+              baseline = p50
+
+              peak = max(
+                  p90,
+                  p95
+              )
+
+              threshold = (
+                  baseline
+                  + (
+                      peak
+                      - baseline
+                  )
+                  * 0.35
+              )
+
+              #
+              # Safety bounds.
+              #
+
+              threshold = max(
+                  0.002,
+                  threshold
+              )
+
+              threshold = min(
+                  threshold,
+                  0.20
+              )
+
+              log("")
+              log(
+                  f"SCORE P50 = {p50:.6f}"
+              )
+
+              log(
+                  f"SCORE P75 = {p75:.6f}"
+              )
+
+              log(
+                  f"SCORE P90 = {p90:.6f}"
+              )
+
+              log(
+                  f"SCORE P95 = {p95:.6f}"
+              )
+
+              log(
+                  f"DETECTION THRESHOLD = "
+                  f"{threshold:.6f}"
+              )
+
+              return threshold
 
 
           # ============================================================
-          # SRT
+          # TEMPORAL SEGMENTS
           # ============================================================
 
-          def save_srt(
-              cues
+          def make_segments(
+              times,
+              scores,
+              threshold
           ):
 
-              subs = pysubs2.SSAFile()
+              if not scores:
+                  return []
 
-              for cue in cues:
+              active = False
 
-                  start_ms = int(
-                      round(
-                          cue["start"]
-                          * 1000
+              start_index = None
+
+              segments = []
+
+              for i, score in enumerate(
+                  scores
+              ):
+
+                  is_sub = (
+                      score >= threshold
+                  )
+
+                  if (
+                      is_sub
+                      and not active
+                  ):
+
+                      active = True
+
+                      start_index = i
+
+                  elif (
+                      not is_sub
+                      and active
+                  ):
+
+                      end_index = i - 1
+
+                      segments.append(
+                          (
+                              start_index,
+                              end_index
+                          )
+                      )
+
+                      active = False
+
+                      start_index = None
+
+              if active:
+
+                  segments.append(
+                      (
+                          start_index,
+                          len(scores) - 1
                       )
                   )
 
-                  end_ms = int(
-                      round(
-                          cue["end"]
-                          * 1000
-                      )
+              #
+              # Convert + filter.
+              #
+
+              result = []
+
+              for start_i, end_i in segments:
+
+                  start = times[
+                      start_i
+                  ]
+
+                  end = (
+                      times[end_i]
+                      + 1.0 / SCAN_FPS
                   )
 
-                  subs.events.append(
-                      pysubs2.SSAEvent(
-                          start=start_ms,
-                          end=end_ms,
-                          text=cue["text"],
-                      )
+                  if (
+                      end - start
+                      < MIN_SUBTITLE_SECONDS
+                  ):
+                      continue
+
+                  result.append(
+                      {
+                          "coarse_start": start,
+                          "coarse_end": end,
+                          "start_index": start_i,
+                          "end_index": end_i
+                      }
                   )
 
-              subs.save(
-                  str(OUTPUT_SRT),
-                  encoding="utf-8",
+              return result
+
+
+          # ============================================================
+          # BINARY SEARCH TRANSITION
+          # ============================================================
+
+          def frame_is_subtitle(
+              time_sec,
+              threshold
+          ):
+
+              frame = get_frame(
+                  time_sec
               )
+
+              if frame is None:
+                  return False
+
+              score = subtitle_score(
+                  frame
+              )
+
+              return (
+                  score >= threshold
+              )
+
+
+          def refine_start(
+              low,
+              high,
+              threshold
+          ):
+
+              #
+              # low  = definitely NO subtitle
+              # high = definitely subtitle
+              #
+
+              for _ in range(
+                  REFINE_ITERATIONS
+              ):
+
+                  mid = (
+                      low + high
+                  ) / 2.0
+
+                  if frame_is_subtitle(
+                      mid,
+                      threshold
+                  ):
+                      high = mid
+                  else:
+                      low = mid
+
+              return high
+
+
+          def refine_end(
+              low,
+              high,
+              threshold
+          ):
+
+              #
+              # low  = definitely subtitle
+              # high = definitely NO subtitle
+              #
+
+              for _ in range(
+                  REFINE_ITERATIONS
+              ):
+
+                  mid = (
+                      low + high
+                  ) / 2.0
+
+                  if frame_is_subtitle(
+                      mid,
+                      threshold
+                  ):
+                      low = mid
+                  else:
+                      high = mid
+
+              return low
+
+
+          # ============================================================
+          # REFINE ALL TIMINGS
+          # ============================================================
+
+          def refine_segments(
+              coarse_segments,
+              times,
+              scores,
+              threshold,
+              duration
+          ):
+
+              result = []
+
+              step = (
+                  1.0 / SCAN_FPS
+              )
+
+              for segment in coarse_segments:
+
+                  si = segment[
+                      "start_index"
+                  ]
+
+                  ei = segment[
+                      "end_index"
+                  ]
+
+                  #
+                  # START
+                  #
+
+                  if si == 0:
+
+                      start = times[si]
+
+                  else:
+
+                      low = max(
+                          0.0,
+                          times[si] - step
+                      )
+
+                      high = times[si]
+
+                      start = refine_start(
+                          low,
+                          high,
+                          threshold
+                      )
+
+                  #
+                  # END
+                  #
+
+                  if ei >= len(times) - 1:
+
+                      end = min(
+                          duration,
+                          times[ei] + step
+                      )
+
+                  else:
+
+                      low = times[ei]
+
+                      high = min(
+                          duration,
+                          times[ei] + step
+                      )
+
+                      end = refine_end(
+                          low,
+                          high,
+                          threshold
+                      )
+
+                  if (
+                      end - start
+                      < MIN_SUBTITLE_SECONDS
+                  ):
+                      continue
+
+                  result.append(
+                      {
+                          "start": round(
+                              start,
+                              6
+                          ),
+                          "end": round(
+                              end,
+                              6
+                          ),
+                          "duration": round(
+                              end - start,
+                              6
+                          ),
+                          "midpoint": round(
+                              (
+                                  start
+                                  + end
+                              ) / 2.0,
+                              6
+                          )
+                      }
+                  )
+
+              return result
+
+
+          # ============================================================
+          # SAVE DEBUG TIMING
+          # ============================================================
+
+          def save_timing(
+              timing_cues,
+              times,
+              scores,
+              threshold
+          ):
+
+              data = {
+                  "scan_fps": SCAN_FPS,
+                  "threshold": threshold,
+                  "samples": [
+                      {
+                          "time": round(
+                              float(t),
+                              6
+                          ),
+                          "score": round(
+                              float(s),
+                              8
+                          )
+                      }
+                      for t, s in zip(
+                          times,
+                          scores
+                      )
+                  ],
+                  "cues": timing_cues
+              }
+
+              TIMING_JSON.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+
+          # ============================================================
+          # FIND BEST OCR CROP
+          # ============================================================
+
+          def find_text_bbox(
+              frame
+          ):
+
+              h, w = frame.shape[:2]
+
+              y1 = int(
+                  h * ROI_Y1_RATIO
+              )
+
+              y2 = int(
+                  h * ROI_Y2_RATIO
+              )
+
+              roi = frame[
+                  y1:y2,
+                  :
+              ]
+
+              gray = cv2.cvtColor(
+                  roi,
+                  cv2.COLOR_BGR2GRAY
+              )
+
+              #
+              # Threshold chữ sáng.
+              #
+
+              _, mask = cv2.threshold(
+                  gray,
+                  0,
+                  255,
+                  cv2.THRESH_BINARY
+                  + cv2.THRESH_OTSU
+              )
+
+              #
+              # Connected components.
+              #
+
+              num_labels, labels, stats, _ = (
+                  cv2.connectedComponentsWithStats(
+                      mask,
+                      connectivity=8
+                  )
+              )
+
+              boxes = []
+
+              for i in range(
+                  1,
+                  num_labels
+              ):
+
+                  x = stats[
+                      i,
+                      cv2.CC_STAT_LEFT
+                  ]
+
+                  y = stats[
+                      i,
+                      cv2.CC_STAT_TOP
+                  ]
+
+                  cw = stats[
+                      i,
+                      cv2.CC_STAT_WIDTH
+                  ]
+
+                  ch = stats[
+                      i,
+                      cv2.CC_STAT_HEIGHT
+                  ]
+
+                  area = stats[
+                      i,
+                      cv2.CC_STAT_AREA
+                  ]
+
+                  if area < 8:
+                      continue
+
+                  if ch < 5:
+                      continue
+
+                  if ch > (
+                      roi.shape[0] * 0.25
+                  ):
+                      continue
+
+                  boxes.append(
+                      (
+                          x,
+                          y,
+                          cw,
+                          ch,
+                          area
+                      )
+                  )
+
+              if not boxes:
+
+                  return (
+                      0,
+                      y1,
+                      w,
+                      y2
+                  )
+
+              #
+              # Gom tất cả component.
+              #
+
+              xs = [
+                  b[0]
+                  for b in boxes
+              ]
+
+              ys = [
+                  b[1]
+                  for b in boxes
+              ]
+
+              x2s = [
+                  b[0] + b[2]
+                  for b in boxes
+              ]
+
+              y2s = [
+                  b[1] + b[3]
+                  for b in boxes
+              ]
+
+              bx1 = max(
+                  0,
+                  min(xs) - 20
+              )
+
+              by1 = max(
+                  0,
+                  y1 + min(ys) - 15
+              )
+
+              bx2 = min(
+                  w,
+                  max(x2s) + 20
+              )
+
+              by2 = min(
+                  h,
+                  y1 + max(y2s) + 15
+              )
+
+              #
+              # Nếu bbox quá rộng theo chiều dọc,
+              # giữ nguyên ROI.
+              #
+
+              if (
+                  by2 - by1
+                  > h * 0.30
+              ):
+
+                  by1 = y1
+
+                  by2 = y2
+
+              return (
+                  bx1,
+                  by1,
+                  bx2,
+                  by2
+              )
+
+
+          # ============================================================
+          # OCR PREPROCESS
+          # ============================================================
+
+          def preprocess_ocr(
+              crop
+          ):
+
+              if (
+                  crop is None
+                  or crop.size == 0
+              ):
+                  return crop
+
+              #
+              # Upscale mạnh.
+              #
+
+              crop = cv2.resize(
+                  crop,
+                  None,
+                  fx=OCR_UPSCALE,
+                  fy=OCR_UPSCALE,
+                  interpolation=cv2.INTER_CUBIC
+              )
+
+              #
+              # LAB CLAHE.
+              #
+
+              lab = cv2.cvtColor(
+                  crop,
+                  cv2.COLOR_BGR2LAB
+              )
+
+              l, a, b = cv2.split(
+                  lab
+              )
+
+              clahe = cv2.createCLAHE(
+                  clipLimit=2.0,
+                  tileGridSize=(8, 8)
+              )
+
+              l = clahe.apply(l)
+
+              lab = cv2.merge(
+                  (
+                      l,
+                      a,
+                      b
+                  )
+              )
+
+              return cv2.cvtColor(
+                  lab,
+                  cv2.COLOR_LAB2BGR
+              )
+
+
+          # ============================================================
+          # OCR ONE MIDPOINT
+          # ============================================================
+
+          def ocr_midpoint(
+              ocr,
+              cue,
+              duration
+          ):
+
+              midpoint = float(
+                  cue["midpoint"]
+              )
+
+              frame = get_frame(
+                  midpoint
+              )
+
+              if frame is None:
+
+                  return {
+                      "text": "",
+                      "midpoint": midpoint,
+                      "error": "frame_failed"
+                  }
+
+              #
+              # Tìm bounding box chữ.
+              #
+
+              (
+                  x1,
+                  y1,
+                  x2,
+                  y2
+              ) = find_text_bbox(
+                  frame
+              )
+
+              crop = frame[
+                  y1:y2,
+                  x1:x2
+              ]
+
+              processed = preprocess_ocr(
+                  crop
+              )
+
+              #
+              # OCR
+              #
+
+              result = ocr.predict(
+                  processed
+              )
+
+              texts = []
+
+              scores = []
+
+              for page in result:
+
+                  try:
+
+                      data = page.json
+
+                      if callable(data):
+                          data = data()
+
+                  except Exception:
+
+                      continue
+
+                  if isinstance(
+                      data,
+                      str
+                  ):
+
+                      try:
+                          data = json.loads(
+                              data
+                          )
+                      except Exception:
+                          continue
+
+                  if not isinstance(
+                      data,
+                      dict
+                  ):
+                      continue
+
+                  if isinstance(
+                      data.get("res"),
+                      dict
+                  ):
+                      data = data["res"]
+
+                  rec_texts = data.get(
+                      "rec_texts",
+                      []
+                  )
+
+                  rec_scores = data.get(
+                      "rec_scores",
+                      []
+                  )
+
+                  for i, text in enumerate(
+                      rec_texts
+                  ):
+
+                      text = normalize_text(
+                          text
+                      )
+
+                      if not text:
+                          continue
+
+                      score = 1.0
+
+                      if i < len(
+                          rec_scores
+                      ):
+
+                          try:
+                              score = float(
+                                  rec_scores[i]
+                              )
+                          except Exception:
+                              pass
+
+                      if score < OCR_MIN_SCORE:
+                          continue
+
+                      if chinese_count(
+                          text
+                      ) == 0:
+                          continue
+
+                      texts.append(
+                          text
+                      )
+
+                      scores.append(
+                          score
+                      )
+
+              text = normalize_text(
+                  "".join(texts)
+              )
+
+              return {
+                  "text": text,
+                  "midpoint": midpoint,
+                  "bbox": [
+                      x1,
+                      y1,
+                      x2,
+                      y2
+                  ],
+                  "ocr_scores": scores
+              }
 
 
           # ============================================================
@@ -1906,35 +1619,234 @@ jobs:
               if not VIDEO.exists():
 
                   raise RuntimeError(
-                      "Video không tồn tại: "
-                      + str(VIDEO)
+                      f"Video not found: {VIDEO}"
                   )
 
-              # --------------------------------------------------------
-              # PASS 1
-              # --------------------------------------------------------
+              (
+                  frames,
+                  times,
+                  scores,
+                  duration
+              ) = load_scan_frames()
 
-              timing_data = (
-                  detect_timings()
+              if not scores:
+
+                  raise RuntimeError(
+                      "Không đọc được frame nào."
+                  )
+
+              threshold = calculate_threshold(
+                  scores
               )
 
-              # --------------------------------------------------------
+              coarse_segments = make_segments(
+                  times,
+                  scores,
+                  threshold
+              )
+
+              log("")
+
+              log(
+                  f"COARSE TIMING CUES = "
+                  f"{len(coarse_segments)}"
+              )
+
+              timing_cues = refine_segments(
+                  coarse_segments,
+                  times,
+                  scores,
+                  threshold,
+                  duration
+              )
+
+              log("")
+
+              log(
+                  "REFINED TIMING CUES = "
+                  f"{len(timing_cues)}"
+              )
+
+              for i, cue in enumerate(
+                  timing_cues
+              ):
+
+                  log(
+                      f"[{i:04d}] "
+                      f"{cue['start']:.6f} "
+                      f"→ "
+                      f"{cue['end']:.6f} "
+                      f"mid="
+                      f"{cue['midpoint']:.6f}"
+                  )
+
+              save_timing(
+                  timing_cues,
+                  times,
+                  scores,
+                  threshold
+              )
+
+              # ========================================================
               # PASS 2
-              # --------------------------------------------------------
+              # ========================================================
 
-              cues = (
-                  ocr_midpoints(
-                      timing_data
+              log("")
+              log(
+                  "=========================================="
+              )
+
+              log(
+                  "PASS 2 — MIDPOINT OCR"
+              )
+
+              log(
+                  "=========================================="
+              )
+
+              log(
+                  "Timing source = PASS 1"
+              )
+
+              log(
+                  "OCR frame = EXACT CUE MIDPOINT"
+              )
+
+              log(
+                  f"Total cues = "
+                  f"{len(timing_cues)}"
+              )
+
+              if not timing_cues:
+
+                  log(
+                      "WARNING: "
+                      "PASS 1 không tìm thấy timing."
                   )
+
+                  log(
+                      "Không chạy OCR vì không có midpoint."
+                  )
+
+                  OUTPUT_SRT.write_text(
+                      "",
+                      encoding="utf-8"
+                  )
+
+                  OCR_JSON.write_text(
+                      json.dumps(
+                          {
+                              "cues": []
+                          },
+                          ensure_ascii=False,
+                          indent=2
+                      ),
+                      encoding="utf-8"
+                  )
+
+                  return
+
+              log(
+                  "Loading PaddleOCR..."
               )
 
-              # --------------------------------------------------------
-              # SAVE
-              # --------------------------------------------------------
-
-              save_srt(
-                  cues
+              ocr = PaddleOCR(
+                  lang="ch",
+                  text_det_limit_side_len=OCR_DET_LIMIT,
+                  text_det_limit_type="max"
               )
+
+              ocr_results = []
+
+              for cue in tqdm(
+                  timing_cues,
+                  desc="Midpoint OCR"
+              ):
+
+                  result = ocr_midpoint(
+                      ocr,
+                      cue,
+                      duration
+                  )
+
+                  result.update(
+                      {
+                          "start": cue[
+                              "start"
+                          ],
+                          "end": cue[
+                              "end"
+                          ]
+                      }
+                  )
+
+                  ocr_results.append(
+                      result
+                  )
+
+                  log(
+                      f"[{cue['start']:.3f}"
+                      f"→"
+                      f"{cue['end']:.3f}] "
+                      f"{result['text']!r}"
+                  )
+
+              # ========================================================
+              # SAVE OCR JSON
+              # ========================================================
+
+              OCR_JSON.write_text(
+                  json.dumps(
+                      {
+                          "cues": ocr_results
+                      },
+                      ensure_ascii=False,
+                      indent=2
+                  ),
+                  encoding="utf-8"
+              )
+
+              # ========================================================
+              # WRITE SRT
+              # ========================================================
+
+              subs = pysubs2.SSAFile()
+
+              for item in ocr_results:
+
+                  text = item[
+                      "text"
+                  ]
+
+                  if not text:
+                      continue
+
+                  subs.events.append(
+                      pysubs2.SSAEvent(
+                          start=int(
+                              float(
+                                  item["start"]
+                              )
+                              * 1000
+                          ),
+                          end=int(
+                              float(
+                                  item["end"]
+                              )
+                              * 1000
+                          ),
+                          text=text
+                      )
+                  )
+
+              subs.save(
+                  str(OUTPUT_SRT),
+                  encoding="utf-8"
+              )
+
+              # ========================================================
+              # SUMMARY
+              # ========================================================
 
               log("")
               log(
@@ -1951,12 +1863,12 @@ jobs:
 
               log(
                   f"Timing cues : "
-                  f"{len(timing_data['cues'])}"
+                  f"{len(timing_cues)}"
               )
 
               log(
                   f"OCR cues    : "
-                  f"{len(cues)}"
+                  f"{len(ocr_results)}"
               )
 
               log(
@@ -1978,22 +1890,6 @@ jobs:
                   "=========================================="
               )
 
-              # --------------------------------------------------------
-              # Print SRT
-              # --------------------------------------------------------
-
-              print("")
-
-              print(
-                  "========== FINAL SRT =========="
-              )
-
-              print(
-                  OUTPUT_SRT.read_text(
-                      encoding="utf-8"
-                  )
-              )
-
 
           if __name__ == "__main__":
               main()
@@ -2005,13 +1901,11 @@ jobs:
       # RUN
       # ============================================================
 
-      - name: Extract subtitle
+      - name: Run subtitle extraction
         env:
           SCAN_FPS: ${{ inputs.scan_fps }}
-          ROI_TOP: ${{ inputs.roi_top }}
-          ROI_BOTTOM: ${{ inputs.roi_bottom }}
-          MIN_DURATION: ${{ inputs.min_duration }}
-          BRIGHTNESS_THRESHOLD: ${{ inputs.threshold }}
+          REFINE_ITERATIONS: ${{ inputs.refine_iterations }}
+          MIN_SUBTITLE_SECONDS: ${{ inputs.min_subtitle_seconds }}
 
           DISABLE_MODEL_SOURCE_CHECK: "True"
           PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
@@ -2026,13 +1920,29 @@ jobs:
       # CHECK OUTPUT
       # ============================================================
 
-      - name: Check Chinese subtitle
+      - name: Check output
         run: |
           set -euo pipefail
 
-          if [ ! -f chinese.srt ]; then
-            echo "::error::chinese.srt không được tạo."
-            exit 1
+          echo ""
+          echo "========== TIMING JSON =========="
+
+          if [ -f work/timing.json ]; then
+            cat work/timing.json
+          fi
+
+          echo ""
+          echo "========== OCR JSON =========="
+
+          if [ -f work/ocr.json ]; then
+            cat work/ocr.json
+          fi
+
+          echo ""
+          echo "========== FINAL SRT =========="
+
+          if [ -f chinese.srt ]; then
+            cat chinese.srt
           fi
 
           if [ ! -s chinese.srt ]; then
@@ -2040,87 +1950,9 @@ jobs:
             exit 1
           fi
 
-          echo ""
-          echo "=========================================="
-          echo "FINAL chinese.srt"
-          echo "=========================================="
-
-          cat chinese.srt
-
-          echo ""
-          echo "=========================================="
-          echo "TIMING DEBUG"
-          echo "=========================================="
-
-          python - <<'PY'
-
-          import json
-          from pathlib import Path
-
-          path = Path(
-              "work/timing.json"
-          )
-
-          data = json.loads(
-              path.read_text(
-                  encoding="utf-8"
-              )
-          )
-
-          print(
-              "Video:",
-              data["video"]
-          )
-
-          print()
-
-          print(
-              "Timing configuration:"
-          )
-
-          print(
-              data["scan"]
-          )
-
-          print()
-
-          print(
-              "Cue count:",
-              data["cue_count"]
-          )
-
-          print()
-
-          for cue in data["cues"][:100]:
-
-              print(
-                  f"{cue['id']:04d} "
-                  f"{cue['start']:.3f} --> "
-                  f"{cue['end']:.3f} "
-                  f"mid={cue['midpoint']:.3f}"
-              )
-
-          PY
-
 
       # ============================================================
-      # UPLOAD DEBUG ARTIFACTS
-      # ============================================================
-
-      - name: Upload debug artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: subtitle-debug
-          path: |
-            work/timing.json
-            work/ocr.json
-            work/debug/
-          if-no-files-found: warn
-          retention-days: 7
-
-
-      # ============================================================
-      # COMMIT SRT
+      # COMMIT
       # ============================================================
 
       - name: Commit Chinese subtitle
@@ -2148,7 +1980,7 @@ jobs:
           else
 
             git commit \
-              -m "feat: extract Chinese hard subtitle"
+              -m "extract: Chinese hard subtitle"
 
             git push \
               origin \
