@@ -1,4 +1,4 @@
-name: Bilibili OCR Debug → Chinese SRT
+name: Bilibili Hard Subtitle Extractor → Accurate Timing + Midpoint OCR
 
 on:
   workflow_dispatch:
@@ -7,15 +7,35 @@ on:
         description: "Bilibili video URL"
         required: true
         type: string
-      scan_seconds:
-        description: "Khoảng cách quét để tìm vùng subtitle ban đầu (giây)"
+
+      scan_fps:
+        description: "FPS phân tích timing. 10-15 cho timing tốt."
         required: false
-        default: "0.5"
+        default: "12"
         type: string
-      ocr_fps:
-        description: "FPS OCR thực tế. Nên dùng 6-8 để merge/vote hoạt động tốt"
+
+      roi_top:
+        description: "Top của vùng subtitle (% chiều cao video)"
         required: false
-        default: "8"
+        default: "70"
+        type: string
+
+      roi_bottom:
+        description: "Bottom của vùng subtitle (% chiều cao video)"
+        required: false
+        default: "100"
+        type: string
+
+      min_duration:
+        description: "Subtitle tối thiểu (giây)"
+        required: false
+        default: "0.25"
+        type: string
+
+      threshold:
+        description: "Brightness threshold cho subtitle trắng"
+        required: false
+        default: "180"
         type: string
 
 permissions:
@@ -30,26 +50,52 @@ jobs:
       PYTHONUNBUFFERED: "1"
 
     steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           persist-credentials: true
           fetch-depth: 0
 
+
+      # ============================================================
+      # PYTHON
+      # ============================================================
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
+
+      # ============================================================
+      # SYSTEM PACKAGES
+      # ============================================================
+
       - name: Install system packages
         run: |
           set -eux
+
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0
+
+          sudo apt-get install -y \
+            ffmpeg \
+            libgl1 \
+            libglib2.0-0
+
+
+      # ============================================================
+      # PYTHON PACKAGES
+      # ============================================================
 
       - name: Install Python packages
         run: |
           set -eux
+
           python -m pip install --upgrade pip
 
           python -m pip install \
@@ -63,15 +109,31 @@ jobs:
             paddlepaddle==3.2.0 \
             -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 
-          python -m pip install paddleocr==3.3.2
+          python -m pip install \
+            paddleocr==3.3.2
+
+
+      # ============================================================
+      # DIRECTORIES
+      # ============================================================
 
       - name: Prepare directories
         run: |
           set -eux
+
           mkdir -p work
+          mkdir -p work/cues
+          mkdir -p work/debug
+
           rm -f chinese.srt
-          rm -f work/ocr_debug.json
-          rm -f work/cookies.txt
+          rm -f work/timing.json
+          rm -f work/ocr.json
+          rm -f work/debug/*
+
+
+      # ============================================================
+      # BILIBILI COOKIES
+      # ============================================================
 
       - name: Prepare Bilibili cookies
         env:
@@ -80,12 +142,18 @@ jobs:
           set -euo pipefail
 
           if [ -z "${BILIBILI_COOKIES:-}" ]; then
-            echo "::error::GitHub Secret BILIBILI_COOKIES chua duoc cau hinh."
+            echo "::error::BILIBILI_COOKIES chưa được cấu hình."
             exit 1
           fi
 
           printf '%s\n' "$BILIBILI_COOKIES" > work/cookies.txt
+
           chmod 600 work/cookies.txt
+
+
+      # ============================================================
+      # DOWNLOAD
+      # ============================================================
 
       - name: Download Bilibili video
         env:
@@ -109,19 +177,32 @@ jobs:
             "$BILIBILI_URL"
 
           if [ ! -f work/source.mp4 ]; then
-            echo "::error::Khong tim thay work/source.mp4 sau khi tai video."
-            find work -maxdepth 2 -type f -ls
+            echo "::error::Không tìm thấy work/source.mp4."
+
+            find work \
+              -maxdepth 2 \
+              -type f \
+              -ls
+
             exit 1
           fi
 
           ls -lh work/
 
-      - name: Create OCR debug script
+
+      # ============================================================
+      # CREATE PROCESSOR
+      # ============================================================
+
+      - name: Create subtitle processor
         run: |
+
           cat > process.py <<'PY'
+
           import os
           import re
           import json
+          import math
           import subprocess
           from pathlib import Path
           from collections import Counter
@@ -130,6 +211,7 @@ jobs:
           import numpy as np
           import pysubs2
           from tqdm import tqdm
+
           from paddleocr import PaddleOCR
 
 
@@ -138,105 +220,135 @@ jobs:
           # ============================================================
 
           WORK = Path("work")
+
           VIDEO = WORK / "source.mp4"
+
+          TIMING_JSON = WORK / "timing.json"
+
+          OCR_JSON = WORK / "ocr.json"
+
           OUTPUT_SRT = Path("chinese.srt")
-          DEBUG_JSON = WORK / "ocr_debug.json"
+
+          CUE_DIR = WORK / "cues"
+
+          DEBUG_DIR = WORK / "debug"
 
 
           # ============================================================
           # CONFIG
           # ============================================================
 
-          SCAN_SECONDS = float(
+          SCAN_FPS = float(
               os.environ.get(
-                  "SCAN_SECONDS",
-                  "0.5",
+                  "SCAN_FPS",
+                  "12",
               )
           )
 
-          OCR_FPS = float(
+          ROI_TOP_PERCENT = float(
               os.environ.get(
-                  "OCR_FPS",
-                  "8",
+                  "ROI_TOP",
+                  "70",
               )
           )
 
-          # Chỉ dùng phần dưới video để TÌM subtitle.
-          # Sau khi tìm thấy subtitle:
-          #
-          #   X = FULL WIDTH
-          #   Y = lấy theo chiều cao subtitle phát hiện được
-          #
-          DETECT_SEARCH_Y_RATIO = 0.70
+          ROI_BOTTOM_PERCENT = float(
+              os.environ.get(
+                  "ROI_BOTTOM",
+                  "100",
+              )
+          )
 
-          # Padding theo chiều dọc.
-          # Giữ thêm khoảng trên/dưới để tránh crop sát chữ.
-          REGION_PAD_Y_RATIO = 0.015
-          REGION_MIN_PAD_Y = 10
+          MIN_DURATION = float(
+              os.environ.get(
+                  "MIN_DURATION",
+                  "0.25",
+              )
+          )
 
-          MIN_CHINESE_COUNT = 1
-          MIN_BOX_WIDTH = 5
-          MIN_BOX_HEIGHT = 5
+          BRIGHTNESS_THRESHOLD = int(
+              os.environ.get(
+                  "BRIGHTNESS_THRESHOLD",
+                  "180",
+              )
+          )
 
-          # ------------------------------------------------------------
-          # NÂNG CẤP OCR QUALITY (giai đoạn 1)
-          # ------------------------------------------------------------
-          #
-          # Vấn đề gốc: ảnh crop full-width (vd 1920xN) khi đưa vào
-          # PaddleOCR sẽ bị model tự resize xuống theo giới hạn cạnh dài
-          # mặc định (det_limit_side_len), khiến dòng chữ vốn đã mỏng
-          # (crop cao ~100px) bị co lại rất nhỏ trước khi qua detection.
-          # Chữ Hán nhiều nét, xuống dưới ngưỡng đó model rất dễ mất nét,
-          # gộp nhầm ký tự, hoặc bỏ sót ký tự đầu/cuối dòng.
-
-          OCR_UPSCALE_FACTOR = 2.0
-          OCR_DET_LIMIT_SIDE_LEN = 2000
-          OCR_APPLY_CLAHE = True
 
           # ------------------------------------------------------------
-          # NÂNG CẤP MERGE QUALITY (giai đoạn 2)
+          # Timing detection
           # ------------------------------------------------------------
-          #
-          # Vấn đề: khi OCR_FPS thấp, mỗi cue chỉ có 1-2 sample, không đủ
-          # dữ liệu để "vote" ra bản đúng nhất trong lúc merge samples
-          # thành cue (samples_to_raw_cues). Kết quả là nhiều cue liền kề
-          # thực chất là CÙNG MỘT câu thoại nhưng bị OCR sai khác nhau,
-          # và bước cleanup cũ chỉ gộp khi text giống HỆT NHAU nên bỏ sót.
-          #
-          # Cách xử lý: thêm một post-merge pass thứ hai, dùng lại đúng
-          # hàm text_match_details() (LCS + length-aware threshold) để so
-          # sánh MỖI CẶP cue liền kề, không chỉ so sánh tuyệt đối. Nếu đủ
-          # giống và gap thời gian hợp lý theo độ dài câu -> gộp, chọn
-          # text có sample_count cao hơn (nếu bằng nhau thì câu dài hơn)
-          # làm đại diện.
-          #
-          # Pass này chạy sau samples_to_raw_cues() và trước khi ghi SRT,
-          # không đụng vào logic vote/tail-representative đã có.
 
-          ENABLE_ADJACENT_CUE_FUZZY_MERGE = True
-
-          # Số lần lặp tối đa để merge dây chuyền (A-B-C đều giống nhau)
-          ADJACENT_MERGE_MAX_PASSES = 5
-
-          # Debug mode:
           #
-          # - Không dùng change detection.
-          # - Không skip frame.
-          # - OCR tất cả sample.
+          # Subtitle thay đổi thường tạo ra pixel difference.
           #
-          # Mục tiêu:
-          # kiểm tra chính xác OCR đọc được gì ở từng thời điểm.
+          # Nhưng video bản thân nó cũng chuyển động.
+          #
+          # Vì vậy KHÔNG so sánh toàn bộ ROI.
+          #
+          # Ta:
+          #
+          #   1. grayscale
+          #   2. threshold brightness
+          #   3. morphology
+          #   4. tính occupancy của bright subtitle pixels
+          #
+          # Với subtitle trắng:
+          #
+          # background thay đổi
+          # nhưng subtitle vẫn tạo ra vùng bright ổn định.
+          #
+          # Ngoài ra dùng frame-to-frame difference để bắt
+          # thời điểm subtitle xuất hiện / biến mất.
+          #
+
+          OCCUPANCY_MIN = 0.0008
+
+          DIFF_PERCENTILE = 98.0
+
+          START_CONFIRM_FRAMES = 2
+
+          END_CONFIRM_FRAMES = 2
+
+          # Cho phép gap nhỏ do video compression / fade.
+          MAX_EMPTY_GAP = 0.20
+
+          # ------------------------------------------------------------
+          # Subtitle morphology
+          # ------------------------------------------------------------
+
+          MORPH_OPEN = 1
+
+          MORPH_CLOSE = 3
+
+          # ------------------------------------------------------------
+          # OCR
+          # ------------------------------------------------------------
+
+          OCR_UPSCALE = 3.0
+
+          OCR_DET_LIMIT = 2500
+
+          OCR_MIN_SCORE = 0.35
 
 
           # ============================================================
-          # UTILS
+          # LOG
           # ============================================================
 
           def log(message):
-              print(message, flush=True)
 
+              print(
+                  message,
+                  flush=True,
+              )
+
+
+          # ============================================================
+          # CHINESE
+          # ============================================================
 
           def chinese_count(text):
+
               return len(
                   re.findall(
                       r"[\u3400-\u9fff]",
@@ -246,9 +358,9 @@ jobs:
 
 
           def normalize_text(text):
+
               text = str(text).strip()
 
-              # PaddleOCR đôi khi trả khoảng trắng giữa ký tự.
               text = re.sub(
                   r"\s+",
                   "",
@@ -258,62 +370,12 @@ jobs:
               return text
 
 
-          def preprocess_for_ocr(image):
-              """
-              Tiền xử lý ảnh trước khi OCR để tăng độ ổn định:
-
-              1. Upscale ảnh (chữ nhỏ -> chữ to hơn khi vào model).
-              2. CLAHE trên kênh sáng (L trong LAB) để tăng tương phản
-                 chữ/nền, giảm ảnh hưởng của nền video động phía sau
-                 phụ đề.
-
-              Không thay đổi tỉ lệ khung hình, chỉ scale đều 2 chiều,
-              nên box được scale ngược lại bằng scale_back trong
-              ocr_image().
-              """
-
-              if image is None or image.size == 0:
-                  return image
-
-              processed = image
-
-              if OCR_UPSCALE_FACTOR and OCR_UPSCALE_FACTOR != 1.0:
-                  processed = cv2.resize(
-                      processed,
-                      None,
-                      fx=OCR_UPSCALE_FACTOR,
-                      fy=OCR_UPSCALE_FACTOR,
-                      interpolation=cv2.INTER_CUBIC,
-                  )
-
-              if OCR_APPLY_CLAHE:
-                  lab = cv2.cvtColor(processed, cv2.COLOR_BGR2LAB)
-                  l_channel, a_channel, b_channel = cv2.split(lab)
-
-                  clahe = cv2.createCLAHE(
-                      clipLimit=2.0,
-                      tileGridSize=(8, 8),
-                  )
-
-                  l_channel = clahe.apply(l_channel)
-
-                  lab = cv2.merge(
-                      (l_channel, a_channel, b_channel)
-                  )
-
-                  processed = cv2.cvtColor(
-                      lab,
-                      cv2.COLOR_LAB2BGR,
-                  )
-
-              return processed
-
-
           # ============================================================
           # VIDEO INFO
           # ============================================================
 
           def probe_video():
+
               cmd = [
                   "ffprobe",
                   "-hide_banner",
@@ -352,14 +414,14 @@ jobs:
                   stream["height"]
               )
 
-              fps_num, fps_den = (
+              num, den = (
                   stream["r_frame_rate"]
                   .split("/")
               )
 
               fps = (
-                  float(fps_num)
-                  / float(fps_den)
+                  float(num)
+                  / float(den)
               )
 
               duration = float(
@@ -375,610 +437,199 @@ jobs:
 
 
           # ============================================================
-          # GET ONE FRAME
+          # ROI
           # ============================================================
 
-          def get_frame(time_sec):
-              cmd = [
-                  "ffmpeg",
-                  "-hide_banner",
-                  "-loglevel",
-                  "error",
-                  "-ss",
-                  f"{time_sec:.6f}",
-                  "-i",
-                  str(VIDEO),
-                  "-frames:v",
-                  "1",
-                  "-f",
-                  "image2pipe",
-                  "-vcodec",
-                  "mjpeg",
-                  "-",
-              ]
+          def get_roi(height):
 
-              result = subprocess.run(
-                  cmd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-              )
-
-              if (
-                  result.returncode != 0
-                  or not result.stdout
-              ):
-                  return None
-
-              raw = np.frombuffer(
-                  result.stdout,
-                  dtype=np.uint8,
-              )
-
-              return cv2.imdecode(
-                  raw,
-                  cv2.IMREAD_COLOR,
-              )
-
-
-          # ============================================================
-          # PADDLEOCR RESULT PARSER
-          # ============================================================
-
-          def ocr_image(image, scale_back=1.0):
-              """
-              Chạy PaddleOCR và trả về:
-
-              [
-                  {
-                      "text": "...",
-                      "score": 0.99,
-                      "box": [x1, y1, x2, y2]
-                  }
-              ]
-
-              scale_back: nếu ảnh đưa vào OCR đã bị upscale trước đó,
-              truyền hệ số để quy đổi box về tọa độ ảnh gốc (crop gốc).
-              """
-
-              result = ocr.predict(
-                  image
-              )
-
-              items = []
-
-              for page in result:
-
-                  try:
-                      data = page.json
-
-                      if callable(data):
-                          data = data()
-
-                  except Exception as error:
-                      log(
-                          "OCR JSON ERROR: "
-                          + repr(error)
-                      )
-                      continue
-
-                  if isinstance(
-                      data,
-                      str,
-                  ):
-                      try:
-                          data = json.loads(
-                              data
-                          )
-                      except Exception:
-                          continue
-
-                  if not isinstance(
-                      data,
-                      dict,
-                  ):
-                      continue
-
-                  if isinstance(
-                      data.get("res"),
-                      dict,
-                  ):
-                      data = data["res"]
-
-                  rec_texts = data.get(
-                      "rec_texts",
-                      [],
-                  )
-
-                  rec_scores = data.get(
-                      "rec_scores",
-                      [],
-                  )
-
-                  rec_polys = data.get(
-                      "rec_polys",
-                      [],
-                  )
-
-                  for index, raw_text in enumerate(
-                      rec_texts
-                  ):
-                      text = normalize_text(
-                          raw_text
-                      )
-
-                      if not text:
-                          continue
-
-                      if (
-                          index
-                          >= len(rec_polys)
-                      ):
-                          continue
-
-                      try:
-                          score = float(
-                              rec_scores[index]
-                          )
-
-                      except Exception:
-                          score = 1.0
-
-                      points = np.asarray(
-                          rec_polys[index]
-                      )
-
-                      if (
-                          points.ndim != 2
-                          or points.shape[1] != 2
-                      ):
-                          continue
-
-                      x1 = int(
-                          np.min(
-                              points[:, 0]
-                          )
-                          / scale_back
-                      )
-
-                      y1 = int(
-                          np.min(
-                              points[:, 1]
-                          )
-                          / scale_back
-                      )
-
-                      x2 = int(
-                          np.max(
-                              points[:, 0]
-                          )
-                          / scale_back
-                      )
-
-                      y2 = int(
-                          np.max(
-                              points[:, 1]
-                          )
-                          / scale_back
-                      )
-
-                      if (
-                          x2 - x1
-                          < MIN_BOX_WIDTH
-                      ):
-                          continue
-
-                      if (
-                          y2 - y1
-                          < MIN_BOX_HEIGHT
-                      ):
-                          continue
-
-                      items.append(
-                          {
-                              "text": text,
-                              "score": score,
-                              "box": [
-                                  x1,
-                                  y1,
-                                  x2,
-                                  y2,
-                              ],
-                          }
-                      )
-
-              return items
-
-
-          # ============================================================
-          # FIND SUBTITLE REGION
-          # ============================================================
-
-          def find_subtitle_region():
-              """
-              Logic mới:
-
-              1. Scan toàn bộ video cho tới khi thấy chữ Trung
-                 ở vùng dưới video.
-
-              2. Dùng bounding box để xác định CHIỀU DỌC subtitle:
-                     y1 -> y2
-
-              3. KHÔNG dùng x1/x2 của box để crop.
-
-              4. OCR region cuối cùng luôn là FULL WIDTH:
-                     x1 = 0
-                     x2 = video_width
-
-              Đây là điểm sửa chính so với bản debug trước.
-              """
-
-              (
-                  width,
-                  height,
-                  fps,
-                  duration,
-              ) = probe_video()
-
-              search_y1 = int(
+              y1 = int(
                   height
-                  * DETECT_SEARCH_Y_RATIO
+                  * ROI_TOP_PERCENT
+                  / 100.0
               )
 
-              search_y2 = height
-
-              log(
-                  "VIDEO: "
-                  f"{width}x{height} "
-                  f"FPS={fps:.3f} "
-                  f"DURATION={duration:.3f}s"
+              y2 = int(
+                  height
+                  * ROI_BOTTOM_PERCENT
+                  / 100.0
               )
 
-              log(
-                  "SUBTITLE DETECTION SEARCH AREA: "
-                  f"x=0..{width}, "
-                  f"y={search_y1}..{search_y2}"
+              y1 = max(
+                  0,
+                  min(height - 1, y1),
               )
 
-              time_sec = 0.0
+              y2 = max(
+                  y1 + 1,
+                  min(height, y2),
+              )
 
-              while time_sec < duration:
-
-                  log(
-                      f"REGION SCAN: "
-                      f"{time_sec:.3f}s"
-                  )
-
-                  frame = get_frame(
-                      time_sec
-                  )
-
-                  if frame is None:
-                      time_sec += SCAN_SECONDS
-                      continue
-
-                  # Chỉ crop vùng dưới để việc tìm subtitle
-                  # ban đầu nhanh hơn.
-                  search_crop = frame[
-                      search_y1:search_y2,
-                      0:width,
-                  ]
-
-                  processed_crop = preprocess_for_ocr(
-                      search_crop
-                  )
-
-                  items = ocr_image(
-                      processed_crop,
-                      scale_back=OCR_UPSCALE_FACTOR,
-                  )
-
-                  candidates = []
-
-                  for item in items:
-
-                      text = item["text"]
-
-                      if (
-                          chinese_count(text)
-                          < MIN_CHINESE_COUNT
-                      ):
-                          continue
-
-                      x1, y1, x2, y2 = (
-                          item["box"]
-                      )
-
-                      # Chuyển Y từ crop coordinate
-                      # về video coordinate.
-                      abs_y1 = (
-                          y1
-                          + search_y1
-                      )
-
-                      abs_y2 = (
-                          y2
-                          + search_y1
-                      )
-
-                      # Chỉ dùng để tìm candidate subtitle.
-                      # Ưu tiên chữ nằm thấp hơn.
-                      box_height = (
-                          abs_y2
-                          - abs_y1
-                      )
-
-                      vertical_score = (
-                          abs_y2
-                          / max(
-                              1,
-                              height,
-                          )
-                      )
-
-                      text_score = (
-                          chinese_count(
-                              text
-                          )
-                      )
-
-                      score = (
-                          vertical_score
-                          * 1000
-                          + text_score * 10
-                          + box_height
-                      )
-
-                      candidates.append(
-                          {
-                              "score": score,
-                              "text": text,
-                              "y1": abs_y1,
-                              "y2": abs_y2,
-                              "box": [
-                                  x1,
-                                  abs_y1,
-                                  x2,
-                                  abs_y2,
-                              ],
-                          }
-                      )
-
-                  if candidates:
-
-                      candidates.sort(
-                          key=lambda item: (
-                              item["score"]
-                          ),
-                          reverse=True,
-                      )
-
-                      # Lấy candidate tốt nhất để xác định
-                      # vị trí subtitle theo chiều dọc.
-                      #
-                      # X được bỏ qua hoàn toàn.
-                      best = candidates[0]
-
-                      detected_y1 = (
-                          best["y1"]
-                      )
-
-                      detected_y2 = (
-                          best["y2"]
-                      )
-
-                      pad_y = max(
-                          REGION_MIN_PAD_Y,
-                          int(
-                              height
-                              * REGION_PAD_Y_RATIO
-                          ),
-                      )
-
-                      region_y1 = max(
-                          0,
-                          detected_y1 - pad_y,
-                      )
-
-                      region_y2 = min(
-                          height,
-                          detected_y2 + pad_y,
-                      )
-
-                      # =================================================
-                      # QUAN TRỌNG:
-                      #
-                      # FULL WIDTH
-                      #
-                      # Không dùng x1/x2 của box OCR nữa.
-                      # =================================================
-
-                      region = {
-                          "x1": 0,
-                          "y1": int(region_y1),
-                          "x2": int(width),
-                          "y2": int(region_y2),
-                          "width": int(width),
-                          "height": int(height),
-                          "fps": float(fps),
-                          "found_at": float(time_sec),
-                          "sample_text": best["text"],
-                          "detected_box": best["box"],
-                          "detected_subtitle_y1": int(
-                              detected_y1
-                          ),
-                          "detected_subtitle_y2": int(
-                              detected_y2
-                          ),
-                          "region_mode": (
-                              "full_width"
-                          ),
-                      }
-
-                      log(
-                          "INITIAL SUBTITLE REGION FOUND:"
-                      )
-
-                      log(
-                          json.dumps(
-                              region,
-                              ensure_ascii=False,
-                          )
-                      )
-
-                      log(
-                          "IMPORTANT: "
-                          "OCR FINAL REGION USES "
-                          "FULL VIDEO WIDTH."
-                      )
-
-                      log(
-                          f"FINAL OCR REGION: "
-                          f"x=0..{width}, "
-                          f"y={region_y1}..{region_y2}, "
-                          f"size={width}x"
-                          f"{region_y2-region_y1}"
-                      )
-
-                      return region
-
-                  time_sec += (
-                      SCAN_SECONDS
-                  )
-
-              raise RuntimeError(
-                  "Khong tim thay subtitle "
-                  "trong toan bo video."
+              return (
+                  y1,
+                  y2,
               )
 
 
           # ============================================================
-          # OCR ALL VIDEO
+          # SUBTITLE MASK
           # ============================================================
 
-          def extract_all_samples(region):
+          def subtitle_mask(frame):
 
-              (
-                  width,
-                  height,
-                  video_fps,
-                  duration,
-              ) = probe_video()
-
-              rx1 = int(
-                  region["x1"]
+              gray = cv2.cvtColor(
+                  frame,
+                  cv2.COLOR_BGR2GRAY,
               )
 
-              ry1 = int(
-                  region["y1"]
+              # --------------------------------------------------------
+              # Bright pixel threshold
+              # --------------------------------------------------------
+
+              _, mask = cv2.threshold(
+                  gray,
+                  BRIGHTNESS_THRESHOLD,
+                  255,
+                  cv2.THRESH_BINARY,
               )
 
-              rx2 = int(
-                  region["x2"]
+              # --------------------------------------------------------
+              # Remove isolated noise
+              # --------------------------------------------------------
+
+              if MORPH_OPEN > 0:
+
+                  kernel = cv2.getStructuringElement(
+                      cv2.MORPH_ELLIPSE,
+                      (
+                          MORPH_OPEN,
+                          MORPH_OPEN,
+                      ),
+                  )
+
+                  mask = cv2.morphologyEx(
+                      mask,
+                      cv2.MORPH_OPEN,
+                      kernel,
+                  )
+
+              # --------------------------------------------------------
+              # Connect letters
+              # --------------------------------------------------------
+
+              if MORPH_CLOSE > 0:
+
+                  kernel = cv2.getStructuringElement(
+                      cv2.MORPH_RECT,
+                      (
+                          MORPH_CLOSE,
+                          MORPH_CLOSE,
+                      ),
+                  )
+
+                  mask = cv2.morphologyEx(
+                      mask,
+                      cv2.MORPH_CLOSE,
+                      kernel,
+                  )
+
+              return mask
+
+
+          # ============================================================
+          # MASK SCORE
+          # ============================================================
+
+          def mask_score(mask):
+
+              if mask is None:
+                  return 0.0
+
+              white = cv2.countNonZero(
+                  mask
               )
 
-              ry2 = int(
-                  region["y2"]
+              total = (
+                  mask.shape[0]
+                  * mask.shape[1]
               )
 
-              crop_width = (
-                  rx2 - rx1
+              if total <= 0:
+                  return 0.0
+
+              return (
+                  white
+                  / total
               )
 
-              crop_height = (
-                  ry2 - ry1
-              )
+
+          # ============================================================
+          # FRAME DIFFERENCE
+          # ============================================================
+
+          def frame_difference(
+              previous,
+              current,
+          ):
 
               if (
-                  crop_width <= 0
-                  or crop_height <= 0
+                  previous is None
+                  or current is None
               ):
-                  raise RuntimeError(
-                      "Invalid OCR region: "
-                      + json.dumps(
-                          region,
-                          ensure_ascii=False,
-                      )
-                  )
+                  return 0.0
 
-              expected_samples = int(
-                  np.ceil(
-                      duration
-                      * OCR_FPS
-                  )
+              prev_gray = cv2.cvtColor(
+                  previous,
+                  cv2.COLOR_BGR2GRAY,
               )
 
-              log("")
-              log(
-                  "========== OCR DEBUG MODE =========="
+              curr_gray = cv2.cvtColor(
+                  current,
+                  cv2.COLOR_BGR2GRAY,
               )
 
-              log(
-                  "CHANGE DETECTION: DISABLED"
+              diff = cv2.absdiff(
+                  prev_gray,
+                  curr_gray,
               )
 
-              log(
-                  "FRAME SKIP: DISABLED"
-              )
-
-              log(
-                  "TEMPORAL + LENGTH-AWARE MERGE: ENABLED"
-              )
-
-              log(
-                  "OCR EVERY SAMPLE: ENABLED"
-              )
-
-              log(
-                  "OCR PREPROCESS: "
-                  f"upscale={OCR_UPSCALE_FACTOR}x "
-                  f"clahe={OCR_APPLY_CLAHE} "
-                  f"det_limit_side_len={OCR_DET_LIMIT_SIDE_LEN}"
-              )
-
-              log(
-                  f"OCR FPS={OCR_FPS}"
-              )
-
-              if OCR_FPS < 4.0:
-                  log(
-                      "WARNING: OCR_FPS < 4.0. Moi cue se qua it sample "
-                      "de vote/merge chinh xac. Nen dung 6-8 fps."
-                  )
-
-              log(
-                  f"EXPECTED SAMPLES="
-                  f"{expected_samples}"
-              )
-
-              log(
-                  f"OCR REGION: "
-                  f"x={rx1}..{rx2} "
-                  f"y={ry1}..{ry2}"
-              )
-
-              log(
-                  f"OCR CROP SIZE: "
-                  f"{crop_width}x"
-                  f"{crop_height}"
-              )
-
-              log(
-                  "===================================="
-              )
-
-              # Decode liên tục bằng FFmpeg.
+              # Không dùng mean vì background movement
+              # có thể làm mean lớn.
               #
-              # Không chạy FFmpeg lại cho từng frame.
-              #
-              # Đây nhanh hơn rất nhiều so với:
-              # get_frame() -> OCR -> get_frame() -> OCR
-              #
+              # percentile giúp bắt những vùng thay đổi mạnh.
+
+              return float(
+                  np.percentile(
+                      diff,
+                      DIFF_PERCENTILE,
+                  )
+              )
+
+
+          # ============================================================
+          # BUILD FRAME STREAM
+          # ============================================================
+
+          def frame_stream(
+              width,
+              height,
+              y1,
+              y2,
+              duration,
+          ):
+
+              roi_width = width
+
+              roi_height = (
+                  y2 - y1
+              )
+
               filter_graph = (
-                  f"fps={OCR_FPS},"
-                  f"crop={crop_width}:"
-                  f"{crop_height}:"
-                  f"{rx1}:"
-                  f"{ry1}"
+                  f"fps={SCAN_FPS},"
+                  f"crop="
+                  f"{roi_width}:"
+                  f"{roi_height}:"
+                  f"0:"
+                  f"{y1}"
               )
 
               cmd = [
@@ -1004,20 +655,13 @@ jobs:
                   cmd,
                   stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE,
-                  bufsize=1024 * 1024 * 128,
+                  bufsize=1024 * 1024 * 64,
               )
 
               frame_size = (
-                  crop_width
-                  * crop_height
+                  roi_width
+                  * roi_height
                   * 3
-              )
-
-              samples = []
-
-              pbar = tqdm(
-                  total=expected_samples,
-                  desc="OCR DEBUG",
               )
 
               index = 0
@@ -1032,16 +676,8 @@ jobs:
                           )
                       )
 
-                      if (
-                          len(raw)
-                          != frame_size
-                      ):
+                      if len(raw) != frame_size:
                           break
-
-                      current_time = (
-                          index
-                          / OCR_FPS
-                      )
 
                       frame = (
                           np.frombuffer(
@@ -1050,669 +686,1207 @@ jobs:
                           )
                           .reshape(
                               (
-                                  crop_height,
-                                  crop_width,
+                                  roi_height,
+                                  roi_width,
                                   3,
                               )
                           )
                       )
 
-                      processed_frame = preprocess_for_ocr(
-                          frame
+                      time_sec = (
+                          index
+                          / SCAN_FPS
                       )
 
-                      items = ocr_image(
-                          processed_frame,
-                          scale_back=OCR_UPSCALE_FACTOR,
+                      yield (
+                          index,
+                          time_sec,
+                          frame,
                       )
-
-                      valid = []
-
-                      for item in items:
-
-                          text = (
-                              item["text"]
-                          )
-
-                          if (
-                              chinese_count(
-                                  text
-                              )
-                              < MIN_CHINESE_COUNT
-                          ):
-                              continue
-
-                          x1, y1, x2, y2 = (
-                              item["box"]
-                          )
-
-                          valid.append(
-                              {
-                                  "text": text,
-                                  "score": item[
-                                      "score"
-                                  ],
-                                  "box": [
-                                      x1 + rx1,
-                                      y1 + ry1,
-                                      x2 + rx1,
-                                      y2 + ry1,
-                                  ],
-                              }
-                          )
-
-                      # PaddleOCR có thể trả nhiều box.
-                      #
-                      # Sắp xếp trái -> phải để ghép
-                      # thành một subtitle line.
-                      valid.sort(
-                          key=lambda item: (
-                              item["box"][0],
-                              item["box"][1],
-                          )
-                      )
-
-                      text = normalize_text(
-                          "".join(
-                              item["text"]
-                              for item in valid
-                          )
-                      )
-
-                      sample = {
-                          "index": index,
-                          "time": round(
-                              current_time,
-                              6,
-                          ),
-                          "text": text,
-                          "detections": valid,
-                      }
-
-                      samples.append(
-                          sample
-                      )
-
-                      if text:
-                          log(
-                              f"[OCR {index:05d}] "
-                              f"{current_time:8.3f}s "
-                              f"TEXT={text!r}"
-                          )
-
-                      else:
-                          log(
-                              f"[OCR {index:05d}] "
-                              f"{current_time:8.3f}s "
-                              "TEXT=<EMPTY>"
-                          )
 
                       index += 1
 
-                      pbar.update(
-                          1
-                      )
-
               finally:
-
-                  pbar.close()
 
                   if process.stdout:
                       process.stdout.close()
 
-                  stderr_data = b""
+                  stderr = b""
 
                   if process.stderr:
-                      stderr_data = (
+
+                      stderr = (
                           process.stderr.read()
                       )
 
                       process.stderr.close()
 
-                  return_code = (
+                  code = (
                       process.wait()
                   )
 
-                  if return_code != 0:
+                  if code != 0:
 
                       raise RuntimeError(
-                          "FFmpeg OCR stream failed:\n"
-                          + stderr_data.decode(
+                          "FFmpeg frame stream failed:\n"
+                          + stderr.decode(
                               "utf-8",
                               errors="replace",
                           )
                       )
 
+
+          # ============================================================
+          # TIMING DETECTION
+          # ============================================================
+
+          def detect_timings():
+
+              (
+                  width,
+                  height,
+                  video_fps,
+                  duration,
+              ) = probe_video()
+
+              y1, y2 = get_roi(
+                  height
+              )
+
+              log("")
               log(
-                  "OCR DEBUG STATS: "
-                  f"scanned={len(samples)} "
-                  f"ocr={len(samples)} "
-                  "skipped=0"
+                  "=========================================="
+              )
+              log(
+                  "PASS 1 — SUBTITLE TIMING DETECTION"
+              )
+              log(
+                  "=========================================="
               )
 
-              return (
-                  samples,
-                  duration,
+              log(
+                  f"VIDEO       : {width}x{height}"
               )
 
-
-          # ============================================================
-          # TEMPORAL + LENGTH-AWARE SUBTITLE MERGE
-          # ============================================================
-
-          # OCR frame sau thường nét hơn.
-          # Vì vậy:
-          #   - ưu tiên representative ở các frame cuối
-          #   - nhưng không lấy frame cuối tuyệt đối một cách mù quáng
-          #   - dùng frequency + recency trong tail window
-          #
-          # Merge phụ thuộc đồng thời vào:
-          #   1. thời gian giữa hai sample non-empty
-          #   2. độ dài subtitle
-          #   3. số ký tự giống nhau theo đúng thứ tự (LCS)
-          #
-          # Câu ngắn: rất khắt khe.
-          # Câu dài: cho phép sai vài ký tự OCR.
-
-
-          def lcs_length(a, b):
-              previous = [0] * (len(b) + 1)
-
-              for char_a in a:
-                  current = [0]
-
-                  for j, char_b in enumerate(b, 1):
-                      if char_a == char_b:
-                          current.append(
-                              previous[j - 1] + 1
-                          )
-                      else:
-                          current.append(
-                              max(
-                                  previous[j],
-                                  current[-1],
-                              )
-                          )
-
-                  previous = current
-
-              return previous[-1]
-
-
-          def required_common_chars(length):
-              # 1-2 ký tự: strict
-              if length <= 2:
-                  return length
-
-              # 3-4 ký tự: ví dụ 4 cần khớp ít nhất 3
-              if length <= 4:
-                  return max(2, length - 1)
-
-              # 5-6 ký tự: thiếu tối đa 1
-              if length <= 6:
-                  return length - 1
-
-              # 7-8 ký tự: thiếu tối đa 2
-              if length <= 8:
-                  return length - 2
-
-              # Câu dài: ít nhất 75%
-              return int(
-                  np.ceil(length * 0.75)
+              log(
+                  f"VIDEO FPS   : {video_fps:.3f}"
               )
 
-
-          def allowed_gap_for_length(length):
-              # Gap tolerance phụ thuộc độ dài câu.
-              # Đây không phải duration chính xác của subtitle.
-              if length <= 2:
-                  return 0.45
-
-              if length <= 4:
-                  return 0.65
-
-              if length <= 6:
-                  return 0.90
-
-              if length <= 8:
-                  return 1.25
-
-              return min(
-                  2.20,
-                  1.25
-                  + (length - 8) * 0.15,
+              log(
+                  f"DURATION    : {duration:.3f}s"
               )
 
-
-          def text_match_details(a, b, time_gap):
-              if not a or not b:
-                  return False, {
-                      "common": 0,
-                      "reason": "empty",
-                  }
-
-              common = lcs_length(a, b)
-              max_len = max(len(a), len(b))
-              ratio = common / max(1, max_len)
-
-              details = {
-                  "common": common,
-                  "max_len": max_len,
-                  "ratio": round(ratio, 4),
-                  "time_gap": round(time_gap, 4),
-                  "gap_limit": round(
-                      allowed_gap_for_length(max_len),
-                      4,
-                  ),
-              }
-
-              if time_gap > allowed_gap_for_length(max_len):
-                  details["reason"] = "gap_too_large"
-                  return False, details
-
-              # 1 ký tự phải giống hoàn toàn.
-              if max_len == 1:
-                  details["required"] = 1
-                  details["reason"] = "single_char"
-                  return a == b, details
-
-              # 2 ký tự:
-              # - bình thường phải giống hoàn toàn
-              # - cho phép OCR sai 1 ký tự chỉ khi cực gần nhau
-              if max_len == 2:
-                  if a == b:
-                      details["required"] = 2
-                      details["reason"] = "short_exact"
-                      return True, details
-
-                  matched = (
-                      common == 1
-                      and time_gap <= 0.30
-                  )
-
-                  details["required"] = (
-                      "exact, or 1 common if gap<=0.30"
-                  )
-                  details["reason"] = "short_exception"
-                  return matched, details
-
-              required = required_common_chars(max_len)
-
-              details["required"] = required
-              details["reason"] = "length_aware_lcs"
-
-              return common >= required, details
-
-
-          def choose_tail_representative(
-              segment,
-              tail_size=4,
-          ):
-              # Chỉ nhìn các sample cuối.
-              # Frequency cao hơn thắng.
-              # Nếu bằng nhau, sample xuất hiện muộn hơn thắng.
-              # Vì vậy frame cuối/gần cuối được ưu tiên.
-              tail = segment[-tail_size:]
-              grouped = {}
-
-              for sample in tail:
-                  text = sample["text"]
-
-                  if not text:
-                      continue
-
-                  stats = grouped.setdefault(
-                      text,
-                      {
-                          "count": 0,
-                          "last_index": -1,
-                          "last_time": -1.0,
-                      },
-                  )
-
-                  stats["count"] += 1
-                  stats["last_index"] = max(
-                      stats["last_index"],
-                      sample["index"],
-                  )
-                  stats["last_time"] = max(
-                      stats["last_time"],
-                      float(sample["time"]),
-                  )
-
-              if not grouped:
-                  return ""
-
-              return max(
-                  grouped.items(),
-                  key=lambda item: (
-                      item[1]["count"],
-                      item[1]["last_index"],
-                      len(item[0]),
-                  ),
-              )[0]
-
-
-          def finalize_segment(segment, duration):
-              if not segment:
-                  return None
-
-              candidate = choose_tail_representative(segment)
-
-              if not candidate:
-                  return None
-
-              # Tail candidate là mặc định cuối cùng.
-              # Chỉ override nếu một text khác có đồng thuận mạnh hơn
-              # rõ rệt (nhiều hơn ít nhất 2 sample).
-              counts = Counter(
-                  sample["text"]
-                  for sample in segment
-                  if sample["text"]
+              log(
+                  f"SCAN FPS    : {SCAN_FPS}"
               )
 
-              candidate_count = counts.get(candidate, 0)
-
-              alternatives = [
-                  (text, count)
-                  for text, count in counts.items()
-                  if text != candidate
-              ]
-
-              if alternatives:
-                  best_text, best_count = max(
-                      alternatives,
-                      key=lambda item: (
-                          item[1],
-                          len(item[0]),
-                      ),
-                  )
-
-                  if best_count >= candidate_count + 2:
-                      candidate = best_text
-
-              start = float(segment[0]["time"])
-              end = min(
-                  duration,
-                  float(segment[-1]["time"])
-                  + (1.0 / OCR_FPS),
+              log(
+                  f"ROI         : y={y1}..{y2}"
               )
 
-              return {
-                  "start": start,
-                  "end": max(start + 0.001, end),
-                  "text": candidate,
-                  "sample_count": len(segment),
-                  "tail_candidate": choose_tail_representative(
-                      segment
-                  ),
-              }
+              log(
+                  "OCR         : DISABLED"
+              )
 
+              log(
+                  "Timing      : PIXEL ANALYSIS ONLY"
+              )
 
-          def samples_to_raw_cues(samples, duration):
-              """
-              Merge subtitle bằng:
-                  temporal continuity
-                  + length-aware LCS
-                  + tail representative
+              # --------------------------------------------------------
+              # First pass:
+              #
+              # determine baseline statistics
+              #
+              # --------------------------------------------------------
 
-              EMPTY không đóng segment ngay lập tức.
-              Chỉ đóng khi sample non-empty tiếp theo:
-                  - cách quá xa
-                  HOẶC
-                  - không đủ giống representative hiện tại.
-              """
+              samples = []
 
-              if not samples:
-                  return [], []
+              previous_frame = None
 
-              cues = []
-              merge_debug = []
-
-              active_segment = []
-              last_nonempty_time = None
-
-              for sample in samples:
-                  current_text = sample["text"]
-
-                  if not current_text:
-                      continue
-
-                  current_time = float(sample["time"])
-
-                  if not active_segment:
-                      active_segment = [sample]
-                      last_nonempty_time = current_time
-                      continue
-
-                  representative = (
-                      choose_tail_representative(
-                          active_segment
+              pbar = tqdm(
+                  total=int(
+                      math.ceil(
+                          duration
+                          * SCAN_FPS
                       )
+                  ),
+                  desc="Timing scan",
+              )
+
+              for (
+                  index,
+                  time_sec,
+                  frame,
+              ) in frame_stream(
+                  width,
+                  height,
+                  y1,
+                  y2,
+                  duration,
+              ):
+
+                  mask = subtitle_mask(
+                      frame
                   )
 
-                  time_gap = (
-                      current_time
-                      - last_nonempty_time
+                  occupancy = mask_score(
+                      mask
                   )
 
-                  matched, details = text_match_details(
-                      current_text,
-                      representative,
-                      time_gap,
+                  diff = frame_difference(
+                      previous_frame,
+                      frame,
                   )
 
-                  merge_debug.append(
+                  samples.append(
                       {
-                          "time": current_time,
-                          "text": current_text,
-                          "representative": representative,
-                          "matched": matched,
-                          "details": details,
+                          "index": index,
+                          "time": time_sec,
+                          "occupancy": occupancy,
+                          "diff": diff,
                       }
                   )
 
-                  if matched:
-                      active_segment.append(sample)
-                      last_nonempty_time = current_time
-                      continue
+                  previous_frame = frame
 
-                  cue = finalize_segment(
-                      active_segment,
-                      duration,
+                  pbar.update(1)
+
+              pbar.close()
+
+              if not samples:
+
+                  raise RuntimeError(
+                      "Không đọc được frame nào."
                   )
 
-                  if cue:
-                      cues.append(cue)
+              # --------------------------------------------------------
+              # Dynamic occupancy threshold
+              #
+              # Background bright pixels có thể rất nhiều.
+              #
+              # Ta dùng percentile thấp + absolute floor.
+              # --------------------------------------------------------
 
-                  active_segment = [sample]
-                  last_nonempty_time = current_time
+              occupancy_values = np.array(
+                  [
+                      x["occupancy"]
+                      for x in samples
+                  ],
+                  dtype=np.float32,
+              )
 
-              if active_segment:
-                  cue = finalize_segment(
-                      active_segment,
-                      duration,
+              dynamic_threshold = max(
+                  OCCUPANCY_MIN,
+                  float(
+                      np.percentile(
+                          occupancy_values,
+                          65,
+                      )
+                      * 1.8
+                  ),
+              )
+
+              log(
+                  f"Occupancy threshold = "
+                  f"{dynamic_threshold:.6f}"
+              )
+
+              # --------------------------------------------------------
+              # Detect raw active states
+              # --------------------------------------------------------
+
+              active = []
+
+              for item in samples:
+
+                  is_active = (
+                      item["occupancy"]
+                      >= dynamic_threshold
                   )
 
-                  if cue:
-                      cues.append(cue)
+                  active.append(
+                      is_active
+                  )
 
-              # Safety cleanup (pass 1):
-              # Hai cue text giống hệt nhau chỉ được nối nếu khoảng cách
-              # phù hợp với độ dài subtitle.
-              cleaned = []
+              # --------------------------------------------------------
+              # Temporal smoothing
+              #
+              # Subtitle có thể fade nhẹ hoặc compression làm
+              # occupancy dao động.
+              #
+              # Không cho một vài frame empty phá cue.
+              # --------------------------------------------------------
 
-              for cue in cues:
-                  if not cleaned:
-                      cleaned.append(cue)
+              gap_frames = max(
+                  1,
+                  int(
+                      MAX_EMPTY_GAP
+                      * SCAN_FPS
+                  ),
+              )
+
+              # Fill short false gaps.
+
+              i = 0
+
+              while i < len(active):
+
+                  if active[i]:
+
+                      i += 1
                       continue
 
-                  previous = cleaned[-1]
+                  start = i
+
+                  while (
+                      i < len(active)
+                      and not active[i]
+                  ):
+                      i += 1
+
+                  end = i
+
+                  gap_length = (
+                      end - start
+                  )
+
+                  if (
+                      gap_length
+                      <= gap_frames
+                      and start > 0
+                      and end < len(active)
+                      and active[start - 1]
+                      and active[end]
+                  ):
+
+                      for j in range(
+                          start,
+                          end,
+                      ):
+                          active[j] = True
+
+
+              # --------------------------------------------------------
+              # Convert active states → raw cues
+              # --------------------------------------------------------
+
+              raw_cues = []
+
+              start_index = None
+
+              for index, state in enumerate(
+                  active
+              ):
+
+                  if (
+                      state
+                      and start_index is None
+                  ):
+
+                      start_index = index
+
+                  elif (
+                      not state
+                      and start_index is not None
+                  ):
+
+                      end_index = (
+                          index - 1
+                      )
+
+                      start_time = (
+                          samples[
+                              start_index
+                          ]["time"]
+                      )
+
+                      end_time = min(
+                          duration,
+                          (
+                              samples[
+                                  end_index
+                              ]["time"]
+                              + 1.0 / SCAN_FPS
+                          ),
+                      )
+
+                      if (
+                          end_time
+                          - start_time
+                          >= MIN_DURATION
+                      ):
+
+                          raw_cues.append(
+                              {
+                                  "start": start_time,
+                                  "end": end_time,
+                              }
+                          )
+
+                      start_index = None
+
+              # Last cue
+
+              if start_index is not None:
+
+                  end_index = (
+                      len(samples)
+                      - 1
+                  )
+
+                  start_time = (
+                      samples[
+                          start_index
+                      ]["time"]
+                  )
+
+                  end_time = min(
+                      duration,
+                      samples[
+                          end_index
+                      ]["time"]
+                      + 1.0 / SCAN_FPS,
+                  )
+
+                  if (
+                      end_time
+                      - start_time
+                      >= MIN_DURATION
+                  ):
+
+                      raw_cues.append(
+                          {
+                              "start": start_time,
+                              "end": end_time,
+                          }
+                      )
+
+              # --------------------------------------------------------
+              # Merge cues separated by tiny gaps.
+              #
+              # Important:
+              #
+              # This is NOT OCR merge.
+              #
+              # It is purely temporal.
+              # --------------------------------------------------------
+
+              cues = []
+
+              for cue in raw_cues:
+
+                  if not cues:
+
+                      cues.append(
+                          dict(cue)
+                      )
+
+                      continue
+
+                  previous = cues[-1]
 
                   gap = (
                       cue["start"]
                       - previous["end"]
                   )
 
-                  if (
-                      cue["text"] == previous["text"]
-                      and gap <= allowed_gap_for_length(
-                          len(cue["text"])
-                      )
-                  ):
+                  if gap <= MAX_EMPTY_GAP:
+
                       previous["end"] = max(
                           previous["end"],
                           cue["end"],
                       )
-                      previous["sample_count"] += cue.get(
-                          "sample_count",
-                          0,
-                      )
+
                   else:
+
+                      cues.append(
+                          dict(cue)
+                      )
+
+              # --------------------------------------------------------
+              # Remove absurd overlaps
+              # --------------------------------------------------------
+
+              cleaned = []
+
+              for cue in cues:
+
+                  if not cleaned:
+
                       cleaned.append(cue)
 
-              return cleaned, merge_debug
+                      continue
+
+                  previous = cleaned[-1]
+
+                  if (
+                      cue["start"]
+                      < previous["end"]
+                  ):
+
+                      midpoint = (
+                          previous["end"]
+                          + cue["start"]
+                      ) / 2.0
+
+                      previous["end"] = midpoint
+
+                      cue["start"] = midpoint
+
+                  if (
+                      cue["end"]
+                      > cue["start"]
+                  ):
+
+                      cleaned.append(cue)
+
+              cues = cleaned
+
+              # --------------------------------------------------------
+              # Add midpoint
+              # --------------------------------------------------------
+
+              for index, cue in enumerate(
+                  cues,
+                  start=1,
+              ):
+
+                  cue["id"] = index
+
+                  cue["midpoint"] = (
+                      cue["start"]
+                      + cue["end"]
+                  ) / 2.0
+
+                  cue["duration"] = (
+                      cue["end"]
+                      - cue["start"]
+                  )
+
+              # --------------------------------------------------------
+              # Save timing
+              # --------------------------------------------------------
+
+              timing_data = {
+                  "video": {
+                      "width": width,
+                      "height": height,
+                      "fps": video_fps,
+                      "duration": duration,
+                  },
+                  "scan": {
+                      "fps": SCAN_FPS,
+                      "roi_top": ROI_TOP_PERCENT,
+                      "roi_bottom": ROI_BOTTOM_PERCENT,
+                      "y1": y1,
+                      "y2": y2,
+                      "brightness_threshold": BRIGHTNESS_THRESHOLD,
+                      "occupancy_threshold": dynamic_threshold,
+                  },
+                  "cue_count": len(cues),
+                  "cues": cues,
+              }
+
+              TIMING_JSON.write_text(
+                  json.dumps(
+                      timing_data,
+                      ensure_ascii=False,
+                      indent=2,
+                  ),
+                  encoding="utf-8",
+              )
+
+              log("")
+              log(
+                  f"TIMING CUES = {len(cues)}"
+              )
+
+              for cue in cues[:30]:
+
+                  log(
+                      f"[{cue['id']:04d}] "
+                      f"{cue['start']:.3f} → "
+                      f"{cue['end']:.3f} "
+                      f"(mid="
+                      f"{cue['midpoint']:.3f})"
+                  )
+
+              if len(cues) > 30:
+
+                  log(
+                      f"... "
+                      f"{len(cues) - 30} cues khác"
+                  )
+
+              return timing_data
 
 
           # ============================================================
-          # POST-MERGE: FUZZY MERGE CUE LIỀN KỀ (giai đoạn 2)
+          # EXTRACT EXACT MIDPOINT FRAME
           # ============================================================
-          #
-          # Khác với pass "Safety cleanup" ở trên (chỉ merge khi text
-          # giống HỆT NHAU), pass này dùng text_match_details() để merge
-          # cả khi hai cue liền kề chỉ GIỐNG NHAU MỘT PHẦN (do OCR sai
-          # khác nhau ở giữa) nhưng rõ ràng là cùng một câu thoại.
-          #
-          # An toàn vì:
-          #   - Chỉ xét 2 cue LIỀN KỀ (không nhảy cóc).
-          #   - Vẫn dùng đúng ngưỡng LCS + gap theo độ dài câu đã tune.
-          #   - Có giới hạn số vòng lặp (ADJACENT_MERGE_MAX_PASSES) để
-          #     tránh merge dây chuyền vô hạn nếu dữ liệu bất thường.
-          #   - Log lại toàn bộ quyết định merge vào debug JSON để bạn
-          #     kiểm tra/tinh chỉnh threshold nếu cần.
 
-          def fuzzy_merge_adjacent_cues(cues):
+          def extract_frame_at_time(
+              time_sec,
+          ):
 
-              if not cues or not ENABLE_ADJACENT_CUE_FUZZY_MERGE:
-                  return cues, []
+              cmd = [
+                  "ffmpeg",
+                  "-hide_banner",
+                  "-loglevel",
+                  "error",
 
-              merge_log = []
+                  # Seek trước input để nhanh,
+                  # sau đó decode chính xác.
 
-              current = list(cues)
+                  "-ss",
+                  f"{time_sec:.6f}",
 
-              for pass_index in range(ADJACENT_MERGE_MAX_PASSES):
+                  "-i",
+                  str(VIDEO),
 
-                  merged_any = False
-                  result = []
+                  "-frames:v",
+                  "1",
 
-                  index = 0
+                  "-f",
+                  "image2pipe",
 
-                  while index < len(current):
+                  "-vcodec",
+                  "png",
 
-                      cue = current[index]
+                  "-",
+              ]
 
-                      if not result:
-                          result.append(dict(cue))
-                          index += 1
+              result = subprocess.run(
+                  cmd,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+              )
+
+              if (
+                  result.returncode != 0
+                  or not result.stdout
+              ):
+
+                  raise RuntimeError(
+                      "Không extract được frame "
+                      f"tại {time_sec:.3f}s"
+                  )
+
+              raw = np.frombuffer(
+                  result.stdout,
+                  dtype=np.uint8,
+              )
+
+              frame = cv2.imdecode(
+                  raw,
+                  cv2.IMREAD_COLOR,
+              )
+
+              if frame is None:
+
+                  raise RuntimeError(
+                      "cv2 không decode được frame."
+                  )
+
+              return frame
+
+
+          # ============================================================
+          # CLEAN OCR IMAGE
+          # ============================================================
+
+          def prepare_ocr_image(
+              frame,
+              y1,
+              y2,
+          ):
+
+              roi = frame[
+                  y1:y2,
+                  :,
+              ]
+
+              if (
+                  roi is None
+                  or roi.size == 0
+              ):
+
+                  return None
+
+              # --------------------------------------------------------
+              # Upscale
+              # --------------------------------------------------------
+
+              roi = cv2.resize(
+                  roi,
+                  None,
+                  fx=OCR_UPSCALE,
+                  fy=OCR_UPSCALE,
+                  interpolation=cv2.INTER_CUBIC,
+              )
+
+              # --------------------------------------------------------
+              # Grayscale
+              # --------------------------------------------------------
+
+              gray = cv2.cvtColor(
+                  roi,
+                  cv2.COLOR_BGR2GRAY,
+              )
+
+              # --------------------------------------------------------
+              # CLAHE
+              # --------------------------------------------------------
+
+              clahe = cv2.createCLAHE(
+                  clipLimit=2.0,
+                  tileGridSize=(8, 8),
+              )
+
+              gray = clahe.apply(
+                  gray
+              )
+
+              # --------------------------------------------------------
+              # Otsu
+              #
+              # Ta tạo một binary version.
+              #
+              # Nhưng không nhất thiết OCR binary tốt hơn grayscale.
+              #
+              # Vì vậy trả về cả hai.
+              # --------------------------------------------------------
+
+              _, otsu = cv2.threshold(
+                  gray,
+                  0,
+                  255,
+                  cv2.THRESH_BINARY
+                  + cv2.THRESH_OTSU,
+              )
+
+              # --------------------------------------------------------
+              # Bright subtitle mask
+              # --------------------------------------------------------
+
+              _, bright = cv2.threshold(
+                  gray,
+                  BRIGHTNESS_THRESHOLD,
+                  255,
+                  cv2.THRESH_BINARY,
+              )
+
+              # --------------------------------------------------------
+              # Morphology
+              # --------------------------------------------------------
+
+              kernel = cv2.getStructuringElement(
+                  cv2.MORPH_RECT,
+                  (3, 3),
+              )
+
+              bright = cv2.morphologyEx(
+                  bright,
+                  cv2.MORPH_CLOSE,
+                  kernel,
+              )
+
+              # --------------------------------------------------------
+              # Black background + white subtitle
+              #
+              # Đây là ảnh rất tốt cho debug.
+              # --------------------------------------------------------
+
+              binary = bright
+
+              return {
+                  "gray": gray,
+                  "otsu": otsu,
+                  "binary": binary,
+              }
+
+
+          # ============================================================
+          # OCR
+          # ============================================================
+
+          def run_ocr(
+              ocr,
+              image,
+          ):
+
+              if image is None:
+                  return []
+
+              results = []
+
+              # --------------------------------------------------------
+              # Thử grayscale trước
+              # --------------------------------------------------------
+
+              variants = [
+                  (
+                      "gray",
+                      image["gray"],
+                  ),
+                  (
+                      "binary",
+                      image["binary"],
+                  ),
+                  (
+                      "otsu",
+                      image["otsu"],
+                  ),
+              ]
+
+              for variant_name, variant_image in variants:
+
+                  try:
+
+                      output = ocr.predict(
+                          variant_image
+                      )
+
+                  except Exception as error:
+
+                      log(
+                          "OCR ERROR "
+                          f"{variant_name}: "
+                          f"{error!r}"
+                      )
+
+                      continue
+
+                  for page in output:
+
+                      try:
+
+                          data = page.json
+
+                          if callable(data):
+
+                              data = data()
+
+                      except Exception:
+
                           continue
 
-                      previous = result[-1]
+                      if isinstance(
+                          data,
+                          str,
+                      ):
 
-                      gap = (
-                          cue["start"]
-                          - previous["end"]
+                          try:
+
+                              data = json.loads(
+                                  data
+                              )
+
+                          except Exception:
+
+                              continue
+
+                      if not isinstance(
+                          data,
+                          dict,
+                      ):
+
+                          continue
+
+                      if isinstance(
+                          data.get("res"),
+                          dict,
+                      ):
+
+                          data = data["res"]
+
+                      texts = data.get(
+                          "rec_texts",
+                          [],
                       )
 
-                      max_len = max(
-                          len(previous["text"]),
-                          len(cue["text"]),
+                      scores = data.get(
+                          "rec_scores",
+                          [],
                       )
 
-                      matched, details = text_match_details(
-                          cue["text"],
-                          previous["text"],
-                          gap,
-                      )
+                      for index, raw_text in enumerate(
+                          texts
+                      ):
 
-                      merge_log.append(
-                          {
-                              "pass": pass_index,
-                              "previous_text": previous["text"],
-                              "current_text": cue["text"],
-                              "gap": round(gap, 4),
-                              "matched": matched,
-                              "details": details,
-                          }
-                      )
-
-                      if matched:
-
-                          merged_any = True
-
-                          previous_count = previous.get(
-                              "sample_count",
-                              0,
+                          text = normalize_text(
+                              raw_text
                           )
 
-                          cue_count = cue.get(
-                              "sample_count",
-                              0,
-                          )
+                          if not text:
+                              continue
 
-                          # Chọn text đại diện: sample_count cao hơn
-                          # thắng; nếu bằng nhau, câu dài hơn thắng
-                          # (thường là bản đọc đầy đủ hơn).
-                          if cue_count > previous_count or (
-                              cue_count == previous_count
-                              and len(cue["text"])
-                              > len(previous["text"])
+                          try:
+
+                              score = float(
+                                  scores[index]
+                              )
+
+                          except Exception:
+
+                              score = 0.0
+
+                          if (
+                              score
+                              < OCR_MIN_SCORE
                           ):
-                              previous["text"] = cue["text"]
 
-                          previous["end"] = max(
-                              previous["end"],
-                              cue["end"],
+                              continue
+
+                          results.append(
+                              {
+                                  "variant": variant_name,
+                                  "text": text,
+                                  "score": score,
+                                  "chinese": chinese_count(
+                                      text
+                                  ),
+                              }
                           )
 
-                          previous["sample_count"] = (
-                              previous_count + cue_count
-                          )
-
-                          previous["fuzzy_merged"] = True
-
-                      else:
-                          result.append(dict(cue))
-
-                      index += 1
-
-                  current = result
-
-                  if not merged_any:
-                      break
-
-              return current, merge_log
+              return results
 
 
           # ============================================================
-          # SAVE SRT
+          # CHOOSE OCR RESULT
           # ============================================================
 
-          def save_srt(cues):
+          def choose_ocr_result(
+              results
+          ):
+
+              if not results:
+                  return ""
+
+              # --------------------------------------------------------
+              # Group exact text.
+              # --------------------------------------------------------
+
+              grouped = {}
+
+              for item in results:
+
+                  text = item["text"]
+
+                  bucket = grouped.setdefault(
+                      text,
+                      {
+                          "count": 0,
+                          "score": 0.0,
+                          "chinese": 0,
+                      },
+                  )
+
+                  bucket["count"] += 1
+
+                  bucket["score"] += float(
+                      item["score"]
+                  )
+
+                  bucket["chinese"] = max(
+                      bucket["chinese"],
+                      item["chinese"],
+                  )
+
+              # --------------------------------------------------------
+              # Score:
+              #
+              # 1. xuất hiện ở nhiều preprocessing variant
+              # 2. confidence cao
+              # 3. nhiều Chinese chars
+              #
+              # Không dùng "text dài hơn = tốt hơn" một cách mù quáng.
+              # --------------------------------------------------------
+
+              best_text = max(
+                  grouped.items(),
+                  key=lambda item: (
+                      item[1]["count"],
+                      item[1]["score"],
+                      item[1]["chinese"],
+                  ),
+              )[0]
+
+              return best_text
+
+
+          # ============================================================
+          # OCR ALL MIDPOINTS
+          # ============================================================
+
+          def ocr_midpoints(
+              timing_data
+          ):
+
+              (
+                  width,
+                  height,
+                  video_fps,
+                  duration,
+              ) = probe_video()
+
+              y1, y2 = get_roi(
+                  height
+              )
+
+              log("")
+              log(
+                  "=========================================="
+              )
+              log(
+                  "PASS 2 — MIDPOINT OCR"
+              )
+              log(
+                  "=========================================="
+              )
+
+              log(
+                  "Timing source = PASS 1"
+              )
+
+              log(
+                  "OCR frame = cue midpoint"
+              )
+
+              log(
+                  f"Total cues = "
+                  f"{len(timing_data['cues'])}"
+              )
+
+              log(
+                  f"ROI = y={y1}..{y2}"
+              )
+
+              # --------------------------------------------------------
+              # Load PaddleOCR once
+              # --------------------------------------------------------
+
+              log(
+                  "Loading PaddleOCR..."
+              )
+
+              ocr = PaddleOCR(
+                  lang="ch",
+                  text_det_limit_side_len=OCR_DET_LIMIT,
+                  text_det_limit_type="max",
+              )
+
+              output_cues = []
+
+              ocr_debug = []
+
+              for cue in tqdm(
+                  timing_data["cues"],
+                  desc="Midpoint OCR",
+              ):
+
+                  cue_id = cue["id"]
+
+                  start = float(
+                      cue["start"]
+                  )
+
+                  end = float(
+                      cue["end"]
+                  )
+
+                  midpoint = float(
+                      cue["midpoint"]
+                  )
+
+                  log("")
+                  log(
+                      f"========== CUE {cue_id} =========="
+                  )
+
+                  log(
+                      f"time     : "
+                      f"{start:.3f} → "
+                      f"{end:.3f}"
+                  )
+
+                  log(
+                      f"midpoint : "
+                      f"{midpoint:.3f}"
+                  )
+
+                  # ----------------------------------------------------
+                  # Extract EXACT midpoint frame
+                  # ----------------------------------------------------
+
+                  frame = extract_frame_at_time(
+                      midpoint
+                  )
+
+                  # ----------------------------------------------------
+                  # Save original midpoint for debugging
+                  # ----------------------------------------------------
+
+                  original_path = (
+                      DEBUG_DIR
+                      / f"{cue_id:05d}_original.png"
+                  )
+
+                  cv2.imwrite(
+                      str(original_path),
+                      frame,
+                  )
+
+                  # ----------------------------------------------------
+                  # Prepare images
+                  # ----------------------------------------------------
+
+                  prepared = prepare_ocr_image(
+                      frame,
+                      y1,
+                      y2,
+                  )
+
+                  if prepared is None:
+
+                      log(
+                          "OCR IMAGE = EMPTY"
+                      )
+
+                      continue
+
+                  # ----------------------------------------------------
+                  # Save OCR variants
+                  # ----------------------------------------------------
+
+                  cv2.imwrite(
+                      str(
+                          DEBUG_DIR
+                          / f"{cue_id:05d}_gray.png"
+                      ),
+                      prepared["gray"],
+                  )
+
+                  cv2.imwrite(
+                      str(
+                          DEBUG_DIR
+                          / f"{cue_id:05d}_binary.png"
+                      ),
+                      prepared["binary"],
+                  )
+
+                  cv2.imwrite(
+                      str(
+                          DEBUG_DIR
+                          / f"{cue_id:05d}_otsu.png"
+                      ),
+                      prepared["otsu"],
+                  )
+
+                  # ----------------------------------------------------
+                  # OCR
+                  # ----------------------------------------------------
+
+                  results = run_ocr(
+                      ocr,
+                      prepared,
+                  )
+
+                  text = choose_ocr_result(
+                      results
+                  )
+
+                  log(
+                      f"OCR = {text!r}"
+                  )
+
+                  # ----------------------------------------------------
+                  # Debug OCR alternatives
+                  # ----------------------------------------------------
+
+                  ocr_debug.append(
+                      {
+                          "id": cue_id,
+                          "start": start,
+                          "end": end,
+                          "midpoint": midpoint,
+                          "selected_text": text,
+                          "results": results,
+                      }
+                  )
+
+                  # ----------------------------------------------------
+                  # Empty OCR
+                  # ----------------------------------------------------
+
+                  if not text:
+
+                      log(
+                          "WARNING: OCR EMPTY"
+                      )
+
+                      continue
+
+                  # ----------------------------------------------------
+                  # Save cue
+                  # ----------------------------------------------------
+
+                  output_cues.append(
+                      {
+                          "id": cue_id,
+                          "start": start,
+                          "end": end,
+                          "midpoint": midpoint,
+                          "text": text,
+                      }
+                  )
+
+              # --------------------------------------------------------
+              # Save OCR debug
+              # --------------------------------------------------------
+
+              OCR_JSON.write_text(
+                  json.dumps(
+                      ocr_debug,
+                      ensure_ascii=False,
+                      indent=2,
+                  ),
+                  encoding="utf-8",
+              )
+
+              return output_cues
+
+
+          # ============================================================
+          # SRT
+          # ============================================================
+
+          def save_srt(
+              cues
+          ):
 
               subs = pysubs2.SSAFile()
 
               for cue in cues:
 
+                  start_ms = int(
+                      round(
+                          cue["start"]
+                          * 1000
+                      )
+                  )
+
+                  end_ms = int(
+                      round(
+                          cue["end"]
+                          * 1000
+                      )
+                  )
+
                   subs.events.append(
                       pysubs2.SSAEvent(
-                          start=int(
-                              cue["start"]
-                              * 1000
-                          ),
-                          end=int(
-                              cue["end"]
-                              * 1000
-                          ),
+                          start=start_ms,
+                          end=end_ms,
                           text=cue["text"],
                       )
                   )
@@ -1732,267 +1906,264 @@ jobs:
               if not VIDEO.exists():
 
                   raise RuntimeError(
-                      "Video khong ton tai: "
+                      "Video không tồn tại: "
                       + str(VIDEO)
                   )
 
-              log(
-                  "Loading PaddleOCR..."
+              # --------------------------------------------------------
+              # PASS 1
+              # --------------------------------------------------------
+
+              timing_data = (
+                  detect_timings()
               )
 
-              global ocr
+              # --------------------------------------------------------
+              # PASS 2
+              # --------------------------------------------------------
 
-              ocr = PaddleOCR(
-                  lang="ch",
-                  text_det_limit_side_len=OCR_DET_LIMIT_SIDE_LEN,
-                  text_det_limit_type="max",
+              cues = (
+                  ocr_midpoints(
+                      timing_data
+                  )
               )
 
-              region = (
-                  find_subtitle_region()
-              )
-
-              (
-                  samples,
-                  duration,
-              ) = extract_all_samples(
-                  region
-              )
-
-              (
-                  raw_cues,
-                  merge_debug,
-              ) = samples_to_raw_cues(
-                  samples,
-                  duration,
-              )
-
-              (
-                  cues,
-                  adjacent_merge_log,
-              ) = fuzzy_merge_adjacent_cues(
-                  raw_cues
-              )
+              # --------------------------------------------------------
+              # SAVE
+              # --------------------------------------------------------
 
               save_srt(
                   cues
               )
 
-              nonempty_samples = [
-                  sample
-                  for sample in samples
-                  if sample["text"]
-              ]
-
-              counter = Counter(
-                  sample["text"]
-                  for sample in nonempty_samples
-              )
-
-              debug_data = {
-                  "region": region,
-                  "scan_seconds": SCAN_SECONDS,
-                  "ocr_fps": OCR_FPS,
-                  "ocr_upscale_factor": OCR_UPSCALE_FACTOR,
-                  "ocr_det_limit_side_len": OCR_DET_LIMIT_SIDE_LEN,
-                  "ocr_apply_clahe": OCR_APPLY_CLAHE,
-                  "adjacent_fuzzy_merge_enabled": (
-                      ENABLE_ADJACENT_CUE_FUZZY_MERGE
-                  ),
-                  "sample_count": len(
-                      samples
-                  ),
-                  "nonempty_sample_count": len(
-                      nonempty_samples
-                  ),
-                  "raw_cue_count": len(
-                      raw_cues
-                  ),
-                  "cue_count": len(
-                      cues
-                  ),
-                  "samples": samples,
-                  "raw_cues": raw_cues,
-                  "cues": cues,
-                  "merge_debug": merge_debug,
-                  "adjacent_merge_log": adjacent_merge_log,
-              }
-
-              DEBUG_JSON.write_text(
-                  json.dumps(
-                      debug_data,
-                      ensure_ascii=False,
-                      indent=2,
-                  ),
-                  encoding="utf-8",
-              )
-
               log("")
               log(
-                  "========== OCR DEBUG SUMMARY =========="
+                  "=========================================="
               )
 
               log(
-                  "REGION:"
+                  "FINAL RESULT"
               )
 
               log(
-                  json.dumps(
-                      region,
-                      ensure_ascii=False,
-                  )
+                  "=========================================="
               )
 
               log(
-                  f"Total samples : "
-                  f"{len(samples)}"
+                  f"Timing cues : "
+                  f"{len(timing_data['cues'])}"
               )
 
               log(
-                  f"Non-empty     : "
-                  f"{len(nonempty_samples)}"
+                  f"OCR cues    : "
+                  f"{len(cues)}"
               )
 
               log(
-                  f"Raw SRT cues  : "
-                  f"{len(raw_cues)}"
-              )
-
-              log(
-                  f"Final cues    : "
-                  f"{len(cues)} "
-                  f"(sau fuzzy merge liền kề)"
-              )
-
-              log(
-                  f"Output        : "
+                  f"Output      : "
                   f"{OUTPUT_SRT}"
               )
 
               log(
-                  f"Debug JSON    : "
-                  f"{DEBUG_JSON}"
+                  f"Timing JSON : "
+                  f"{TIMING_JSON}"
               )
 
               log(
-                  "Most common OCR results:"
+                  f"OCR JSON    : "
+                  f"{OCR_JSON}"
               )
 
-              for (
-                  text,
-                  count,
-              ) in counter.most_common(
-                  20
-              ):
-                  log(
-                      f"  {count:4d}x "
-                      f"{text!r}"
+              log(
+                  "=========================================="
+              )
+
+              # --------------------------------------------------------
+              # Print SRT
+              # --------------------------------------------------------
+
+              print("")
+
+              print(
+                  "========== FINAL SRT =========="
+              )
+
+              print(
+                  OUTPUT_SRT.read_text(
+                      encoding="utf-8"
                   )
-
-              log(
-                  "======================================="
               )
 
 
           if __name__ == "__main__":
               main()
+
           PY
 
-      - name: OCR Debug only
+
+      # ============================================================
+      # RUN
+      # ============================================================
+
+      - name: Extract subtitle
         env:
-          SCAN_SECONDS: ${{ inputs.scan_seconds }}
-          OCR_FPS: ${{ inputs.ocr_fps }}
+          SCAN_FPS: ${{ inputs.scan_fps }}
+          ROI_TOP: ${{ inputs.roi_top }}
+          ROI_BOTTOM: ${{ inputs.roi_bottom }}
+          MIN_DURATION: ${{ inputs.min_duration }}
+          BRIGHTNESS_THRESHOLD: ${{ inputs.threshold }}
+
           DISABLE_MODEL_SOURCE_CHECK: "True"
           PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+
         run: |
           set -euo pipefail
+
           python process.py
+
+
+      # ============================================================
+      # CHECK OUTPUT
+      # ============================================================
 
       - name: Check Chinese subtitle
         run: |
           set -euo pipefail
 
           if [ ! -f chinese.srt ]; then
-            echo "::error::chinese.srt khong duoc tao."
+            echo "::error::chinese.srt không được tạo."
             exit 1
           fi
 
-          echo "========== chinese.srt =========="
+          if [ ! -s chinese.srt ]; then
+            echo "::error::chinese.srt rỗng."
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "FINAL chinese.srt"
+          echo "=========================================="
+
           cat chinese.srt
 
           echo ""
-          echo "========== OCR DEBUG REGION =========="
+          echo "=========================================="
+          echo "TIMING DEBUG"
+          echo "=========================================="
 
           python - <<'PY'
+
           import json
           from pathlib import Path
 
-          debug_file = Path("work/ocr_debug.json")
-
-          if not debug_file.exists():
-              raise SystemExit("work/ocr_debug.json khong ton tai")
+          path = Path(
+              "work/timing.json"
+          )
 
           data = json.loads(
-              debug_file.read_text(
+              path.read_text(
                   encoding="utf-8"
               )
           )
 
-          region = data["region"]
-
           print(
-              json.dumps(
-                  region,
-                  ensure_ascii=False,
-                  indent=2,
-              )
+              "Video:",
+              data["video"]
           )
 
           print()
+
           print(
-              "sample_count:",
-              data["sample_count"]
+              "Timing configuration:"
           )
 
           print(
-              "nonempty_sample_count:",
-              data["nonempty_sample_count"]
+              data["scan"]
           )
 
-          print(
-              "raw_cue_count:",
-              data["raw_cue_count"]
-          )
+          print()
 
           print(
-              "cue_count:",
+              "Cue count:",
               data["cue_count"]
           )
+
+          print()
+
+          for cue in data["cues"][:100]:
+
+              print(
+                  f"{cue['id']:04d} "
+                  f"{cue['start']:.3f} --> "
+                  f"{cue['end']:.3f} "
+                  f"mid={cue['midpoint']:.3f}"
+              )
+
           PY
 
-      - name: Commit Chinese subtitle to repository
+
+      # ============================================================
+      # UPLOAD DEBUG ARTIFACTS
+      # ============================================================
+
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: subtitle-debug
+          path: |
+            work/timing.json
+            work/ocr.json
+            work/debug/
+          if-no-files-found: warn
+          retention-days: 7
+
+
+      # ============================================================
+      # COMMIT SRT
+      # ============================================================
+
+      - name: Commit Chinese subtitle
         run: |
           set -euo pipefail
 
           if [ ! -s chinese.srt ]; then
-            echo "::error::chinese.srt khong ton tai hoac rong."
+            echo "::error::chinese.srt không tồn tại hoặc rỗng."
             exit 1
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name \
+            "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add chinese.srt
 
           if git diff --cached --quiet; then
-            echo "chinese.srt khong thay doi, khong can commit."
+
+            echo \
+              "chinese.srt không thay đổi."
+
           else
-            git commit -m "debug: update Chinese OCR subtitle"
-            git push origin HEAD:${{ github.ref_name }}
+
+            git commit \
+              -m "feat: extract Chinese hard subtitle"
+
+            git push \
+              origin \
+              HEAD:${{ github.ref_name }}
+
           fi
+
+
+      # ============================================================
+      # CLEANUP
+      # ============================================================
 
       - name: Cleanup cookies
         if: always()
         run: |
           rm -f work/cookies.txt
+
           echo "Cookie removed."
