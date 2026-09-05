@@ -11,7 +11,19 @@ on:
       scan_fps:
         description: "FPS scan thô cho pass 1 (timing)"
         required: false
-        default: "12"
+        default: "20"
+        type: string
+
+      fine_rescan_fps:
+        description: "FPS quét lại (pass 1.5) cho các region dài nghi bị gộp nhiều sub"
+        required: false
+        default: "30"
+        type: string
+
+      fine_rescan_min_duration:
+        description: "Chỉ fine-rescan các region dài hơn giá trị này (giây)"
+        required: false
+        default: "3.0"
         type: string
 
       refine_radius:
@@ -35,19 +47,19 @@ on:
       min_cue_duration:
         description: "Loại bỏ cue ngắn hơn giá trị này (giây) sau khi đã gộp gap"
         required: false
-        default: "0.18"
+        default: "0.12"
         type: string
 
       local_window_seconds:
         description: "Cửa sổ (giây) để tính nền cục bộ khi phát hiện sub yếu/ngắn (so với nền lân cận thay vì so với cả video)"
         required: false
-        default: "4.0"
+        default: "2.0"
         type: string
 
       local_margin:
         description: "Biên độ tối thiểu (điểm số) để coi 1 frame là 'nổi bật hơn nền cục bộ' -> có sub"
         required: false
-        default: "0.00015"
+        default: "0.00006"
         type: string
 
       save_debug_frames:
@@ -178,18 +190,30 @@ jobs:
         run: |
           cat > process.py <<'PY'
           """
-          Pass 1 (timing)  : xác định chính xác các khoảng thời gian có sub bằng
-                              pixel presence (đèn sáng + cạnh) + phát hiện đổi chữ.
-          Pass 2 (OCR)      : OCR nhiều mẫu quanh mỗi cue, chọn kết quả đồng thuận
-                              nhất, chỉ chạy SAU khi timing đã ổn định.
+          Pass 1   (timing)      : xác định chính xác các khoảng thời gian có sub bằng
+                                    pixel presence (đèn sáng + cạnh) + phát hiện đổi chữ.
+          Pass 1.5 (fine-rescan) : với các region "có sub" dài bất thường mà pass 1
+                                    (ở SCAN_FPS thấp) chỉ tách được đúng 1 mảnh, quét
+                                    lại RIÊNG đoạn đó ở FPS cao hơn hẳn để bắt các lần
+                                    đổi chữ diễn ra quá nhanh giữa các frame mẫu gốc.
+          Pass 2   (OCR)         : OCR nhiều mẫu quanh mỗi cue, chọn kết quả đồng thuận
+                                    nhất, chỉ chạy SAU khi timing đã ổn định.
 
-          Sửa so với bản trước:
-            - Ngưỡng "có sub" dùng Otsu tự thích ứng theo video, thay vì công thức
-              percentile cố định (dễ bỏ sót các câu ngắn/ít chữ).
-            - Presence dùng hysteresis (ngưỡng vào cao hơn ngưỡng giữ) + thực sự
-              bridge các khoảng mất tín hiệu ngắn (MAX_SHORT_GAP) trước khi lọc
-              theo MIN_CUE_DURATION -> không còn bị cắt vụn 1 cue thành nhiều
-              mảnh rồi rớt hết vì mỗi mảnh quá ngắn.
+          Thay đổi so với bản trước (fix 2 lỗi thực tế):
+            1) Sub ngắn (ít chữ, ví dụ 4 chữ) bị mất hoàn toàn khỏi presence:
+               - Giảm LOCAL_K_MAD (5.0 -> 3.0) và mặc định LOCAL_WINDOW_SECONDS,
+                 LOCAL_MARGIN nhỏ hơn -> nền cục bộ ít bị chính đoạn sub yếu đó
+                 kéo lên, nhạy hơn với các câu ít chữ.
+               - MIN_CUE_DURATION giảm mặc định (0.18 -> 0.12) để không loại bỏ
+                 nhầm các cue ngắn hợp lệ sau khi đã gộp gap.
+            2) Nhiều sub liên tiếp chạy nhanh trong 1 khoảng dài bị gộp thành 1 cue
+               (change detection ở SCAN_FPS thấp không đủ mẫu để bắt boundary):
+               - Nới lỏng calculate_change_threshold + giảm min_gap_frames.
+               - Thêm PASS 1.5: với mỗi region "có sub" dài hơn
+                 FINE_RESCAN_MIN_DURATION mà pass 1 chỉ tách ra được 1 mảnh, quét
+                 lại chính đoạn video đó (chỉ đoạn đó, không phải cả video) ở
+                 FINE_RESCAN_FPS cao hơn nhiều để tính lại signature/change và
+                 tách boundary chính xác hơn.
           """
 
           import os
@@ -226,14 +250,16 @@ jobs:
           def env_bool(name, default):
               return os.environ.get(name, default).strip().lower() == "true"
 
-          SCAN_FPS = env_float("SCAN_FPS", "12")
+          SCAN_FPS = env_float("SCAN_FPS", "20")
+          FINE_RESCAN_FPS = env_float("FINE_RESCAN_FPS", "30")
+          FINE_RESCAN_MIN_DURATION = env_float("FINE_RESCAN_MIN_DURATION", "3.0")
           REFINE_RADIUS = env_float("REFINE_RADIUS", "0.35")
           MIDPOINT_OFFSET = env_float("MIDPOINT_OFFSET", "0.12")
           MAX_SHORT_GAP = env_float("MAX_SHORT_GAP", "0.20")
-          MIN_CUE_DURATION = env_float("MIN_CUE_DURATION", "0.18")
-          LOCAL_WINDOW_SECONDS = env_float("LOCAL_WINDOW_SECONDS", "4.0")
-          LOCAL_MARGIN = env_float("LOCAL_MARGIN", "0.00015")
-          LOCAL_K_MAD = 5.0  # độ nhạy so với nhiễu cục bộ, ít khi cần chỉnh
+          MIN_CUE_DURATION = env_float("MIN_CUE_DURATION", "0.12")
+          LOCAL_WINDOW_SECONDS = env_float("LOCAL_WINDOW_SECONDS", "2.0")
+          LOCAL_MARGIN = env_float("LOCAL_MARGIN", "0.00006")
+          LOCAL_K_MAD = 3.0  # giảm từ 5.0 -> nhạy hơn với sub ít chữ / nền lân cận
           SAVE_DEBUG_FRAMES = env_bool("SAVE_DEBUG_FRAMES", "true")
 
           # Subtitle thường nằm ở dải dưới khung hình.
@@ -244,14 +270,17 @@ jobs:
           BRIGHT_THRESHOLD = 165
           EDGE_THRESHOLD_1 = 45
           EDGE_THRESHOLD_2 = 120
-          EDGE_DILATE_ITERS = 2  # tăng từ 1 -> 2 để bắt được chữ mảnh / chữ màu
+          EDGE_DILATE_ITERS = 2
 
           # Signature (dùng để phát hiện đổi nội dung sub)
           SIGNATURE_WIDTH = 240
           SIGNATURE_HEIGHT = 72
 
           # Temporal
-          MIN_SEGMENT_DURATION = 0.25
+          MIN_SEGMENT_DURATION = 0.12  # giảm từ 0.25 -> giữ được các câu ngắn/chạy nhanh
+
+          # Change-boundary gap chống trùng do rung/nhiễu (giây), giảm từ 0.12 -> 0.06
+          MIN_CHANGE_GAP_SECONDS = 0.06
 
           # OCR
           OCR_UPSCALE = 2.5
@@ -395,24 +424,6 @@ jobs:
           # ---------------------------------------------------------------
           # PRESENCE THRESHOLD
           # ---------------------------------------------------------------
-          #
-          # Dùng SONG SONG hai tiêu chí, hợp (OR) với nhau:
-          #
-          #   1) GLOBAL (Otsu)   : tách "có sub" / "không có sub" dựa trên
-          #                        toàn bộ phân bố điểm số của cả video.
-          #                        Tốt cho các câu sub dài/rõ.
-          #
-          #   2) LOCAL (adaptive): so điểm số của từng frame với NỀN LÂN CẬN
-          #                        của chính nó (rolling median/MAD trong cửa
-          #                        sổ ±LOCAL_WINDOW_SECONDS), không phải so
-          #                        với cả video. Bắt được các câu sub NGẮN
-          #                        (ít chữ, hiển thị trong thời gian ngắn nên
-          #                        tổng điểm thấp) mà tiêu chí global có thể
-          #                        bỏ sót vì bị các câu sub mạnh hơn ở chỗ
-          #                        khác trong video kéo ngưỡng lên cao.
-          #
-          # Một frame được coi là "có sub" nếu thoả MỘT TRONG HAI tiêu chí.
-          # ---------------------------------------------------------------
           def calculate_global_threshold(scores):
               values = np.asarray(scores, dtype=np.float64)
               values = values[np.isfinite(values)]
@@ -425,8 +436,6 @@ jobs:
               otsu_val, _ = cv2.threshold(scaled_8u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
               threshold = (float(otsu_val) / 255.0) * scale
 
-              # Không để ngưỡng cao hơn mức mà một câu ít chữ (ít pixel) vẫn đạt
-              # được, nếu không các câu ngắn/ít chữ sẽ bị loại ngay từ đầu.
               positive = values[values > 0]
               if positive.size:
                   threshold = min(threshold, float(np.percentile(positive, 45)))
@@ -435,8 +444,8 @@ jobs:
               log(f"GLOBAL THRESHOLD (Otsu) = {threshold:.6f}")
               return float(threshold)
 
-          def calculate_local_active(scores):
-              window_frames = max(1, int(round(LOCAL_WINDOW_SECONDS * SCAN_FPS)))
+          def calculate_local_active(scores, scan_fps):
+              window_frames = max(1, int(round(LOCAL_WINDOW_SECONDS * scan_fps)))
               window = window_frames * 2 + 1
 
               series = pd.Series(np.asarray(scores, dtype=np.float64))
@@ -445,7 +454,7 @@ jobs:
               local_threshold = local_median + np.maximum(LOCAL_K_MAD * local_mad, LOCAL_MARGIN)
 
               active = (series.values > local_threshold.values)
-              log(f"LOCAL ADAPTIVE   : window={LOCAL_WINDOW_SECONDS}s margin={LOCAL_MARGIN}")
+              log(f"LOCAL ADAPTIVE   : window={LOCAL_WINDOW_SECONDS}s margin={LOCAL_MARGIN} k_mad={LOCAL_K_MAD}")
               log(f"LOCAL ADAPTIVE   : frames flagged = {int(active.sum())}/{len(active)}")
               return active
 
@@ -454,14 +463,17 @@ jobs:
               values = values[np.isfinite(values)]
 
               if len(values) == 0:
-                  return 0.05
+                  return 0.04
 
               median = float(np.median(values))
               mad = float(np.median(np.abs(values - median)))
               p90 = float(np.percentile(values, 90))
 
-              threshold = max(0.025, median + mad * 4.0, p90 * 0.55)
-              threshold = min(threshold, 0.35)
+              # Nới lỏng hơn bản trước: hệ số MAD giảm (4.0 -> 2.0), tỉ trọng p90
+              # giảm (0.55 -> 0.35), trần giảm (0.35 -> 0.22) -> bắt được các lần
+              # đổi chữ nhanh, tương phản thấp hơn giữa 2 câu liên tiếp.
+              threshold = max(0.015, median + mad * 2.0, p90 * 0.35)
+              threshold = min(threshold, 0.22)
 
               log(f"CHANGE MEDIAN = {median:.6f} | MAD = {mad:.6f} | P90 = {p90:.6f}")
               log(f"CHANGE THRESHOLD = {threshold:.6f}")
@@ -470,17 +482,14 @@ jobs:
           # ---------------------------------------------------------------
           # PRESENCE (global OR local, rồi gap bridging) -> ACTIVE REGIONS
           # ---------------------------------------------------------------
-          def compute_active_regions(samples, global_threshold, local_active_mask, duration):
+          def compute_active_regions(samples, global_threshold, local_active_mask, duration, scan_fps):
               scores = np.asarray([s["score"] for s in samples], dtype=np.float64)
               n = len(scores)
 
               global_active = scores >= global_threshold
               active = (global_active | np.asarray(local_active_mask)).astype(np.uint8)
 
-              # Nối các khoảng "mất tín hiệu" ngắn (motion blur, fade, frame lỗi
-              # OCR-unfriendly) nằm giữa hai đoạn "có sub", để không bị cắt vụn
-              # một cue thành nhiều mảnh rồi rớt hết vì mỗi mảnh quá ngắn.
-              max_gap_frames = max(1, int(round(MAX_SHORT_GAP * SCAN_FPS)))
+              max_gap_frames = max(1, int(round(MAX_SHORT_GAP * scan_fps)))
               i = 0
               while i < n:
                   if active[i] == 0:
@@ -513,7 +522,7 @@ jobs:
               result = []
               for start_index, end_index in regions:
                   start = float(samples[start_index]["time"])
-                  end = min(duration, float(samples[end_index]["time"] + 1.0 / SCAN_FPS))
+                  end = min(duration, float(samples[end_index]["time"] + 1.0 / scan_fps))
                   if end - start >= MIN_CUE_DURATION:
                       result.append({
                           "start_index": int(start_index),
@@ -526,21 +535,12 @@ jobs:
           # ---------------------------------------------------------------
           # SPLIT REGION BY TEXT CHANGE
           # ---------------------------------------------------------------
-          #
-          # Lưu ý quan trọng: KHÔNG được chặn điểm đổi chữ đầu tiên chỉ vì nó
-          # xảy ra gần lúc vùng "có sub" vừa bắt đầu. Một câu ngắn (3-4 chữ)
-          # đổi ngay sang câu dài phía sau — không có khoảng đen ở giữa — sẽ
-          # tạo ra điểm đổi chữ rất sớm trong vùng. min_gap_frames chỉ dùng để
-          # chống trùng lặp giữa các frame liên tiếp của CÙNG một lần đổi chữ
-          # (do rung/nhiễu), không phải để tạo "vùng chết" ngay đầu region.
-          # ---------------------------------------------------------------
-          def find_change_boundaries(samples, region, change_threshold):
+          def find_change_boundaries(samples, region, change_threshold, scan_fps):
               boundaries = []
               start_index = region["start_index"]
               end_index = region["end_index"]
-              min_gap_frames = max(1, int(round(SCAN_FPS * 0.12)))
+              min_gap_frames = max(1, int(round(scan_fps * MIN_CHANGE_GAP_SECONDS)))
 
-              # Khởi tạo đủ xa để không chặn điểm đổi chữ đầu tiên.
               last_boundary = start_index - min_gap_frames - 1
 
               for i in range(start_index + 1, end_index + 1):
@@ -559,8 +559,8 @@ jobs:
 
               return boundaries
 
-          def split_region_by_changes(samples, region, change_threshold, duration):
-              boundaries = find_change_boundaries(samples, region, change_threshold)
+          def split_region_by_changes(samples, region, change_threshold, duration, scan_fps):
+              boundaries = find_change_boundaries(samples, region, change_threshold, scan_fps)
               indexes = [region["start_index"], *boundaries, region["end_index"] + 1]
 
               cues = []
@@ -571,7 +571,7 @@ jobs:
                       continue
 
                   start = float(samples[start_index]["time"])
-                  end = min(duration, float(samples[end_index]["time"]) + 1.0 / SCAN_FPS)
+                  end = min(duration, float(samples[end_index]["time"]) + 1.0 / scan_fps)
                   if end - start < MIN_SEGMENT_DURATION:
                       continue
 
@@ -580,6 +580,103 @@ jobs:
                       "start_index": int(start_index), "end_index": int(end_index),
                   })
               return cues
+
+          # ---------------------------------------------------------------
+          # PASS 1.5 — FINE RESCAN CHO REGION DÀI BỊ NGHI GỘP
+          # ---------------------------------------------------------------
+          #
+          # compute_active_regions()/split_region_by_changes() chạy ở SCAN_FPS
+          # (mặc định 20fps). Nếu trong 1 region liên tục nhiều sub chạy rất
+          # nhanh (mỗi câu <300-400ms) mà không hề "tắt đèn" ở giữa, số mẫu ở
+          # SCAN_FPS có thể không đủ để signature đổi rõ ràng -> bị coi là 1
+          # cue duy nhất. Với các region như vậy (dài hơn FINE_RESCAN_MIN_DURATION
+          # nhưng pass 1 chỉ tách được đúng 1 mảnh), quét lại CHỈ đoạn video đó
+          # ở FINE_RESCAN_FPS cao hơn hẳn rồi tách boundary lại.
+          # ---------------------------------------------------------------
+          def extract_region_frames(video_info, start, end, fps):
+              width, height = video_info["width"], video_info["height"]
+              roi_y1 = int(height * ROI_Y1_RATIO)
+              roi_y2 = int(height * ROI_Y2_RATIO)
+              roi_width, roi_height = width, roi_y2 - roi_y1
+
+              pad = 0.15  # đệm thêm 2 đầu để không hụt frame do làm tròn fps
+              seek = max(0.0, start - pad)
+              span = (end - start) + 2 * pad
+
+              filter_graph = f"fps={fps},crop={roi_width}:{roi_height}:0:{roi_y1}"
+              cmd = [
+                  "ffmpeg", "-hide_banner", "-loglevel", "error",
+                  "-ss", f"{seek:.6f}", "-i", str(VIDEO),
+                  "-t", f"{span:.6f}",
+                  "-vf", filter_graph, "-an", "-sn", "-dn",
+                  "-pix_fmt", "bgr24", "-f", "rawvideo", "-",
+              ]
+              result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if result.returncode != 0:
+                  log("FINE RESCAN ffmpeg lỗi: " + result.stderr.decode("utf-8", errors="replace"))
+                  return []
+
+              frame_size = roi_width * roi_height * 3
+              raw = result.stdout
+              n_frames = len(raw) // frame_size
+
+              frames = []
+              previous_signature = None
+              for i in range(n_frames):
+                  chunk = raw[i * frame_size:(i + 1) * frame_size]
+                  roi = np.frombuffer(chunk, dtype=np.uint8).reshape((roi_height, roi_width, 3))
+                  mask = subtitle_mask(roi)
+                  score = subtitle_score(mask)
+                  signature = create_signature(mask)
+                  change = signature_distance(signature, previous_signature)
+                  frames.append({
+                      "time": float(seek + i / fps),
+                      "score": float(score),
+                      "change": float(change),
+                  })
+                  previous_signature = signature
+              return frames
+
+          def fine_rescan_region(video_info, region_start, region_end, base_change_threshold):
+              fine_frames = extract_region_frames(video_info, region_start, region_end, FINE_RESCAN_FPS)
+              fine_frames = [f for f in fine_frames if region_start - 0.05 <= f["time"] <= region_end + 0.05]
+              if len(fine_frames) < 3:
+                  return None
+
+              changes = [f["change"] for f in fine_frames[1:]]
+              fine_threshold = calculate_change_threshold(changes)
+              # Không để fine threshold cao hơn threshold gốc (đoạn này đã biết
+              # chắc chắn là 1 region liên tục có sub, nên ưu tiên nhạy hơn).
+              fine_threshold = min(fine_threshold, base_change_threshold)
+
+              min_gap_frames = max(1, int(round(FINE_RESCAN_FPS * MIN_CHANGE_GAP_SECONDS)))
+              boundaries = []
+              last_boundary = -min_gap_frames - 1
+              for i in range(1, len(fine_frames)):
+                  if fine_frames[i]["change"] < fine_threshold:
+                      continue
+                  if i - last_boundary < min_gap_frames:
+                      continue
+                  boundaries.append(i)
+                  last_boundary = i
+
+              if not boundaries:
+                  return None
+
+              indexes = [0, *boundaries, len(fine_frames)]
+              cues = []
+              for i in range(len(indexes) - 1):
+                  start_i = indexes[i]
+                  end_i = indexes[i + 1] - 1
+                  if end_i < start_i:
+                      continue
+                  start = max(region_start, float(fine_frames[start_i]["time"]))
+                  end = min(region_end, float(fine_frames[end_i]["time"]) + 1.0 / FINE_RESCAN_FPS)
+                  if end - start < MIN_SEGMENT_DURATION:
+                      continue
+                  cues.append({"start": start, "end": end})
+
+              return cues if len(cues) > 1 else None
 
           # ---------------------------------------------------------------
           # BOUNDARY REFINEMENT (frame-accurate quanh mốc thô)
@@ -591,10 +688,6 @@ jobs:
               roi, _, _ = get_roi(frame, video_info)
               return {"score": float(subtitle_score(subtitle_mask(roi)))}
 
-          # Dùng ngưỡng nới lỏng hơn ngưỡng phát hiện chính khi dò biên,
-          # vì phần đầu/cuối của một cue (fade-in/out) tự nhiên có điểm số
-          # thấp hơn phần giữa — nếu đòi hỏi cùng mức ngưỡng như lúc phát
-          # hiện sẽ vô tình cắt bớt biên của các cue yếu (câu ngắn).
           def refine_start(approximate, threshold, video_info):
               fps = video_info["fps"]
               step = 1.0 / fps
@@ -627,7 +720,7 @@ jobs:
               return float(approximate)
 
           def refine_presence_boundaries(cues, threshold, video_info):
-              refine_threshold = threshold * 0.6  # xem ghi chú ở refine_start
+              refine_threshold = threshold * 0.6
               refined = []
               for cue in cues:
                   start = refine_start(cue["start"], refine_threshold, video_info)
@@ -640,16 +733,31 @@ jobs:
           # ---------------------------------------------------------------
           # BUILD FINAL TIMING CUES
           # ---------------------------------------------------------------
-          def build_timing_cues(samples, global_threshold, local_active_mask, change_threshold, video_info):
+          def build_timing_cues(samples, global_threshold, local_active_mask, change_threshold, video_info, scan_fps):
               duration = video_info["duration"]
-              regions = compute_active_regions(samples, global_threshold, local_active_mask, duration)
+              regions = compute_active_regions(samples, global_threshold, local_active_mask, duration, scan_fps)
               log(f"ACTIVE REGIONS = {len(regions)}")
 
               raw_cues = []
+              fine_rescan_count = 0
               for region in regions:
-                  parts = split_region_by_changes(samples, region, change_threshold, duration)
-                  raw_cues.extend(parts or [{"start": region["start"], "end": region["end"]}])
-              log(f"RAW PIXEL CUES = {len(raw_cues)}")
+                  parts = split_region_by_changes(samples, region, change_threshold, duration, scan_fps)
+                  if not parts:
+                      parts = [{"start": region["start"], "end": region["end"]}]
+
+                  region_duration = region["end"] - region["start"]
+                  if len(parts) == 1 and region_duration >= FINE_RESCAN_MIN_DURATION:
+                      log(f"FINE RESCAN thử lại region {region['start']:.3f}->{region['end']:.3f} "
+                          f"(dài {region_duration:.3f}s, pass1 chỉ ra 1 mảnh)")
+                      fine_parts = fine_rescan_region(video_info, region["start"], region["end"], change_threshold)
+                      if fine_parts:
+                          fine_rescan_count += 1
+                          log(f"FINE RESCAN tách được {len(fine_parts)} mảnh thay vì 1")
+                          parts = fine_parts
+
+                  raw_cues.extend(parts)
+
+              log(f"RAW PIXEL CUES = {len(raw_cues)} (fine-rescanned regions = {fine_rescan_count})")
 
               refined = refine_presence_boundaries(raw_cues, global_threshold, video_info)
 
@@ -681,6 +789,7 @@ jobs:
               log("==========================================")
               log(f"VIDEO       : {width}x{height} @ {video_info['fps']:.3f}fps, {duration:.3f}s")
               log(f"SCAN FPS    : {SCAN_FPS}  | ROI: y={roi_y1}..{roi_y2}")
+              log(f"FINE RESCAN : fps={FINE_RESCAN_FPS} min_duration={FINE_RESCAN_MIN_DURATION}s")
               log(f"MAX_SHORT_GAP={MAX_SHORT_GAP}s | MIN_CUE_DURATION={MIN_CUE_DURATION}s")
 
               filter_graph = f"fps={SCAN_FPS},crop={width}:{roi_y2 - roi_y1}:0:{roi_y1}"
@@ -735,11 +844,9 @@ jobs:
 
               scores = [s["score"] for s in samples]
               global_threshold = calculate_global_threshold(scores)
-              local_active_mask = calculate_local_active(scores)
+              local_active_mask = calculate_local_active(scores, SCAN_FPS)
 
-              # compute_active_regions() sẽ điền sample["active"] cho từng frame
-              # (dùng để tính change_threshold bên dưới).
-              compute_active_regions(samples, global_threshold, local_active_mask, duration)
+              compute_active_regions(samples, global_threshold, local_active_mask, duration, SCAN_FPS)
 
               active_changes = [
                   samples[i]["change"]
@@ -748,7 +855,9 @@ jobs:
               ]
               change_threshold = calculate_change_threshold(active_changes)
 
-              timing_cues = build_timing_cues(samples, global_threshold, local_active_mask, change_threshold, video_info)
+              timing_cues = build_timing_cues(
+                  samples, global_threshold, local_active_mask, change_threshold, video_info, SCAN_FPS
+              )
 
               log(f"\nFINAL TIMING CUES = {len(timing_cues)}")
               for cue in timing_cues:
@@ -757,6 +866,8 @@ jobs:
               write_json(TIMING_JSON, {
                   "video": video_info,
                   "scan_fps": float(SCAN_FPS),
+                  "fine_rescan_fps": float(FINE_RESCAN_FPS),
+                  "fine_rescan_min_duration": float(FINE_RESCAN_MIN_DURATION),
                   "roi": {"y1": int(roi_y1), "y2": int(roi_y2)},
                   "global_threshold": float(global_threshold),
                   "change_threshold": float(change_threshold),
@@ -978,7 +1089,6 @@ jobs:
               if not final:
                   return []
 
-              # Gộp các cue liên tiếp có nội dung gần giống nhau và khoảng cách nhỏ.
               merged = [final[0].copy()]
               for cue in final[1:]:
                   previous = merged[-1]
@@ -1044,6 +1154,8 @@ jobs:
       - name: Run subtitle extraction
         env:
           SCAN_FPS: ${{ inputs.scan_fps }}
+          FINE_RESCAN_FPS: ${{ inputs.fine_rescan_fps }}
+          FINE_RESCAN_MIN_DURATION: ${{ inputs.fine_rescan_min_duration }}
           REFINE_RADIUS: ${{ inputs.refine_radius }}
           MIDPOINT_OFFSET: ${{ inputs.midpoint_offsets }}
           MAX_SHORT_GAP: ${{ inputs.max_short_gap }}
