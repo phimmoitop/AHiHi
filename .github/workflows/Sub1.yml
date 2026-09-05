@@ -38,6 +38,18 @@ on:
         default: "0.18"
         type: string
 
+      local_window_seconds:
+        description: "Cửa sổ (giây) để tính nền cục bộ khi phát hiện sub yếu/ngắn (so với nền lân cận thay vì so với cả video)"
+        required: false
+        default: "4.0"
+        type: string
+
+      local_margin:
+        description: "Biên độ tối thiểu (điểm số) để coi 1 frame là 'nổi bật hơn nền cục bộ' -> có sub"
+        required: false
+        default: "0.00015"
+        type: string
+
       save_debug_frames:
         description: "Lưu frame OCR để debug"
         required: false
@@ -95,6 +107,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             numpy==1.26.4 \
+            pandas==2.2.2 \
             opencv-python-headless==4.10.0.84 \
             tqdm \
             pysubs2 \
@@ -188,6 +201,7 @@ jobs:
 
           import cv2
           import numpy as np
+          import pandas as pd
           import pysubs2
           from tqdm import tqdm
           from paddleocr import PaddleOCR
@@ -217,6 +231,9 @@ jobs:
           MIDPOINT_OFFSET = env_float("MIDPOINT_OFFSET", "0.12")
           MAX_SHORT_GAP = env_float("MAX_SHORT_GAP", "0.20")
           MIN_CUE_DURATION = env_float("MIN_CUE_DURATION", "0.18")
+          LOCAL_WINDOW_SECONDS = env_float("LOCAL_WINDOW_SECONDS", "4.0")
+          LOCAL_MARGIN = env_float("LOCAL_MARGIN", "0.00015")
+          LOCAL_K_MAD = 5.0  # độ nhạy so với nhiễu cục bộ, ít khi cần chỉnh
           SAVE_DEBUG_FRAMES = env_bool("SAVE_DEBUG_FRAMES", "true")
 
           # Subtitle thường nằm ở dải dưới khung hình.
@@ -376,9 +393,27 @@ jobs:
               return float(np.mean(np.abs(a - b)))
 
           # ---------------------------------------------------------------
-          # PRESENCE THRESHOLD (Otsu, tự thích ứng theo video)
+          # PRESENCE THRESHOLD
           # ---------------------------------------------------------------
-          def calculate_presence_threshold(scores):
+          #
+          # Dùng SONG SONG hai tiêu chí, hợp (OR) với nhau:
+          #
+          #   1) GLOBAL (Otsu)   : tách "có sub" / "không có sub" dựa trên
+          #                        toàn bộ phân bố điểm số của cả video.
+          #                        Tốt cho các câu sub dài/rõ.
+          #
+          #   2) LOCAL (adaptive): so điểm số của từng frame với NỀN LÂN CẬN
+          #                        của chính nó (rolling median/MAD trong cửa
+          #                        sổ ±LOCAL_WINDOW_SECONDS), không phải so
+          #                        với cả video. Bắt được các câu sub NGẮN
+          #                        (ít chữ, hiển thị trong thời gian ngắn nên
+          #                        tổng điểm thấp) mà tiêu chí global có thể
+          #                        bỏ sót vì bị các câu sub mạnh hơn ở chỗ
+          #                        khác trong video kéo ngưỡng lên cao.
+          #
+          # Một frame được coi là "có sub" nếu thoả MỘT TRONG HAI tiêu chí.
+          # ---------------------------------------------------------------
+          def calculate_global_threshold(scores):
               values = np.asarray(scores, dtype=np.float64)
               values = values[np.isfinite(values)]
 
@@ -397,10 +432,22 @@ jobs:
                   threshold = min(threshold, float(np.percentile(positive, 45)))
 
               threshold = max(threshold, 0.0006)
-
-              log(f"OTSU RAW THRESHOLD  = {(otsu_val / 255.0) * scale:.6f}")
-              log(f"PRESENCE THRESHOLD  = {threshold:.6f}")
+              log(f"GLOBAL THRESHOLD (Otsu) = {threshold:.6f}")
               return float(threshold)
+
+          def calculate_local_active(scores):
+              window_frames = max(1, int(round(LOCAL_WINDOW_SECONDS * SCAN_FPS)))
+              window = window_frames * 2 + 1
+
+              series = pd.Series(np.asarray(scores, dtype=np.float64))
+              local_median = series.rolling(window, center=True, min_periods=1).median()
+              local_mad = (series - local_median).abs().rolling(window, center=True, min_periods=1).median()
+              local_threshold = local_median + np.maximum(LOCAL_K_MAD * local_mad, LOCAL_MARGIN)
+
+              active = (series.values > local_threshold.values)
+              log(f"LOCAL ADAPTIVE   : window={LOCAL_WINDOW_SECONDS}s margin={LOCAL_MARGIN}")
+              log(f"LOCAL ADAPTIVE   : frames flagged = {int(active.sum())}/{len(active)}")
+              return active
 
           def calculate_change_threshold(changes):
               values = np.asarray(changes, dtype=np.float64)
@@ -421,25 +468,14 @@ jobs:
               return float(threshold)
 
           # ---------------------------------------------------------------
-          # PRESENCE (hysteresis + gap bridging) -> ACTIVE REGIONS
+          # PRESENCE (global OR local, rồi gap bridging) -> ACTIVE REGIONS
           # ---------------------------------------------------------------
-          def compute_active_regions(samples, presence_threshold, duration):
-              scores = [s["score"] for s in samples]
+          def compute_active_regions(samples, global_threshold, local_active_mask, duration):
+              scores = np.asarray([s["score"] for s in samples], dtype=np.float64)
               n = len(scores)
 
-              hi = presence_threshold
-              lo = presence_threshold * 0.55  # đã "vào" cue thì cho phép tụt sâu hơn mới coi là "tắt"
-
-              active = np.zeros(n, dtype=np.uint8)
-              state = 0
-              for i, score in enumerate(scores):
-                  if state == 0:
-                      if score >= hi:
-                          state = 1
-                  else:
-                      if score < lo:
-                          state = 0
-                  active[i] = state
+              global_active = scores >= global_threshold
+              active = (global_active | np.asarray(local_active_mask)).astype(np.uint8)
 
               # Nối các khoảng "mất tín hiệu" ngắn (motion blur, fade, frame lỗi
               # OCR-unfriendly) nằm giữa hai đoạn "có sub", để không bị cắt vụn
@@ -545,6 +581,10 @@ jobs:
               roi, _, _ = get_roi(frame, video_info)
               return {"score": float(subtitle_score(subtitle_mask(roi)))}
 
+          # Dùng ngưỡng nới lỏng hơn ngưỡng phát hiện chính khi dò biên,
+          # vì phần đầu/cuối của một cue (fade-in/out) tự nhiên có điểm số
+          # thấp hơn phần giữa — nếu đòi hỏi cùng mức ngưỡng như lúc phát
+          # hiện sẽ vô tình cắt bớt biên của các cue yếu (câu ngắn).
           def refine_start(approximate, threshold, video_info):
               fps = video_info["fps"]
               step = 1.0 / fps
@@ -577,10 +617,11 @@ jobs:
               return float(approximate)
 
           def refine_presence_boundaries(cues, threshold, video_info):
+              refine_threshold = threshold * 0.6  # xem ghi chú ở refine_start
               refined = []
               for cue in cues:
-                  start = refine_start(cue["start"], threshold, video_info)
-                  end = refine_end(cue["end"], threshold, video_info)
+                  start = refine_start(cue["start"], refine_threshold, video_info)
+                  end = refine_end(cue["end"], refine_threshold, video_info)
                   if end - start < MIN_CUE_DURATION:
                       continue
                   refined.append({"start": float(start), "end": float(end)})
@@ -589,9 +630,9 @@ jobs:
           # ---------------------------------------------------------------
           # BUILD FINAL TIMING CUES
           # ---------------------------------------------------------------
-          def build_timing_cues(samples, presence_threshold, change_threshold, video_info):
+          def build_timing_cues(samples, global_threshold, local_active_mask, change_threshold, video_info):
               duration = video_info["duration"]
-              regions = compute_active_regions(samples, presence_threshold, duration)
+              regions = compute_active_regions(samples, global_threshold, local_active_mask, duration)
               log(f"ACTIVE REGIONS = {len(regions)}")
 
               raw_cues = []
@@ -600,7 +641,7 @@ jobs:
                   raw_cues.extend(parts or [{"start": region["start"], "end": region["end"]}])
               log(f"RAW PIXEL CUES = {len(raw_cues)}")
 
-              refined = refine_presence_boundaries(raw_cues, presence_threshold, video_info)
+              refined = refine_presence_boundaries(raw_cues, global_threshold, video_info)
 
               final = []
               for index, cue in enumerate(refined):
@@ -683,10 +724,12 @@ jobs:
                       raise RuntimeError("FFmpeg timing scan failed:\n" + stderr_data.decode("utf-8", errors="replace"))
 
               scores = [s["score"] for s in samples]
-              presence_threshold = calculate_presence_threshold(scores)
+              global_threshold = calculate_global_threshold(scores)
+              local_active_mask = calculate_local_active(scores)
 
-              # compute_active_regions() sẽ điền sample["active"] cho từng frame.
-              timing_cues_regions_probe = compute_active_regions(samples, presence_threshold, duration)
+              # compute_active_regions() sẽ điền sample["active"] cho từng frame
+              # (dùng để tính change_threshold bên dưới).
+              compute_active_regions(samples, global_threshold, local_active_mask, duration)
 
               active_changes = [
                   samples[i]["change"]
@@ -695,7 +738,7 @@ jobs:
               ]
               change_threshold = calculate_change_threshold(active_changes)
 
-              timing_cues = build_timing_cues(samples, presence_threshold, change_threshold, video_info)
+              timing_cues = build_timing_cues(samples, global_threshold, local_active_mask, change_threshold, video_info)
 
               log(f"\nFINAL TIMING CUES = {len(timing_cues)}")
               for cue in timing_cues:
@@ -705,10 +748,12 @@ jobs:
                   "video": video_info,
                   "scan_fps": float(SCAN_FPS),
                   "roi": {"y1": int(roi_y1), "y2": int(roi_y2)},
-                  "presence_threshold": float(presence_threshold),
+                  "global_threshold": float(global_threshold),
                   "change_threshold": float(change_threshold),
                   "max_short_gap": float(MAX_SHORT_GAP),
                   "min_cue_duration": float(MIN_CUE_DURATION),
+                  "local_window_seconds": float(LOCAL_WINDOW_SECONDS),
+                  "local_margin": float(LOCAL_MARGIN),
                   "samples": samples,
                   "cues": timing_cues,
               })
@@ -993,6 +1038,8 @@ jobs:
           MIDPOINT_OFFSET: ${{ inputs.midpoint_offsets }}
           MAX_SHORT_GAP: ${{ inputs.max_short_gap }}
           MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
+          LOCAL_WINDOW_SECONDS: ${{ inputs.local_window_seconds }}
+          LOCAL_MARGIN: ${{ inputs.local_margin }}
           SAVE_DEBUG_FRAMES: ${{ inputs.save_debug_frames }}
         run: |
           set -euxo pipefail
