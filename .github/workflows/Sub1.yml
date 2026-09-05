@@ -526,12 +526,22 @@ jobs:
           # ---------------------------------------------------------------
           # SPLIT REGION BY TEXT CHANGE
           # ---------------------------------------------------------------
+          #
+          # Lưu ý quan trọng: KHÔNG được chặn điểm đổi chữ đầu tiên chỉ vì nó
+          # xảy ra gần lúc vùng "có sub" vừa bắt đầu. Một câu ngắn (3-4 chữ)
+          # đổi ngay sang câu dài phía sau — không có khoảng đen ở giữa — sẽ
+          # tạo ra điểm đổi chữ rất sớm trong vùng. min_gap_frames chỉ dùng để
+          # chống trùng lặp giữa các frame liên tiếp của CÙNG một lần đổi chữ
+          # (do rung/nhiễu), không phải để tạo "vùng chết" ngay đầu region.
+          # ---------------------------------------------------------------
           def find_change_boundaries(samples, region, change_threshold):
               boundaries = []
               start_index = region["start_index"]
               end_index = region["end_index"]
-              last_boundary = start_index
-              min_gap_frames = max(2, int(SCAN_FPS * 0.25))
+              min_gap_frames = max(1, int(round(SCAN_FPS * 0.12)))
+
+              # Khởi tạo đủ xa để không chặn điểm đổi chữ đầu tiên.
+              last_boundary = start_index - min_gap_frames - 1
 
               for i in range(start_index + 1, end_index + 1):
                   previous = samples[i - 1]
