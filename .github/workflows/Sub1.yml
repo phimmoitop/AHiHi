@@ -1850,13 +1850,7 @@ jobs:
                           "time"
                       ]
 
-                  )
-
-                  +
-
-                  1.0
-                  /
-                  SCAN_FPS
+                  ) + 1.0 / SCAN_FPS
 
 
                   end = min(
