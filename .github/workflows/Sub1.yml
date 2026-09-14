@@ -45,15 +45,15 @@ on:
         type: string
 
       cluster_diff_threshold:
-        description: "Ngưỡng khác biệt nội dung (Jaccard distance trên text-mask, 0-1) để coi là 2 câu sub khác nhau. Thấp = nhạy hơn, dễ tách câu liền nhau nhưng dễ tách nhầm do rung/nén; cao = ít tách nhầm nhưng dễ gộp 2 câu giống layout"
+        description: "Ngưỡng khác biệt nội dung (Jaccard distance trên text-mask, 0-1) để coi là 2 câu sub khác nhau. Đặt cao hơn hẳn mức rung/nhiễu nén hình thông thường (~0.10-0.20) để không tách vụn 1 câu sub đứng yên thành nhiều đoạn nhỏ. Thấp quá sẽ tách vụn (như 150 đoạn cho video 30s); cao quá sẽ gộp 2 câu liền nhau có layout giống nhau"
         required: false
-        default: "0.30"
+        default: "0.45"
         type: string
 
-      cluster_confirm_frames:
-        description: "Số frame liên tiếp phải xác nhận nội dung mới trước khi chấp nhận đó là 1 câu sub mới (chống nhiễu 1 frame). Đặt =1 nếu muốn bắt cả câu cực ngắn chỉ tồn tại 1 frame"
+      cluster_confirm_seconds:
+        description: "Thời gian (giây) một nội dung mới phải giữ ổn định liên tục trước khi được công nhận là 1 câu sub mới, để chống nhiễu vài khung hình do nén video. Tính theo giây (không theo số khung) nên không cần đổi khi scan_fps thay đổi. Tăng lên nếu vẫn còn bị tách vụn; giảm xuống (kể cả 0 để tắt) nếu bị gộp mất câu ngắn/liền nhau"
         required: false
-        default: "2"
+        default: "0.10"
         type: string
 
       local_window_seconds:
@@ -227,6 +227,7 @@ jobs:
           import math
           import subprocess
           from pathlib import Path
+          from collections import deque
           
           import cv2
           import numpy as np
@@ -260,9 +261,17 @@ jobs:
           # Content-based cue splitting (replaces the old isolated-spike change
           # detector). See module docstring: this is a VideoSubFinder/PySceneDetect
           # style reference-mask comparator, not a peak-picker, so it can split two
-          # cues that touch with zero blank frame between them.
-          CLUSTER_DIFF_THRESHOLD = env_float("CLUSTER_DIFF_THRESHOLD", "0.30")
-          CLUSTER_CONFIRM_FRAMES = max(1, int(env_float("CLUSTER_CONFIRM_FRAMES", "2")))
+          # cues that touch with zero blank frame between them. The reference is a
+          # rolling majority vote (see majority_mask), not a frozen first frame, so
+          # ordinary encode noise on an unchanged subtitle doesn't accumulate into a
+          # false split. CLUSTER_DIFF_THRESHOLD is intentionally set well above
+          # typical frame-to-frame encode jitter (~0.10-0.20 Jaccard distance) so
+          # only an actual change in the rendered characters crosses it.
+          CLUSTER_DIFF_THRESHOLD = env_float("CLUSTER_DIFF_THRESHOLD", "0.45")
+          # Expressed in seconds (not frames) so it behaves the same at 24, 25, 30,
+          # or 60 native FPS. A candidate boundary must hold for this long before
+          # being accepted, which is what absorbs multi-frame noise bursts.
+          CLUSTER_CONFIRM_SECONDS = env_float("CLUSTER_CONFIRM_SECONDS", "0.10")
           
           # Subtitle band. Keep a little more vertical area than before to avoid clipping
           # top strokes/second lines.
@@ -651,6 +660,23 @@ jobs:
                       })
               return result
           
+          def majority_mask(sig_list):
+              """
+              Combine several matched frames of the SAME cue into one stable
+              reference mask via per-pixel majority vote. Anti-aliasing/compression
+              jitter flips a small, shifting minority of pixels frame to frame, so a
+              majority vote across a short rolling window cancels that noise out
+              instead of letting it accumulate against a frozen first-frame
+              reference (which was the actual cause of the over-splitting: a
+              reference that never updates slowly drifts "different enough" from
+              later frames of the very same subtitle purely from encode noise).
+              """
+              if len(sig_list) == 1:
+                  return sig_list[0]
+              stacked = np.stack([s > 0.5 for s in sig_list], axis=0)
+              votes = stacked.sum(axis=0)
+              return (votes >= (len(sig_list) / 2.0)).astype(np.float32)
+          
           def jaccard_diff(sig_a, sig_b):
               """
               Symmetric-difference (Jaccard) distance between two binary text-masks,
@@ -672,28 +698,29 @@ jobs:
               inter = int(np.count_nonzero(a & b))
               return float(1.0 - inter / union)
           
-          def cluster_split_indexes(samples, start_index, end_index, diff_threshold, confirm_frames):
+          def cluster_split_indexes(samples, start_index, end_index, diff_threshold, confirm_frames, ref_window=6):
               """
-              Reference-cluster segmentation (VideoSubFinder/PySceneDetect style).
+              Reference-cluster segmentation (VideoSubFinder/PySceneDetect style),
+              with a rolling majority-vote reference (see majority_mask) so ordinary
+              encode noise on an unchanged subtitle does not accumulate into a false
+              boundary.
           
-              Walk the run frame by frame, keeping a "reference" text-mask for the
-              current cue. As soon as a frame's content drifts far enough from that
-              reference, it becomes a *candidate* new cue; the candidate must hold
-              for `confirm_frames` consecutive frames (matched against itself, not
-              the old reference) before it is accepted, which absorbs 1-frame
-              flicker from compression/motion blur without needing a duration
-              cutoff. Because the comparison is against the running content
-              reference rather than a "quiet vs. spike" pattern, back-to-back cues
-              with zero blank frames between them are still split correctly, and a
-              cue that is only 2-3 frames long is still captured (its start index is
-              recorded the moment the content changes, not after the confirmation
-              delay).
+              A candidate new cue must hold together for `confirm_frames`
+              consecutive frames (matched against the candidate's own frames, not
+              the old reference) before it is accepted — this absorbs 1-2 frame
+              flicker without a duration cutoff. Its start index is recorded the
+              moment the content changes, not after the confirmation delay, so
+              short cues are not truncated. Because the comparison is against a
+              running content reference rather than a "quiet vs. spike" pattern,
+              back-to-back cues with zero blank frames between them still split
+              correctly.
               """
               if end_index < start_index:
                   return []
           
               boundaries = []
-              ref_sig = samples[start_index]["mask_sig"]
+              recent = deque([samples[start_index]["mask_sig"]], maxlen=ref_window)
+              ref_sig = recent[-1]
               pending = None
           
               for i in range(start_index + 1, end_index + 1):
@@ -701,22 +728,27 @@ jobs:
                   d = jaccard_diff(ref_sig, sig)
           
                   if d <= diff_threshold:
+                      recent.append(sig)
+                      ref_sig = majority_mask(list(recent))
                       pending = None
                       continue
           
                   if pending is None or jaccard_diff(pending["sig"], sig) > diff_threshold:
-                      pending = {"start": i, "sig": sig, "count": 1}
+                      pending = {"start": i, "sig": sig, "count": 1, "frames": [sig]}
                   else:
                       pending["count"] += 1
+                      pending["frames"].append(sig)
           
                   if pending["count"] >= confirm_frames:
                       boundaries.append(pending["start"])
-                      ref_sig = pending["sig"]
+                      recent = deque(pending["frames"], maxlen=ref_window)
+                      ref_sig = majority_mask(list(recent))
                       pending = None
           
               return boundaries
           
-          def split_region_by_clusters(samples, region, duration, scan_fps, diff_threshold, confirm_frames):
+          def split_region_by_clusters(samples, region, duration, scan_fps, diff_threshold, confirm_seconds):
+              confirm_frames = max(1, int(round(confirm_seconds * scan_fps)))
               boundaries = cluster_split_indexes(
                   samples, region["start_index"], region["end_index"],
                   diff_threshold, confirm_frames
@@ -795,14 +827,14 @@ jobs:
                   prev = current
               return frames
           
-          def fine_rescan_region(video_info, region_start, region_end, diff_threshold, confirm_frames):
+          def fine_rescan_region(video_info, region_start, region_end, diff_threshold, confirm_seconds):
               """
               Safety-net rescan for long active regions: re-samples the region at
               FINE_RESCAN_FPS and runs the *same* Jaccard reference-cluster splitter
               used on the native-FPS pass (cluster_split_indexes), just with more
               frames to work with. This exists because native FPS (often 24-30) can
-              occasionally straddle a very fast cut so the confirm-frames check
-              never gets enough evidence; the high-FPS pass gives it more samples to
+              occasionally straddle a very fast cut so the confirm-time check never
+              gets enough evidence; the high-FPS pass gives it more samples to
               confirm against without changing the underlying logic.
               """
               fine_frames = extract_region_frames(
@@ -815,9 +847,7 @@ jobs:
               if len(fine_frames) < 5:
                   return None
           
-              # A little more sensitive than the native pass since we have denser
-              # samples to confirm a boundary with.
-              fine_confirm = max(confirm_frames, int(round(confirm_frames * FINE_RESCAN_FPS / 25.0)))
+              fine_confirm = max(1, int(round(confirm_seconds * FINE_RESCAN_FPS)))
               boundaries = cluster_split_indexes(
                   fine_frames, 0, len(fine_frames) - 1, diff_threshold, fine_confirm
               )
@@ -941,7 +971,7 @@ jobs:
               for region in regions:
                   parts = split_region_by_clusters(
                       samples, region, duration, scan_fps,
-                      CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_FRAMES
+                      CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS
                   )
                   if not parts:
                       parts = [{"start": region["start"], "end": region["end"]}]
@@ -958,7 +988,7 @@ jobs:
                       )
                       fine_parts = fine_rescan_region(
                           video_info, region["start"], region["end"],
-                          CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_FRAMES
+                          CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS
                       )
                       if fine_parts and len(fine_parts) > len(parts):
                           fine_rescan_count += 1
@@ -1092,7 +1122,7 @@ jobs:
           
               log(
                   f"CLUSTER DIFF THRESHOLD = {CLUSTER_DIFF_THRESHOLD:.4f} "
-                  f"CONFIRM FRAMES = {CLUSTER_CONFIRM_FRAMES}"
+                  f"CONFIRM SECONDS = {CLUSTER_CONFIRM_SECONDS}"
               )
           
               timing_cues = build_timing_cues(
@@ -1129,7 +1159,7 @@ jobs:
                   "roi": {"y1": int(roi_y1), "y2": int(roi_y2)},
                   "global_threshold": float(global_threshold),
                   "cluster_diff_threshold": float(CLUSTER_DIFF_THRESHOLD),
-                  "cluster_confirm_frames": int(CLUSTER_CONFIRM_FRAMES),
+                  "cluster_confirm_seconds": float(CLUSTER_CONFIRM_SECONDS),
                   "max_short_gap": float(MAX_SHORT_GAP),
                   "min_cue_duration": float(MIN_CUE_DURATION),
                   "local_window_seconds": float(LOCAL_WINDOW_SECONDS),
@@ -1204,7 +1234,7 @@ jobs:
           MAX_SHORT_GAP: ${{ inputs.max_short_gap }}
           MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
           CLUSTER_DIFF_THRESHOLD: ${{ inputs.cluster_diff_threshold }}
-          CLUSTER_CONFIRM_FRAMES: ${{ inputs.cluster_confirm_frames }}
+          CLUSTER_CONFIRM_SECONDS: ${{ inputs.cluster_confirm_seconds }}
           LOCAL_WINDOW_SECONDS: ${{ inputs.local_window_seconds }}
           LOCAL_MARGIN: ${{ inputs.local_margin }}
           SAVE_DEBUG_FRAMES: ${{ inputs.save_debug_frames }}
