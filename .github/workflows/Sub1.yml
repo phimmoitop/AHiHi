@@ -45,7 +45,7 @@ on:
         type: string
 
       cluster_diff_threshold:
-        description: "Ngưỡng khác biệt nội dung (Jaccard distance trên text-mask, 0-1) để coi là 2 câu sub khác nhau. Đặt cao hơn hẳn mức rung/nhiễu nén hình thông thường (~0.10-0.20) để không tách vụn 1 câu sub đứng yên thành nhiều đoạn nhỏ. Thấp quá sẽ tách vụn (như 150 đoạn cho video 30s); cao quá sẽ gộp 2 câu liền nhau có layout giống nhau"
+        description: "Ngưỡng khác biệt nội dung (0-1) để coi là 2 câu sub khác nhau, đo bằng lượng mực chữ + hình dạng phân bố mực theo cột (không so pixel thô nên ít nhạy với rung/nội suy hình). Xem log 'DIFF DISTRIBUTION' hoặc 'diff_distribution' trong timing.json để chỉnh theo số liệu thật của video thay vì đoán. Thấp quá sẽ tách vụn 1 câu thành nhiều đoạn nhỏ; cao quá sẽ gộp 2 câu liền nhau"
         required: false
         default: "0.45"
         type: string
@@ -201,15 +201,23 @@ jobs:
             recovery to avoid losing frames to anti-aliasing/compression flicker;
           - within a presence run, decide "same cue vs. new cue" the way VideoSubFinder's
             sub-image comparator and PySceneDetect's content-detector do it: keep a
-            reference text-mask for the run and measure a Jaccard/symmetric-difference
-            distance between the reference and each new frame's text-mask, instead of only
-            looking for a quiet gap between cues. This is what makes back-to-back cues with
-            *zero* blank frame between them splittable, and it is what previously caused
-            "câu liền quá nó gộp hết vào với nhau" (adjacent lines with no gap got merged),
-            because the old peak-picking change-detector required a strong isolated spike
-            with quiet neighbours on both sides;
-          - a short run-length confirmation (default 2 frames) before accepting a new
-            cluster suppresses 1-frame compression/motion-blur flicker so it doesn't get
+            reference for the run and measure how far each new frame's subtitle content
+            has drifted from it, instead of only looking for a quiet gap between cues.
+            The content signature is built the way a person would compare two subtitle
+            images by eye — crop tightly to just the ink (no background padding),
+            binarize, then compare total ink amount, crop width, and the column-wise
+            ink profile (shape) — rather than a raw pixel-by-pixel mask diff, because
+            raw pixel comparison is extremely sensitive to sub-pixel rendering/encode
+            jitter on text that hasn't actually changed. This is what makes back-to-back
+            cues with *zero* blank frame between them splittable, and it is what
+            previously caused "câu liền quá nó gộp hết vào với nhau" (adjacent lines with
+            no gap got merged), because the old peak-picking change-detector required a
+            strong isolated spike with quiet neighbours on both sides;
+          - the reference is a rolling average over recent matched frames of the same
+            cue (not a frozen first frame), so ordinary encode noise doesn't slowly
+            accumulate into a false split;
+          - a short run-length confirmation (default 0.10s) before accepting a new
+            cluster suppresses brief compression/motion-blur flicker so it doesn't get
             mistaken for a real cue boundary, without needing a hard minimum-cue-duration
             cutoff that used to discard genuinely short one-word cues
             ("câu ngắn quá nó bỏ qua");
@@ -260,14 +268,19 @@ jobs:
           
           # Content-based cue splitting (replaces the old isolated-spike change
           # detector). See module docstring: this is a VideoSubFinder/PySceneDetect
-          # style reference-mask comparator, not a peak-picker, so it can split two
-          # cues that touch with zero blank frame between them. The reference is a
-          # rolling majority vote (see majority_mask), not a frozen first frame, so
-          # ordinary encode noise on an unchanged subtitle doesn't accumulate into a
-          # false split. CLUSTER_DIFF_THRESHOLD is intentionally set well above
-          # typical frame-to-frame encode jitter (~0.10-0.20 Jaccard distance) so
-          # only an actual change in the rendered characters crosses it.
-          CLUSTER_DIFF_THRESHOLD = env_float("CLUSTER_DIFF_THRESHOLD", "0.45")
+          # style reference comparator, not a peak-picker, so it can split two cues
+          # that touch with zero blank frame between them. The reference is a
+          # rolling average of ink amount / width / column-ink-profile (see
+          # build_text_signature + average_signature) over recent matched frames,
+          # not a frozen first frame, so ordinary encode jitter on an unchanged
+          # subtitle doesn't accumulate into a false split. Because the signature
+          # aggregates ink spatially (per-column sums, total ink, crop width)
+          # instead of comparing raw pixels 1:1, sub-pixel rendering jitter washes
+          # out far more than it did with a raw pixel-mask comparison, so this
+          # threshold should need much less per-video tuning — check the
+          # "DIFF DISTRIBUTION" log / diff_distribution in timing.json if it still
+          # does.
+          CLUSTER_DIFF_THRESHOLD = env_float("CLUSTER_DIFF_THRESHOLD", "0.30")
           # Expressed in seconds (not frames) so it behaves the same at 24, 25, 30,
           # or 60 native FPS. A candidate boundary must hold for this long before
           # being accepted, which is what absorbs multi-frame noise bursts.
@@ -287,9 +300,8 @@ jobs:
           # Temporal / segmentation.
           MIN_SEGMENT_DURATION = 0.10
           
-          # Signature size: enough horizontal detail to distinguish adjacent Chinese cues.
-          SIGNATURE_WIDTH = 320
-          SIGNATURE_HEIGHT = 80
+          # Column-profile resolution for the ink/shape signature (build_text_signature).
+          TEXT_PROFILE_BINS = 96
           
           def log(message):
               print(message, flush=True)
@@ -468,69 +480,6 @@ jobs:
                   + largest_bonus
               )
           
-          def make_signature(features):
-              if features is None:
-                  return None
-          
-              mask = cv2.resize(
-                  features["mask"],
-                  (SIGNATURE_WIDTH, SIGNATURE_HEIGHT),
-                  interpolation=cv2.INTER_AREA
-              )
-              return (mask > 35).astype(np.float32)
-          
-          def make_gray_signature(features):
-              if features is None:
-                  return None
-              gray = cv2.resize(
-                  features["gray"],
-                  (SIGNATURE_WIDTH, SIGNATURE_HEIGHT),
-                  interpolation=cv2.INTER_AREA
-              ).astype(np.float32) / 255.0
-              return gray
-          
-          def signature_distance(a, b):
-              if a is None or b is None:
-                  return 1.0
-              return float(np.mean(np.abs(a - b)))
-          
-          def ssim_distance(a, b):
-              """
-              Lightweight SSIM-like structural distance. No skimage dependency.
-              0 = very similar, 1 = very different.
-              """
-              if a is None or b is None:
-                  return 1.0
-          
-              a = a.astype(np.float32)
-              b = b.astype(np.float32)
-              mu_a = cv2.GaussianBlur(a, (0, 0), 1.2)
-              mu_b = cv2.GaussianBlur(b, (0, 0), 1.2)
-          
-              sigma_a = cv2.GaussianBlur(a * a, (0, 0), 1.2) - mu_a * mu_a
-              sigma_b = cv2.GaussianBlur(b * b, (0, 0), 1.2) - mu_b * mu_b
-              sigma_ab = cv2.GaussianBlur(a * b, (0, 0), 1.2) - mu_a * mu_b
-          
-              c1 = 0.01 ** 2
-              c2 = 0.03 ** 2
-              ssim_map = (
-                  ((2 * mu_a * mu_b + c1) * (2 * sigma_ab + c2))
-                  / ((mu_a * mu_a + mu_b * mu_b + c1) * (sigma_a + sigma_b + c2) + 1e-9)
-              )
-              score = float(np.mean(np.clip(ssim_map, -1.0, 1.0)))
-              return float(np.clip((1.0 - score) * 0.5, 0.0, 1.0))
-          
-          def temporal_change(prev, current):
-              if prev is None or current is None:
-                  return 1.0
-          
-              mask_change = signature_distance(prev["mask_sig"], current["mask_sig"])
-              gray_change = ssim_distance(prev["gray_sig"], current["gray_sig"])
-          
-              # Mask difference is most subtitle-specific. SSIM adds sensitivity to
-              # outline/anti-aliasing changes that binarization can miss.
-              return float(0.72 * mask_change + 0.28 * gray_change)
-          
           def calculate_global_threshold(scores):
               values = np.asarray(scores, dtype=np.float64)
               values = values[np.isfinite(values)]
@@ -660,50 +609,111 @@ jobs:
                       })
               return result
           
-          def majority_mask(sig_list):
+          def crop_to_ink(mask):
               """
-              Combine several matched frames of the SAME cue into one stable
-              reference mask via per-pixel majority vote. Anti-aliasing/compression
-              jitter flips a small, shifting minority of pixels frame to frame, so a
-              majority vote across a short rolling window cancels that noise out
-              instead of letting it accumulate against a frozen first-frame
-              reference (which was the actual cause of the over-splitting: a
-              reference that never updates slowly drifts "different enough" from
-              later frames of the very same subtitle purely from encode noise).
+              Crop a binary text mask tightly to its actual ink (the "cắt đúng chiều
+              cao của sub" step) so background/padding pixels never dilute the
+              comparison. Returns None when there's no ink at all (blank frame).
               """
-              if len(sig_list) == 1:
-                  return sig_list[0]
-              stacked = np.stack([s > 0.5 for s in sig_list], axis=0)
-              votes = stacked.sum(axis=0)
-              return (votes >= (len(sig_list) / 2.0)).astype(np.float32)
+              ys, xs = np.nonzero(mask)
+              if xs.size < 3:
+                  return None
+              x0, x1 = int(xs.min()), int(xs.max())
+              y0, y1 = int(ys.min()), int(ys.max())
+              return mask[y0:y1 + 1, x0:x1 + 1]
           
-          def jaccard_diff(sig_a, sig_b):
+          def build_text_signature(features, profile_bins=TEXT_PROFILE_BINS):
               """
-              Symmetric-difference (Jaccard) distance between two binary text-masks,
-              0 = identical content, 1 = completely different. This is the same core
-              idea VideoSubFinder uses to decide "is this still the same subtitle
-              image" — comparing the text pixels directly — rather than a blurred
-              global similarity score. It is far more sensitive to a genuine change
-              in characters than a temporal-diff spike, and it does not require a
-              quiet frame on either side, so two cues that touch with no gap between
-              them still register a clear jump in this distance.
+              "Chữ trắng, nền đen" signature, but instead of comparing raw pixels
+              (which is what made the old Jaccard-on-resized-mask metric so noisy —
+              a 1px sub-pixel rendering jitter shifts which exact pixels are lit
+              without changing the text at all), this measures three things that
+              only change when the CONTENT changes:
+                - ink: total lit-pixel count in the tight crop (roughly proportional
+                  to character count/stroke weight — a different sentence almost
+                  always has a different amount of ink);
+                - width: the crop's horizontal extent (a different sentence is
+                  almost always a different length);
+                - profile: the column-wise ink histogram (how much ink sits in each
+                  horizontal slice of the crop, resampled to a fixed number of bins)
+                  — this is the actual shape of the text, and because it sums pixels
+                  down each column it washes out single-pixel jitter that would
+                  otherwise dominate a raw pixel-to-pixel comparison.
               """
-              if sig_a is None or sig_b is None:
+              if features is None:
+                  return {"ink": 0.0, "width": 0.0, "profile": None}
+          
+              crop = crop_to_ink(features["mask"])
+              if crop is None:
+                  return {"ink": 0.0, "width": 0.0, "profile": None}
+          
+              ink = float(np.count_nonzero(crop))
+              col_profile = crop.astype(np.float32).sum(axis=0)
+              total = float(col_profile.sum())
+              if total <= 0:
+                  return {"ink": 0.0, "width": 0.0, "profile": None}
+          
+              norm = (col_profile / total).reshape(1, -1)
+              resized = cv2.resize(
+                  norm, (profile_bins, 1), interpolation=cv2.INTER_AREA
+              ).flatten().astype(np.float32)
+          
+              return {
+                  "ink": ink,
+                  "width": float(crop.shape[1]),
+                  "profile": resized,
+              }
+          
+          def signature_diff(a, b):
+              """
+              0 = same subtitle content, 1 = clearly different. Blank-vs-text always
+              counts as maximally different; two blanks are identical.
+              """
+              if a is None or b is None:
                   return 1.0
-              a = sig_a > 0.5
-              b = sig_b > 0.5
-              union = int(np.count_nonzero(a | b))
-              if union == 0:
+              if a["ink"] <= 0 and b["ink"] <= 0:
                   return 0.0
-              inter = int(np.count_nonzero(a & b))
-              return float(1.0 - inter / union)
+              if a["ink"] <= 0 or b["ink"] <= 0:
+                  return 1.0
           
-          def cluster_split_indexes(samples, start_index, end_index, diff_threshold, confirm_frames, ref_window=6):
+              ink_diff = abs(a["ink"] - b["ink"]) / max(a["ink"], b["ink"])
+              width_diff = abs(a["width"] - b["width"]) / max(a["width"], b["width"], 1.0)
+          
+              corr = 0.0
+              if a["profile"] is not None and b["profile"] is not None:
+                  pa, pb = a["profile"], b["profile"]
+                  if np.std(pa) > 1e-6 and np.std(pb) > 1e-6:
+                      corr = float(np.corrcoef(pa, pb)[0, 1])
+              if not np.isfinite(corr):
+                  corr = 0.0
+              profile_diff = (1.0 - corr) / 2.0
+          
+              return float(0.5 * profile_diff + 0.3 * ink_diff + 0.2 * width_diff)
+          
+          def average_signature(sig_list):
+              """
+              Rolling reference for a cluster of matched frames: average the ink,
+              width, and profile of recent frames belonging to the same cue. This is
+              what lets ordinary frame-to-frame jitter cancel out over a run instead
+              of drifting a frozen single-frame reference away from later frames of
+              the very same subtitle.
+              """
+              valid = [s for s in sig_list if s["profile"] is not None]
+              if not valid:
+                  return sig_list[-1]
+              profiles = np.stack([s["profile"] for s in valid], axis=0)
+              return {
+                  "ink": float(np.mean([s["ink"] for s in valid])),
+                  "width": float(np.mean([s["width"] for s in valid])),
+                  "profile": profiles.mean(axis=0).astype(np.float32),
+              }
+          
+          def cluster_split_indexes(samples, start_index, end_index, diff_threshold, confirm_frames, ref_window=6, diag=None):
               """
               Reference-cluster segmentation (VideoSubFinder/PySceneDetect style),
-              with a rolling majority-vote reference (see majority_mask) so ordinary
-              encode noise on an unchanged subtitle does not accumulate into a false
-              boundary.
+              with a rolling-average ink/profile reference (see average_signature)
+              so ordinary encode noise on an unchanged subtitle does not accumulate
+              into a false boundary.
           
               A candidate new cue must hold together for `confirm_frames`
               consecutive frames (matched against the candidate's own frames, not
@@ -714,26 +724,33 @@ jobs:
               running content reference rather than a "quiet vs. spike" pattern,
               back-to-back cues with zero blank frames between them still split
               correctly.
+          
+              If `diag` (a list) is passed, every frame's diff against the current
+              reference is appended to it — this is how we build a real
+              distribution of "same cue" vs "different cue" diff values per video,
+              instead of guessing a global threshold blind.
               """
               if end_index < start_index:
                   return []
           
               boundaries = []
-              recent = deque([samples[start_index]["mask_sig"]], maxlen=ref_window)
+              recent = deque([samples[start_index]["text_sig"]], maxlen=ref_window)
               ref_sig = recent[-1]
               pending = None
           
               for i in range(start_index + 1, end_index + 1):
-                  sig = samples[i]["mask_sig"]
-                  d = jaccard_diff(ref_sig, sig)
+                  sig = samples[i]["text_sig"]
+                  d = signature_diff(ref_sig, sig)
+                  if diag is not None:
+                      diag.append(float(d))
           
                   if d <= diff_threshold:
                       recent.append(sig)
-                      ref_sig = majority_mask(list(recent))
+                      ref_sig = average_signature(list(recent))
                       pending = None
                       continue
           
-                  if pending is None or jaccard_diff(pending["sig"], sig) > diff_threshold:
+                  if pending is None or signature_diff(pending["sig"], sig) > diff_threshold:
                       pending = {"start": i, "sig": sig, "count": 1, "frames": [sig]}
                   else:
                       pending["count"] += 1
@@ -742,16 +759,16 @@ jobs:
                   if pending["count"] >= confirm_frames:
                       boundaries.append(pending["start"])
                       recent = deque(pending["frames"], maxlen=ref_window)
-                      ref_sig = majority_mask(list(recent))
+                      ref_sig = average_signature(list(recent))
                       pending = None
           
               return boundaries
           
-          def split_region_by_clusters(samples, region, duration, scan_fps, diff_threshold, confirm_seconds):
+          def split_region_by_clusters(samples, region, duration, scan_fps, diff_threshold, confirm_seconds, diag=None):
               confirm_frames = max(1, int(round(confirm_seconds * scan_fps)))
               boundaries = cluster_split_indexes(
                   samples, region["start_index"], region["end_index"],
-                  diff_threshold, confirm_frames
+                  diff_threshold, confirm_frames, diag=diag
               )
               indexes = [region["start_index"], *boundaries, region["end_index"] + 1]
           
@@ -811,26 +828,22 @@ jobs:
                   roi = np.frombuffer(chunk, dtype=np.uint8).reshape((roi_height, roi_width, 3))
                   feat = subtitle_features(roi)
                   score = subtitle_score(feat)
-                  mask_sig = make_signature(feat)
-                  current = {
-                      "mask_sig": mask_sig,
-                      "gray_sig": make_gray_signature(feat),
-                  }
-                  change = temporal_change(prev, current)
+                  text_sig = build_text_signature(feat)
+                  change = signature_diff(prev, text_sig) if prev is not None else 1.0
           
                   frames.append({
                       "time": float(seek + i / fps),
                       "score": float(score),
                       "change": float(change),
-                      "mask_sig": mask_sig,
+                      "text_sig": text_sig,
                   })
-                  prev = current
+                  prev = text_sig
               return frames
           
           def fine_rescan_region(video_info, region_start, region_end, diff_threshold, confirm_seconds):
               """
               Safety-net rescan for long active regions: re-samples the region at
-              FINE_RESCAN_FPS and runs the *same* Jaccard reference-cluster splitter
+              FINE_RESCAN_FPS and runs the *same* content reference-cluster splitter
               used on the native-FPS pass (cluster_split_indexes), just with more
               frames to work with. This exists because native FPS (often 24-30) can
               occasionally straddle a very fast cut so the confirm-time check never
@@ -967,11 +980,12 @@ jobs:
           
               raw_cues = []
               fine_rescan_count = 0
+              diff_diag = []
           
               for region in regions:
                   parts = split_region_by_clusters(
                       samples, region, duration, scan_fps,
-                      CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS
+                      CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS, diag=diff_diag
                   )
                   if not parts:
                       parts = [{"start": region["start"], "end": region["end"]}]
@@ -1002,6 +1016,32 @@ jobs:
                   f"(fine-rescanned regions = {fine_rescan_count})"
               )
           
+              # Real distribution of frame-to-reference diffs for THIS video, so the
+              # threshold can be tuned from actual numbers instead of guessing blind.
+              # If most diffs sit well under CLUSTER_DIFF_THRESHOLD but you're still
+              # seeing merged cues, the threshold is too high — lower it toward p90/p95.
+              # If p95/p99 are already close to or above the threshold with no merging
+              # problem, the threshold has little headroom and false splits are likely.
+              diff_stats = {}
+              if diff_diag:
+                  arr = np.asarray(diff_diag, dtype=np.float64)
+                  diff_stats = {
+                      "count": int(arr.size),
+                      "p50": float(np.percentile(arr, 50)),
+                      "p75": float(np.percentile(arr, 75)),
+                      "p90": float(np.percentile(arr, 90)),
+                      "p95": float(np.percentile(arr, 95)),
+                      "p99": float(np.percentile(arr, 99)),
+                      "max": float(np.max(arr)),
+                  }
+                  log(
+                      "DIFF DISTRIBUTION (frame-to-reference, all active frames): "
+                      f"p50={diff_stats['p50']:.3f} p75={diff_stats['p75']:.3f} "
+                      f"p90={diff_stats['p90']:.3f} p95={diff_stats['p95']:.3f} "
+                      f"p99={diff_stats['p99']:.3f} max={diff_stats['max']:.3f} "
+                      f"| threshold={CLUSTER_DIFF_THRESHOLD:.3f}"
+                  )
+          
               refined = refine_presence_boundaries(
                   raw_cues, global_threshold, video_info
               )
@@ -1019,7 +1059,7 @@ jobs:
                       "duration": float(en - st),
                       "midpoint": float((st + en) / 2.0),
                   })
-              return final
+              return final, diff_stats
           
           def timing_pass():
               video_info = probe_video()
@@ -1081,21 +1121,18 @@ jobs:
                       feat = subtitle_features(roi)
                       score = subtitle_score(feat)
           
-                      current = {
-                          "mask_sig": make_signature(feat),
-                          "gray_sig": make_gray_signature(feat),
-                      }
-                      change = temporal_change(previous, current)
+                      text_sig = build_text_signature(feat)
+                      change = signature_diff(previous, text_sig) if previous is not None else 1.0
           
                       samples.append({
                           "index": int(index),
                           "time": float(index / actual_scan_fps),
                           "score": float(score),
                           "change": float(change),
-                          "mask_sig": current["mask_sig"],
+                          "text_sig": text_sig,
                       })
           
-                      previous = current
+                      previous = text_sig
                       index += 1
                       pbar.update(1)
               finally:
@@ -1125,7 +1162,7 @@ jobs:
                   f"CONFIRM SECONDS = {CLUSTER_CONFIRM_SECONDS}"
               )
           
-              timing_cues = build_timing_cues(
+              timing_cues, diff_stats = build_timing_cues(
                   samples,
                   global_threshold,
                   local_active_mask,
@@ -1142,11 +1179,11 @@ jobs:
                       )
                   )
           
-              # mask_sig is a per-frame 320x80 array kept only for in-memory clustering;
-              # dumping it into timing.json would make the debug artifact huge and slow
-              # to write, so log only the lightweight scalar fields per sample.
+              # text_sig holds a numpy profile array kept only for in-memory
+              # clustering; dumping it into timing.json would bloat the debug
+              # artifact, so log only the lightweight scalar fields per sample.
               samples_for_json = [
-                  {k: v for k, v in s.items() if k != "mask_sig"}
+                  {k: v for k, v in s.items() if k != "text_sig"}
                   for s in samples
               ]
           
@@ -1160,6 +1197,7 @@ jobs:
                   "global_threshold": float(global_threshold),
                   "cluster_diff_threshold": float(CLUSTER_DIFF_THRESHOLD),
                   "cluster_confirm_seconds": float(CLUSTER_CONFIRM_SECONDS),
+                  "diff_distribution": diff_stats,
                   "max_short_gap": float(MAX_SHORT_GAP),
                   "min_cue_duration": float(MIN_CUE_DURATION),
                   "local_window_seconds": float(LOCAL_WINDOW_SECONDS),
