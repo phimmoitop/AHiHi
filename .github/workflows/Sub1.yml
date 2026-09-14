@@ -1062,6 +1062,7 @@ jobs:
                           "time": float(index / actual_scan_fps),
                           "score": float(score),
                           "change": float(change),
+                          "mask_sig": current["mask_sig"],
                       })
           
                       previous = current
@@ -1111,6 +1112,14 @@ jobs:
                       )
                   )
           
+              # mask_sig is a per-frame 320x80 array kept only for in-memory clustering;
+              # dumping it into timing.json would make the debug artifact huge and slow
+              # to write, so log only the lightweight scalar fields per sample.
+              samples_for_json = [
+                  {k: v for k, v in s.items() if k != "mask_sig"}
+                  for s in samples
+              ]
+          
               write_json(TIMING_JSON, {
                   "video": video_info,
                   "scan_fps_requested": float(SCAN_FPS),
@@ -1124,7 +1133,7 @@ jobs:
                   "max_short_gap": float(MAX_SHORT_GAP),
                   "min_cue_duration": float(MIN_CUE_DURATION),
                   "local_window_seconds": float(LOCAL_WINDOW_SECONDS),
-                  "samples": samples,
+                  "samples": samples_for_json,
                   "cues": timing_cues,
               })
           
