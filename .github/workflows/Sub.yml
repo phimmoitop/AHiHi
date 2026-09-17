@@ -1,21 +1,69 @@
-name: Bilibili → Vietnamese
+name: Bilibili → Vietnamese (All-in-one: Audio ASR → Translate → Render)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Bilibili video URL (phải đúng video đã dùng để tạo file SRT)"
+        description: "Bilibili video URL"
         required: true
         type: string
 
-      srt_file:
-        description: "Đường dẫn file SRT tiếng Trung đã có sẵn trong repo (kết quả từ workflow trích xuất timing/ASR)"
+      # ---------- ASR ----------
+      model_size:
+        description: "faster-whisper model. medium = cân bằng tốt trên CPU runner; large-v3 chính xác nhất nhưng chậm hơn nhiều (video dài có thể chạm timeout)"
         required: false
-        default: "chinese.srt"
+        default: "medium"
+        type: choice
+        options:
+          - "small"
+          - "medium"
+          - "large-v3"
+
+      language:
+        description: "Mã ngôn ngữ nguồn (zh = tiếng Trung). Để trống để tự nhận diện"
+        required: false
+        default: "zh"
         type: string
 
+      beam_size:
+        description: "Beam size khi decode. Tăng lên (8-10) cho kết quả ổn định hơn nhưng chậm hơn"
+        required: false
+        default: "5"
+        type: string
+
+      vad_min_silence_ms:
+        description: "Silero VAD: khoảng lặng tối thiểu (ms) để coi là ranh giới giữa 2 đoạn thoại"
+        required: false
+        default: "300"
+        type: string
+
+      max_word_gap:
+        description: "Khoảng lặng (giây) giữa 2 từ để buộc tách thành 2 câu sub. Giảm nếu 2 câu bị gộp, tăng nếu 1 câu bị tách vụn"
+        required: false
+        default: "0.45"
+        type: string
+
+      max_cue_duration:
+        description: "Cue dài quá giá trị này (giây) sẽ bị ép tách tại khoảng lặng gần nhất"
+        required: false
+        default: "6.0"
+        type: string
+
+      speech_pad_seconds:
+        description: "Nới thêm đầu/cuối mỗi cue (giây)"
+        required: false
+        default: "0.08"
+        type: string
+
+      min_cue_duration:
+        description: "Loại bỏ cue ngắn hơn giá trị này (giây)"
+        required: false
+        default: "0.12"
+        type: string
+
+      # ---------- BLUR ----------
       blur_mode:
-        description: "auto = tự dò vùng sub cứng bằng cách so sánh frame LÚC CÓ SUB với frame LÚC KHÔNG CÓ SUB (dựa vào chính timing trong SRT, không cần OCR). manual = dùng 4 giá trị tỉ lệ bên dưới"
+        description: "auto = tự dò vùng sub cứng bằng cách so sánh frame LÚC CÓ THOẠI với frame LÚC IM LẶNG (dùng chính timing vừa tạo, không cần OCR). manual = dùng 3 tỉ lệ bên dưới"
         required: false
         default: "auto"
         type: choice
@@ -24,29 +72,30 @@ on:
           - "manual"
 
       manual_x_ratio:
-        description: "manual: bề rộng vùng blur theo tỉ lệ chiều rộng video (vd 0.70 = 70%, canh giữa)"
+        description: "manual: bề rộng vùng blur theo tỉ lệ chiều rộng video (canh giữa)"
         required: false
         default: "0.70"
         type: string
 
       manual_y1_ratio:
-        description: "manual: mép trên vùng blur theo tỉ lệ chiều cao video"
+        description: "manual: mép trên vùng blur theo tỉ lệ chiều cao"
         required: false
         default: "0.86"
         type: string
 
       manual_y2_ratio:
-        description: "manual: mép dưới vùng blur theo tỉ lệ chiều cao video"
+        description: "manual: mép dưới vùng blur theo tỉ lệ chiều cao"
         required: false
         default: "0.96"
         type: string
 
       detect_samples:
-        description: "auto: số frame lấy mẫu cho mỗi nhóm (có sub / không sub). Tăng lên nếu dò vùng chưa chuẩn, nhưng chậm hơn"
+        description: "auto: số frame lấy mẫu mỗi nhóm (có sub / không sub)"
         required: false
         default: "40"
         type: string
 
+      # ---------- RENDER ----------
       font_size:
         description: "Cỡ chữ phụ đề tiếng Việt"
         required: false
@@ -54,10 +103,13 @@ on:
         type: string
 
       blur_sigma:
-        description: "Độ mạnh của blur che sub cứng cũ"
+        description: "Độ mạnh blur che sub cứng cũ"
         required: false
         default: "9"
         type: string
+
+permissions:
+  contents: write
 
 jobs:
   process:
@@ -65,10 +117,14 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: "1"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -118,9 +174,7 @@ jobs:
             cp "$FONT_TTF" "$HOME/.local/share/fonts/"
             fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1 || true
             FONT_FAMILY="$(fc-scan --format '%{family[0]}\n' "$FONT_TTF" 2>/dev/null | head -1 | tr -d '\r')"
-            if [ -z "$FONT_FAMILY" ]; then
-              FONT_FAMILY="Arial"
-            fi
+            [ -z "$FONT_FAMILY" ] && FONT_FAMILY="Arial"
           else
             FONT_FAMILY="Arial"
           fi
@@ -128,31 +182,26 @@ jobs:
           echo "FONT_FAMILY=$FONT_FAMILY" >> "$GITHUB_ENV"
           echo "Font su dung: $FONT_FAMILY"
 
-      # PaddleOCR/PaddlePaddle đã được bỏ hoàn toàn: không còn bước OCR nào.
-      # Chỉ giữ opencv cho bước dò vùng blur (so sánh pixel, không nhận dạng chữ).
+      # Khong con PaddleOCR/PaddlePaddle. opencv chi dung de do vung blur (so pixel,
+      # khong nhan dang chu).
       - name: Install Python packages
         run: |
           set -eux
           python -m pip install --upgrade pip
-          python -m pip install yt-dlp numpy==1.26.4 opencv-python-headless==4.10.0.84 tqdm pysubs2 google-genai
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install \
+            yt-dlp \
+            numpy==1.26.4 \
+            opencv-python-headless==4.10.0.84 \
+            tqdm \
+            pysubs2 \
+            faster-whisper \
+            google-genai
 
       - name: Prepare directories
         run: |
           set -eux
           mkdir -p work output
-
-      - name: Verify source SRT exists
-        env:
-          SRT_FILE: ${{ inputs.srt_file }}
-        run: |
-          set -euo pipefail
-          if [ ! -s "$SRT_FILE" ]; then
-            echo "::error::Khong tim thay file SRT: $SRT_FILE"
-            ls -la
-            exit 1
-          fi
-          echo "Dung SRT: $SRT_FILE"
-          head -40 "$SRT_FILE"
 
       - name: Prepare Bilibili cookies
         env:
@@ -171,7 +220,8 @@ jobs:
           BILIBILI_URL: ${{ inputs.url }}
         run: |
           set -euo pipefail
-          yt-dlp --cookies work/cookies.txt --no-playlist --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
+          yt-dlp --cookies work/cookies.txt --no-playlist \
+            --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
             --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
             --add-header "Referer: https://www.bilibili.com/" \
             --add-header "Origin: https://www.bilibili.com" \
@@ -179,30 +229,47 @@ jobs:
             --merge-output-format mp4 \
             -o "work/source.%(ext)s" \
             "$BILIBILI_URL"
+
+          if [ ! -f work/source.mp4 ]; then
+            echo "::error::work/source.mp4 khong ton tai."
+            find work -maxdepth 2 -type f -ls
+            exit 1
+          fi
           ls -lh work/
+
+      - name: Extract audio track
+        run: |
+          set -eux
+          ffmpeg -hide_banner -loglevel error -y \
+            -i work/source.mp4 -vn -ac 1 -ar 16000 -c:a pcm_s16le \
+            work/audio.wav
+          ls -lh work/audio.wav
 
       - name: Create processing script
         run: |
           cat > process.py <<'PY'
           """
-          SRT -> Vietnamese video.
+          ALL-IN-ONE: video -> sub tieng Trung (tu AUDIO) -> dich -> xoa sub cung -> render.
 
-          Khac voi ban cu: KHONG con OCR. Timing va text tieng Trung lay truc tiep
-          tu file SRT da co san (ket qua cua workflow trich xuat timing/ASR), nen:
-            - khong can PaddleOCR/PaddlePaddle (tiet kiem rat nhieu thoi gian cai dat
-              va thoi gian chay),
-            - text dua di dich la text ban da xac nhan la chuan, khong bi loi OCR,
-            - timing khong bi lam tron theo OCR_FPS nua.
+          Toan bo pipeline khong dung OCR o bat ky buoc nao.
 
-          Van de con lai: ban cu suy ra vung blur (de xoa sub cung) tu bounding box
-          cua OCR. Khong co OCR thi phai xac dinh vung do bang cach khac. O day dung
-          chinh timing trong SRT lam "nhan":
-            - lay N frame tai giua cac cue  -> chac chan CO sub cung tren man hinh,
-            - lay N frame trong cac khoang trong giua 2 cue -> chac chan KHONG co sub,
-            - voi moi pixel o nua duoi khung hinh, do tan suat no "sang/co net chu"
-              trong nhom CO sub tru tan suat trong nhom KHONG co sub.
-          Pixel nao chi sang khi co sub -> do chinh la vung chu. Cach nay khong can
-          nhan dang chu, chi can biet luc nao sub bat/tat, ma dieu do SRT da cho san.
+          1) ASR: faster-whisper (CTranslate2 port cua Whisper) voi Silero VAD
+             (vad_filter=True) loc nhac nen/khoang cam, tra ve timestamp theo TUNG TU
+             (word_timestamps=True). Text tieng Trung lay luon tu day, nen khong con
+             loi nhan dang ky tu nhu OCR.
+          2) Gom tu thanh cue: khong gop qua ranh gioi segment cua Whisper; trong 1
+             segment thi tach tai khoang lang >= MAX_WORD_GAP, va ep tach neu cue dai
+             qua MAX_CUE_DURATION (y tuong "regroup" giong stable-ts).
+          3) Do vung sub cung de blur: dung chinh timing vua tao lam nhan. Lay N frame
+             o GIUA cac cue (chac chan co sub cung) va N frame trong KHOANG LANG giua
+             2 cue (chac chan khong co sub), roi voi moi pixel nua duoi khung hinh tinh
+             tan suat "co net chu sang" cua nhom ON tru nhom OFF. Pixel nao chi sang
+             khi co thoai -> do la vung chu. Khong can nhan dang chu.
+          4) Dich tung batch bang Gemini, co retry + bat dong bi bo sot.
+          5) Render: blur vung sub cung (co feather) roi burn phu de tieng Viet.
+
+          Luu y: buoc 3 gia dinh sub cung xuat hien dung luc co thoai. Dung cho phim/
+          drama Bilibili thong thuong.
           """
 
           import os, re, json, time, random, subprocess
@@ -212,37 +279,40 @@ jobs:
           import numpy as np
           import pysubs2
           from tqdm import tqdm
+          from faster_whisper import WhisperModel
           from google import genai
           from google.genai import types
 
           WORK = Path("work")
           OUTPUT = Path("output")
           VIDEO = WORK / "source.mp4"
+          AUDIO = WORK / "audio.wav"
 
-          SRT_FILE = Path(os.environ.get("SRT_FILE", "chinese.srt"))
-          BLUR_MODE = os.environ.get("BLUR_MODE", "auto").strip().lower()
-          MANUAL_X_RATIO = float(os.environ.get("MANUAL_X_RATIO", "0.70"))
-          MANUAL_Y1_RATIO = float(os.environ.get("MANUAL_Y1_RATIO", "0.86"))
-          MANUAL_Y2_RATIO = float(os.environ.get("MANUAL_Y2_RATIO", "0.96"))
-          DETECT_SAMPLES = int(float(os.environ.get("DETECT_SAMPLES", "40")))
-          FONT_NAME = os.environ.get("FONT_NAME", "Arial")
-          FONT_SIZE = int(float(os.environ.get("FONT_SIZE", "40")))
-          BLUR_SIGMA = int(float(os.environ.get("BLUR_SIGMA", "9")))
+          def env_f(name, default):
+              return float(os.environ.get(name, default) or default)
 
-          LETTER_SPACING = -1
-          OUTLINE_SIZE = 1
-          SHADOW_SIZE = 0
-          BOX_BACKGROUND_ENABLED = True
-          BOX_BACKGROUND_ALPHA = 140
+          def env_s(name, default):
+              return (os.environ.get(name) or default).strip()
 
-          # Vung tim sub cung: chi xet nua duoi khung hinh.
+          # ---- ASR ----
+          MODEL_SIZE = env_s("MODEL_SIZE", "medium")
+          LANGUAGE = os.environ.get("LANGUAGE", "").strip() or None
+          BEAM_SIZE = int(env_f("BEAM_SIZE", "5"))
+          VAD_MIN_SILENCE_MS = int(env_f("VAD_MIN_SILENCE_MS", "300"))
+          MAX_WORD_GAP = env_f("MAX_WORD_GAP", "0.45")
+          MAX_CUE_DURATION = env_f("MAX_CUE_DURATION", "6.0")
+          SPEECH_PAD_SECONDS = env_f("SPEECH_PAD_SECONDS", "0.08")
+          MIN_CUE_DURATION = env_f("MIN_CUE_DURATION", "0.12")
+
+          # ---- BLUR ----
+          BLUR_MODE = env_s("BLUR_MODE", "auto").lower()
+          MANUAL_X_RATIO = env_f("MANUAL_X_RATIO", "0.70")
+          MANUAL_Y1_RATIO = env_f("MANUAL_Y1_RATIO", "0.86")
+          MANUAL_Y2_RATIO = env_f("MANUAL_Y2_RATIO", "0.96")
+          DETECT_SAMPLES = int(env_f("DETECT_SAMPLES", "40"))
           DETECT_Y_RATIO = 0.55
-          # Pixel phai "sang khi co sub" nhieu hon "sang khi khong co sub" it nhat
-          # bao nhieu (ty le frame) thi moi tinh la pixel chu.
           DETECT_MIN_DELTA = 0.22
-          # Nguong cat bien cua bounding box theo profile hang/cot.
           PROFILE_CUT = 0.08
-
           BLUR_PAD_X = 10
           BLUR_PAD_Y_TOP = 8
           BLUR_PAD_Y_BOTTOM = 10
@@ -250,11 +320,21 @@ jobs:
           MIN_BLUR_HEIGHT = 24
           BLUR_FEATHER_RATIO = 0.25
           MIN_FEATHER_PX = 6
+          BLUR_SIGMA = int(env_f("BLUR_SIGMA", "9"))
 
+          # ---- STYLE ----
+          FONT_NAME = env_s("FONT_NAME", "Arial")
+          FONT_SIZE = int(env_f("FONT_SIZE", "40"))
+          LETTER_SPACING = -1
+          OUTLINE_SIZE = 1
+          SHADOW_SIZE = 0
+          BOX_BACKGROUND_ENABLED = True
+          BOX_BACKGROUND_ALPHA = 140
+
+          # ---- GEMINI ----
           GEMINI_MODEL = "gemini-2.5-flash"
           GEMINI_BATCH_SIZE = 100
           GEMINI_MAX_RETRIES = 10
-
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
 
@@ -285,77 +365,131 @@ jobs:
               cmd = ["ffprobe", "-hide_banner", "-v", "error", "-select_streams", "v:0",
                      "-show_entries", "stream=width,height,r_frame_rate",
                      "-show_entries", "format=duration", "-of", "json", str(VIDEO)]
-              result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-              data = json.loads(result.stdout)
-              stream = data["streams"][0]
-              width, height = int(stream["width"]), int(stream["height"])
-              a, b = stream["r_frame_rate"].split("/")
-              fps = float(a) / float(b)
-              duration = float(data["format"]["duration"])
-              return width, height, fps, duration
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+              data = json.loads(r.stdout)
+              st = data["streams"][0]
+              a, b = st["r_frame_rate"].split("/")
+              return (int(st["width"]), int(st["height"]),
+                      float(a) / float(b), float(data["format"]["duration"]))
 
 
           def get_frame(time_sec):
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, time_sec):.3f}",
                      "-i", str(VIDEO), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"]
-              result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              if result.returncode != 0 or not result.stdout:
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if r.returncode != 0 or not r.stdout:
                   return None
-              data = np.frombuffer(result.stdout, dtype=np.uint8)
-              return cv2.imdecode(data, cv2.IMREAD_COLOR)
+              return cv2.imdecode(np.frombuffer(r.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
           # ============================================================
-          # 1. DOC SRT
+          # BUOC 1-2: ASR -> CUE TIENG TRUNG
           # ============================================================
-          def load_cues():
-              subs = pysubs2.load(str(SRT_FILE), encoding="utf-8")
-              cues = []
-              for ev in subs.events:
-                  text = re.sub(r"\s+", " ", ev.plaintext.replace("\\N", " ")).strip()
-                  if not text:
-                      continue
-                  start = ev.start / 1000.0
-                  end = ev.end / 1000.0
-                  if end <= start:
-                      continue
-                  cues.append({"start": start, "end": end, "text": text})
+          def transcribe():
+              log(f"Loading faster-whisper model={MODEL_SIZE}")
+              model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 
-              cues.sort(key=lambda c: c["start"])
-              log(f"SRT CUES: {len(cues)}")
-              if not cues:
-                  raise RuntimeError(f"Khong doc duoc cue nao tu {SRT_FILE}")
+              log(f"Transcribing (language={LANGUAGE or 'auto'}, beam_size={BEAM_SIZE}) ...")
+              segments, info = model.transcribe(
+                  str(AUDIO),
+                  language=LANGUAGE,
+                  beam_size=BEAM_SIZE,
+                  word_timestamps=True,
+                  vad_filter=True,
+                  vad_parameters=dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS),
+                  condition_on_previous_text=False,
+              )
+              log(f"Detected language={info.language} (p={info.language_probability:.3f})")
 
-              placeholder = sum(1 for c in cues if re.fullmatch(r"\[TIMING_\d+\]", c["text"]))
-              if placeholder:
-                  raise RuntimeError(
-                      f"{placeholder}/{len(cues)} cue van con la placeholder [TIMING_xxxx]. "
-                      "File SRT nay chi co timing, chua co text tieng Trung."
-                  )
+              words = []
+              for seg in segments:
+                  seg_words = list(seg.words or [])
+                  if not seg_words:
+                      words.append({"start": float(seg.start), "end": float(seg.end),
+                                    "text": seg.text.strip(), "seg": float(seg.start)})
+                      continue
+                  for w in seg_words:
+                      words.append({"start": float(w.start), "end": float(w.end),
+                                    "text": str(w.word).strip(), "seg": float(seg.start)})
+
+              log(f"ASR words = {len(words)}")
+              return words
+
+
+          def group_words(words):
+              cues, current, prev = [], None, None
+
+              def flush():
+                  nonlocal current
+                  if current and current["words"]:
+                      cues.append(current)
+                  current = None
+
+              for w in words:
+                  gap = (w["start"] - prev["end"]) if prev else None
+                  new_seg = prev is not None and w["seg"] != prev["seg"]
+
+                  start_new = current is None or new_seg
+                  if not start_new and gap is not None and gap >= MAX_WORD_GAP:
+                      start_new = True
+                  if (not start_new and current
+                          and (w["end"] - current["start"]) > MAX_CUE_DURATION
+                          and gap is not None and gap > 0.02):
+                      start_new = True
+
+                  if start_new:
+                      flush()
+                      current = {"start": w["start"], "end": w["end"], "words": [w]}
+                  else:
+                      current["end"] = w["end"]
+                      current["words"].append(w)
+                  prev = w
+
+              flush()
               return cues
 
 
+          def finalize_cues(grouped, duration):
+              padded = []
+              for c in grouped:
+                  st = max(0.0, c["start"] - SPEECH_PAD_SECONDS)
+                  en = min(duration, c["end"] + SPEECH_PAD_SECONDS)
+                  text = re.sub(r"\s+", "", "".join(w["text"] for w in c["words"])).strip()
+                  if text:
+                      padded.append({"start": st, "end": en, "text": text})
+
+              padded.sort(key=lambda c: (c["start"], c["end"]))
+              final = []
+              for c in padded:
+                  st, en = c["start"], c["end"]
+                  if final and st < final[-1]["end"]:
+                      mid = (st + final[-1]["end"]) / 2.0
+                      final[-1]["end"] = mid
+                      st = mid
+                  if en - st < MIN_CUE_DURATION:
+                      continue
+                  final.append({"start": st, "end": en, "text": c["text"]})
+
+              log(f"CHINESE CUES = {len(final)}")
+              if not final:
+                  raise RuntimeError("ASR khong tao duoc cue nao.")
+              return final
+
+
           # ============================================================
-          # 2. DO VUNG SUB CUNG (khong OCR)
+          # BUOC 3: DO VUNG SUB CUNG (khong OCR)
           # ============================================================
           def text_mask(gray):
-              """Mask cac cau truc sang/manh giong chu (tophat + nguong)."""
               kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 9))
               tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
               _, mask = cv2.threshold(tophat, 22, 255, cv2.THRESH_BINARY)
-              bright = cv2.inRange(gray, 165, 255)
-              return cv2.bitwise_and(mask, bright)
+              return cv2.bitwise_and(mask, cv2.inRange(gray, 165, 255))
 
 
           def sample_times(cues, duration, n):
-              """Thoi diem CHAC CHAN co sub va CHAC CHAN khong co sub."""
-              on_times, off_times = [], []
+              on_times = [(c["start"] + c["end"]) / 2.0 for c in cues if c["end"] - c["start"] >= 0.25]
 
-              for c in cues:
-                  if c["end"] - c["start"] >= 0.25:
-                      on_times.append((c["start"] + c["end"]) / 2.0)
-
-              prev_end = 0.0
+              off_times, prev_end = [], 0.0
               for c in cues:
                   gap = c["start"] - prev_end
                   if gap >= 0.8:
@@ -379,38 +513,30 @@ jobs:
               log(f"DETECT: {len(on_times)} frame CO sub / {len(off_times)} frame KHONG sub")
 
               if len(on_times) < 5 or len(off_times) < 3:
-                  log("DETECT: khong du mau, chuyen sang manual ratio.")
+                  log("DETECT: khong du mau -> dung manual ratio.")
                   return None
 
               def accumulate(times, label):
-                  acc = None
-                  used = 0
+                  acc, used = None, 0
                   for t in tqdm(times, desc=label):
                       frame = get_frame(t)
                       if frame is None:
                           continue
-                      crop = frame[y0:height, 0:width]
-                      gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                      mask = (text_mask(gray) > 0).astype(np.float32)
-                      acc = mask if acc is None else acc + mask
+                      gray = cv2.cvtColor(frame[y0:height, 0:width], cv2.COLOR_BGR2GRAY)
+                      m = (text_mask(gray) > 0).astype(np.float32)
+                      acc = m if acc is None else acc + m
                       used += 1
-                  if used == 0:
-                      return None
-                  return acc / used
+                  return None if used == 0 else acc / used
 
               on_freq = accumulate(on_times, "Sampling ON")
               off_freq = accumulate(off_times, "Sampling OFF")
               if on_freq is None or off_freq is None:
                   return None
 
-              delta = on_freq - off_freq
-              band = (delta >= DETECT_MIN_DELTA).astype(np.float32)
+              band = ((on_freq - off_freq) >= DETECT_MIN_DELTA).astype(np.float32)
               if band.sum() < 50:
-                  log("DETECT: tin hieu qua yeu, chuyen sang manual ratio.")
+                  log("DETECT: tin hieu qua yeu -> dung manual ratio.")
                   return None
-
-              row_profile = band.sum(axis=1)
-              col_profile = band.sum(axis=0)
 
               def bounds(profile):
                   peak = profile.max()
@@ -419,23 +545,18 @@ jobs:
                   idx = np.nonzero(profile >= peak * PROFILE_CUT)[0]
                   return int(idx.min()), int(idx.max())
 
-              rb = bounds(row_profile)
-              cb = bounds(col_profile)
+              rb = bounds(band.sum(axis=1))
+              cb = bounds(band.sum(axis=0))
               if rb is None or cb is None:
                   return None
 
-              y1 = y0 + rb[0]
-              y2 = y0 + rb[1]
-              x1, x2 = cb
-
-              log(f"DETECT RAW BAND: x={x1}..{x2} y={y1}..{y2}")
-              return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+              result = {"x1": cb[0], "y1": y0 + rb[0], "x2": cb[1], "y2": y0 + rb[1]}
+              log(f"DETECT RAW BAND: {result}")
+              return result
 
 
           def build_blur_region(cues, width, height, fps, duration):
-              detected = None
-              if BLUR_MODE == "auto":
-                  detected = detect_subtitle_band(cues, width, height, duration)
+              detected = detect_subtitle_band(cues, width, height, duration) if BLUR_MODE == "auto" else None
 
               if detected is None:
                   band_w = int(width * MANUAL_X_RATIO)
@@ -449,27 +570,21 @@ jobs:
                   x2 = detected["x2"] + BLUR_PAD_X
                   y1 = detected["y1"] - BLUR_PAD_Y_TOP
                   y2 = detected["y2"] + BLUR_PAD_Y_BOTTOM
-                  # Sub luon canh giua -> ep doi xung qua truc giua cho dep va an toan.
                   half = max(width / 2 - x1, x2 - width / 2)
                   x1 = int(width / 2 - half)
                   x2 = int(width / 2 + half)
                   source = "auto"
 
-              x1 = max(0, x1)
-              x2 = min(width, x2)
-              y1 = max(0, y1)
-              y2 = min(height - MIN_BOTTOM_GAP, y2)
-
+              x1 = max(0, x1); x2 = min(width, x2)
+              y1 = max(0, y1); y2 = min(height - MIN_BOTTOM_GAP, y2)
               if y2 - y1 < MIN_BLUR_HEIGHT:
                   y2 = min(height - MIN_BOTTOM_GAP, y1 + MIN_BLUR_HEIGHT)
-
-              if (x2 - x1) % 2 != 0:
+              if (x2 - x1) % 2:
                   x2 -= 1
-              if (y2 - y1) % 2 != 0:
+              if (y2 - y1) % 2:
                   y2 -= 1
 
-              feather = int((x2 - x1) * BLUR_FEATHER_RATIO)
-              feather = max(MIN_FEATHER_PX, feather)
+              feather = max(MIN_FEATHER_PX, int((x2 - x1) * BLUR_FEATHER_RATIO))
               feather = min(feather, (x2 - x1) // 2, (y2 - y1) // 2)
               feather = max(MIN_FEATHER_PX, feather)
 
@@ -484,53 +599,39 @@ jobs:
               return region
 
 
-          # ============================================================
-          # 3. MASK + DICH + ASS + RENDER  (giu nguyen logic ban cu)
-          # ============================================================
           def create_feather_mask(region):
               width, height = region["width"], region["height"]
               x1, y1, x2, y2 = region["x1"], region["y1"], region["x2"], region["y2"]
               feather = region["feather_px"]
 
-              crop_x1 = max(0, x1 - feather)
-              crop_y1 = max(0, y1 - feather)
-              crop_x2 = min(width, x2 + feather)
-              crop_y2 = min(height, y2 + feather)
+              cx1 = max(0, x1 - feather); cy1 = max(0, y1 - feather)
+              cx2 = min(width, x2 + feather); cy2 = min(height, y2 + feather)
+              if (cx2 - cx1) % 2:
+                  cx2 -= 1
+              if (cy2 - cy1) % 2:
+                  cy2 -= 1
 
-              if (crop_x2 - crop_x1) % 2 != 0:
-                  crop_x2 -= 1
-              if (crop_y2 - crop_y1) % 2 != 0:
-                  crop_y2 -= 1
+              cw, ch = cx2 - cx1, cy2 - cy1
+              if cw <= 0 or ch <= 0:
+                  raise RuntimeError(f"Invalid mask size: {cw}x{ch}")
 
-              crop_w = crop_x2 - crop_x1
-              crop_h = crop_y2 - crop_y1
-              if crop_w <= 0 or crop_h <= 0:
-                  raise RuntimeError(f"Invalid mask size: {crop_w}x{crop_h}")
-
-              mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
-              inner_x1 = max(0, x1 - crop_x1)
-              inner_y1 = max(0, y1 - crop_y1)
-              inner_x2 = min(crop_w, x2 - crop_x1)
-              inner_y2 = min(crop_h, y2 - crop_y1)
-              mask[inner_y1:inner_y2, inner_x1:inner_x2] = 255
-
-              ksize = int(feather) * 2 + 1
-              sigma = max(1.0, feather / 2.0)
-              mask = cv2.GaussianBlur(mask, (ksize, ksize), sigma)
+              mask = np.zeros((ch, cw), dtype=np.uint8)
+              mask[max(0, y1 - cy1):min(ch, y2 - cy1), max(0, x1 - cx1):min(cw, x2 - cx1)] = 255
+              mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), max(1.0, feather / 2.0))
 
               mask_path = WORK / "blur_mask.png"
               if not cv2.imwrite(str(mask_path), mask):
                   raise RuntimeError("Khong ghi duoc blur_mask.png")
 
-              region["crop_x1"] = int(crop_x1)
-              region["crop_y1"] = int(crop_y1)
-              region["crop_x2"] = int(crop_x2)
-              region["crop_y2"] = int(crop_y2)
-
-              log(f"FEATHER MASK: crop=({crop_x1},{crop_y1})-({crop_x2},{crop_y2}) size={crop_w}x{crop_h} feather={feather}px")
+              region.update({"crop_x1": int(cx1), "crop_y1": int(cy1),
+                             "crop_x2": int(cx2), "crop_y2": int(cy2)})
+              log(f"FEATHER MASK: crop=({cx1},{cy1})-({cx2},{cy2}) size={cw}x{ch} feather={feather}px")
               return mask_path
 
 
+          # ============================================================
+          # BUOC 4: DICH
+          # ============================================================
           def get_random_gemini_client():
               key = random.choice(GEMINI_API_KEYS)
               return genai.Client(api_key=key), key
@@ -540,10 +641,9 @@ jobs:
               for attempt in range(max_retries):
                   wait = 6 * (2 ** attempt)
                   client, key = get_random_gemini_client()
-                  key_idx = GEMINI_API_KEYS.index(key) + 1
-                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Key #{key_idx} | {time.strftime('%H:%M:%S')}")
+                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Key #{GEMINI_API_KEYS.index(key) + 1} | {time.strftime('%H:%M:%S')}")
                   try:
-                      t_start = time.time()
+                      t0 = time.time()
                       response = client.models.generate_content(
                           model=GEMINI_MODEL,
                           contents=prompt_text,
@@ -552,13 +652,12 @@ jobs:
                               temperature=0.3,
                           )
                       )
-                      elapsed = time.time() - t_start
-                      log(f"<< NHAN KET QUA - Thanh cong sau {elapsed:.1f}s")
+                      log(f"<< NHAN KET QUA - Thanh cong sau {time.time() - t0:.1f}s")
                       return response.text
                   except Exception as e:
-                      error_str = str(e)
-                      log(f"<< LOI API: {error_str}")
-                      if any(code in error_str for code in ("503", "429", "500", "UNAVAILABLE")):
+                      err = str(e)
+                      log(f"<< LOI API: {err}")
+                      if any(c in err for c in ("503", "429", "500", "UNAVAILABLE")):
                           log(f"   Server ban/qua tai/limit. Doi key va cho {wait}s...")
                           time.sleep(wait)
                       else:
@@ -568,110 +667,103 @@ jobs:
 
 
           def parse_translated(response_text):
-              translated_dict = {}
+              out = {}
               for line in response_text.strip().split("\n"):
                   if "]" in line:
                       try:
-                          parts = line.split("]", 1)
-                          idx_str = parts[0].replace("[", "").strip()
-                          val = parts[1].strip()
-                          if val == "...":
-                              val = ""
-                          translated_dict[int(idx_str)] = val
+                          head, val = line.split("]", 1)
+                          val = val.strip()
+                          out[int(head.replace("[", "").strip())] = "" if val == "..." else val
                       except Exception:
                           pass
-              return translated_dict
+              return out
 
 
           def translate_cues(cues):
               if not GEMINI_API_KEYS:
                   raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
 
-              total_lines = len(cues)
-              total_batches = (total_lines + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
-              log(f"BAT DAU DICH - {total_lines} dong / {total_batches} batch")
+              total = len(cues)
+              total_batches = (total + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
+              log(f"BAT DAU DICH - {total} dong / {total_batches} batch")
 
               results = []
-
-              for i in range(0, total_lines, GEMINI_BATCH_SIZE):
+              for i in range(0, total, GEMINI_BATCH_SIZE):
                   batch = cues[i:i + GEMINI_BATCH_SIZE]
-                  batch_num = (i // GEMINI_BATCH_SIZE) + 1
-                  log(f"[BATCH {batch_num}/{total_batches}] Dong {i + 1}-{min(i + GEMINI_BATCH_SIZE, total_lines)}")
+                  bn = i // GEMINI_BATCH_SIZE + 1
+                  log(f"[BATCH {bn}/{total_batches}] Dong {i + 1}-{min(i + GEMINI_BATCH_SIZE, total)}")
 
-                  prompt_text = ""
-                  for idx, cue in enumerate(batch):
-                      prompt_text += f"[{idx}] {cue['text'].strip() or '...'}\n"
-
+                  prompt_text = "".join(f"[{idx}] {c['text'].strip() or '...'}\n" for idx, c in enumerate(batch))
                   log(">> NOI DUNG GUI LEN API:")
                   for line in prompt_text.strip().split("\n"):
                       log(f"   {line}")
 
                   response_text = call_gemini_with_retry(prompt_text)
                   if response_text is None:
-                      raise RuntimeError(f"[THAT BAI] Khong the dich batch {batch_num}.")
+                      raise RuntimeError(f"[THAT BAI] Khong the dich batch {bn}.")
 
                   log(">> KET QUA DICH TU AI:")
                   for line in response_text.strip().split("\n"):
                       log(f"   {line}")
 
-                  translated_dict = parse_translated(response_text)
+                  translated = parse_translated(response_text)
 
-                  missing = [idx for idx in range(len(batch)) if not translated_dict.get(idx)]
+                  missing = [idx for idx in range(len(batch)) if not translated.get(idx)]
                   if missing:
                       log(f">> CANH BAO: AI bo sot {len(missing)} dong: {missing}. Retry...")
-                      retry_prompt = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
-                      for idx in missing:
-                          retry_prompt += f"[{idx}] {batch[idx]['text'].strip() or '...'}\n"
-                      retry_prompt += "\nOutput ONLY the missing lines with their exact [index] prefix."
-                      retry_response = call_gemini_with_retry(retry_prompt)
-                      if retry_response:
+                      rp = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
+                      rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in missing)
+                      rp += "\nOutput ONLY the missing lines with their exact [index] prefix."
+                      rr = call_gemini_with_retry(rp)
+                      if rr:
                           log(">> KET QUA RETRY:")
-                          for line in retry_response.strip().split("\n"):
+                          for line in rr.strip().split("\n"):
                               log(f"   {line}")
-                          translated_dict.update(parse_translated(retry_response))
+                          translated.update(parse_translated(rr))
 
-                  fallback_count = 0
+                  fallback = 0
                   for idx, cue in enumerate(batch):
-                      if translated_dict.get(idx):
-                          vi = translated_dict[idx]
+                      if translated.get(idx):
+                          vi = translated[idx]
                       else:
                           vi = cue["text"]
-                          fallback_count += 1
+                          fallback += 1
                           log(f"   [{i + idx + 1:04d}] FALLBACK (giu nguyen goc): {cue['text']!r}")
-                      results.append({"start": cue["start"], "end": cue["end"], "text": cue["text"], "vi": vi})
+                      results.append({"start": cue["start"], "end": cue["end"],
+                                      "text": cue["text"], "vi": vi})
 
-                  if fallback_count:
-                      log(f">> Batch {batch_num}: {fallback_count} dong giu nguyen tieng Trung.")
-
-                  log(f"[BATCH {batch_num}/{total_batches}] Hoan thanh")
+                  if fallback:
+                      log(f">> Batch {bn}: {fallback} dong giu nguyen tieng Trung.")
+                  log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
                   time.sleep(3)
 
               with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
                   for idx, r in enumerate(results):
-                      zh_len, vi_len = len(r["text"]), len(r["vi"])
-                      flag = " [SUSPICIOUS]" if vi_len < zh_len * 0.6 else ""
+                      zh, vi = len(r["text"]), len(r["vi"])
+                      flag = " [SUSPICIOUS]" if vi < zh * 0.6 else ""
                       f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s{flag}\n")
-                      f.write(f"  ZH ({zh_len}): {r['text']}\n")
-                      f.write(f"  VI ({vi_len}): {r['vi']}\n\n")
+                      f.write(f"  ZH ({zh}): {r['text']}\n")
+                      f.write(f"  VI ({vi}): {r['vi']}\n\n")
 
               return results
 
 
+          # ============================================================
+          # BUOC 5: ASS + RENDER
+          # ============================================================
           def save_srt(cues, path, field):
               subs = pysubs2.SSAFile()
-              for cue in cues:
+              for c in cues:
                   subs.events.append(pysubs2.SSAEvent(
-                      start=int(cue["start"] * 1000), end=int(cue["end"] * 1000), text=cue[field]))
+                      start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c[field]))
               subs.save(str(path), encoding="utf-8")
 
 
           def create_ass(cues, region):
-              width = int(region["width"])
-              height = int(region["height"])
-              subtitle_x = (int(region["x1"]) + int(region["x2"])) // 2
-              subtitle_y = (int(region["y1"]) + int(region["y2"])) // 2
-
-              log(f"SUBTITLE STYLE Font: {FONT_NAME} Size: {FONT_SIZE} Pos: ({subtitle_x},{subtitle_y})")
+              width, height = int(region["width"]), int(region["height"])
+              sx = (int(region["x1"]) + int(region["x2"])) // 2
+              sy = (int(region["y1"]) + int(region["y2"])) // 2
+              log(f"SUBTITLE STYLE Font: {FONT_NAME} Size: {FONT_SIZE} Pos: ({sx},{sy})")
 
               subs = pysubs2.SSAFile()
               subs.info["PlayResX"] = width
@@ -695,16 +787,10 @@ jobs:
               style.marginv = 0
               subs.styles["Default"] = style
 
-              for cue in cues:
-                  text = (
-                      "{\\an5"
-                      f"\\pos({subtitle_x},{subtitle_y})"
-                      f"\\fsp{LETTER_SPACING}"
-                      "\\q2}"
-                      + cue["vi"]
-                  )
+              for c in cues:
+                  text = ("{\\an5" f"\\pos({sx},{sy})" f"\\fsp{LETTER_SPACING}" "\\q2}") + c["vi"]
                   subs.events.append(pysubs2.SSAEvent(
-                      start=int(cue["start"] * 1000), end=int(cue["end"] * 1000), text=text))
+                      start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=text))
 
               path = WORK / "vietnamese.ass"
               subs.save(str(path), encoding="utf-8")
@@ -712,7 +798,7 @@ jobs:
               invalid = [ev for ev in subs.events if ev.end <= ev.start]
               log(f"ASS EVENTS WRITTEN: {len(subs.events)} (loi end<=start: {len(invalid)})")
               if not subs.events:
-                  raise RuntimeError("Khong co event nao duoc ghi vao file .ass.")
+                  raise RuntimeError("Khong co event nao trong file .ass.")
               if invalid:
                   raise RuntimeError(f"Co {len(invalid)} event end<=start.")
               return path
@@ -725,20 +811,18 @@ jobs:
               cw, ch = cx2 - cx1, cy2 - cy1
 
               if cx1 < 0 or cy1 < 0 or cx2 > width or cy2 > height or cw <= 0 or ch <= 0:
-                  raise RuntimeError(f"Invalid feather crop region: x1={cx1} y1={cy1} x2={cx2} y2={cy2}")
-              if cw % 2 != 0 or ch % 2 != 0:
+                  raise RuntimeError(f"Invalid feather crop region: {cx1},{cy1} -> {cx2},{cy2}")
+              if cw % 2 or ch % 2:
                   raise RuntimeError(f"Crop size must be even for yuv420p: {cw}x{ch}")
 
               mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
               if mask_img is None:
                   raise RuntimeError(f"Cannot read mask: {mask_path}")
-              mask_h, mask_w = mask_img.shape[:2]
-              log(f"RENDER CROP: {cw}x{ch} | MASK: {mask_w}x{mask_h}")
-
-              if mask_w != cw or mask_h != ch:
-                  log(f"WARNING: Resize mask {mask_w}x{mask_h} -> {cw}x{ch}")
-                  mask_img = cv2.resize(mask_img, (cw, ch), interpolation=cv2.INTER_NEAREST)
-                  cv2.imwrite(str(mask_path), mask_img)
+              mh, mw = mask_img.shape[:2]
+              log(f"RENDER CROP: {cw}x{ch} | MASK: {mw}x{mh}")
+              if mw != cw or mh != ch:
+                  log(f"WARNING: Resize mask {mw}x{mh} -> {cw}x{ch}")
+                  cv2.imwrite(str(mask_path), cv2.resize(mask_img, (cw, ch), interpolation=cv2.INTER_NEAREST))
 
               ass_path = str(ass).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
 
@@ -757,7 +841,7 @@ jobs:
               if output.exists():
                   output.unlink()
 
-              cmd = [
+              subprocess.run([
                   "ffmpeg", "-hide_banner", "-y",
                   "-i", str(VIDEO),
                   "-loop", "1", "-i", str(mask_path),
@@ -768,8 +852,7 @@ jobs:
                   "-c:a", "aac", "-b:a", "192k",
                   "-movflags", "+faststart",
                   "-shortest", str(output)
-              ]
-              subprocess.run(cmd, check=True)
+              ], check=True)
 
               if not output.exists() or output.stat().st_size < 10000:
                   raise RuntimeError("Output video bat thuong.")
@@ -779,35 +862,52 @@ jobs:
           def main():
               if not VIDEO.exists():
                   raise RuntimeError(f"Video khong ton tai: {VIDEO}")
+              if not AUDIO.exists():
+                  raise RuntimeError(f"Audio khong ton tai: {AUDIO}")
 
               width, height, fps, duration = probe_video()
               log(f"VIDEO: {width}x{height} FPS={fps:.2f} Duration={duration:.2f}s")
 
-              cues = load_cues()
+              # 1-2. ASR -> cue tieng Trung
+              cues = finalize_cues(group_words(transcribe()), duration)
+              save_srt(cues, WORK / "chinese.srt", "text")
+              for i, c in enumerate(cues, 1):
+                  log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
+
+              # 3. Vung blur
               region = build_blur_region(cues, width, height, fps, duration)
               mask_path = create_feather_mask(region)
-
               (WORK / "subtitle_region.json").write_text(
                   json.dumps(region, ensure_ascii=False, indent=2), encoding="utf-8")
 
+              # 4. Dich
               translated = translate_cues(cues)
               save_srt(translated, WORK / "vietnamese.srt", "vi")
 
+              # 5. Render
               ass = create_ass(translated, region)
               output = render_video(ass, region, mask_path)
 
               log("PROCESS COMPLETE")
-              log(f"Video: {output}")
-              log(f"Vietnamese SRT: {WORK / 'vietnamese.srt'}")
+              log(f"Video        : {output}")
+              log(f"Chinese SRT  : {WORK / 'chinese.srt'}")
+              log(f"Vietnamese   : {WORK / 'vietnamese.srt'}")
 
 
           if __name__ == "__main__":
               main()
           PY
 
-      - name: Translate → Render
+      - name: ASR → Translate → Render
         env:
-          SRT_FILE: ${{ inputs.srt_file }}
+          MODEL_SIZE: ${{ inputs.model_size }}
+          LANGUAGE: ${{ inputs.language }}
+          BEAM_SIZE: ${{ inputs.beam_size }}
+          VAD_MIN_SILENCE_MS: ${{ inputs.vad_min_silence_ms }}
+          MAX_WORD_GAP: ${{ inputs.max_word_gap }}
+          MAX_CUE_DURATION: ${{ inputs.max_cue_duration }}
+          SPEECH_PAD_SECONDS: ${{ inputs.speech_pad_seconds }}
+          MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
           BLUR_MODE: ${{ inputs.blur_mode }}
           MANUAL_X_RATIO: ${{ inputs.manual_x_ratio }}
           MANUAL_Y1_RATIO: ${{ inputs.manual_y1_ratio }}
@@ -826,6 +926,8 @@ jobs:
           set -e
           ls -lh output/
           cat work/subtitle_region.json || true
+          echo "===== CHINESE SRT (head) ====="
+          head -40 work/chinese.srt || true
           ffprobe -hide_banner -v error -show_entries format=duration,size \
             -show_entries stream=codec_name,width,height -of default=noprint_wrappers=1 output/video_vi.mp4
 
