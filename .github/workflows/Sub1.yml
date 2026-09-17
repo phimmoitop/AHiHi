@@ -1,4 +1,4 @@
-name: Bilibili Hard Subtitle Extractor — Native FPS Multi-Signal Timing
+name: Bilibili Hard Subtitle Extractor — Audio/ASR Timing (faster-whisper + Silero VAD)
 
 on:
   workflow_dispatch:
@@ -8,71 +8,65 @@ on:
         required: true
         type: string
 
-      scan_fps:
-        description: "FPS timing chính. 0 = tự dùng FPS gốc của video (khuyên dùng để không bỏ frame)"
+      model_size:
+        description: "faster-whisper model. tiny/base/small = nhanh nhưng kém chính xác hơn với tiếng Trung nói nhanh/lẫn giọng vùng; medium = cân bằng tốt trên CPU của GitHub runner; large-v3 chính xác nhất nhưng chậm hơn nhiều (có thể vượt timeout job)"
         required: false
-        default: "0"
+        default: "medium"
+        type: choice
+        options:
+          - "tiny"
+          - "base"
+          - "small"
+          - "medium"
+          - "large-v3"
+
+      language:
+        description: "Mã ngôn ngữ ASR (zh = tiếng Trung). Để trống để faster-whisper tự nhận diện"
+        required: false
+        default: "zh"
         type: string
 
-      fine_rescan_fps:
-        description: "FPS quét lại các vùng dài; dùng để bắt boundary mà pass native-FPS còn bỏ sót"
+      compute_type:
+        description: "CTranslate2 compute type trên CPU. int8 nhanh nhất/tốn ít RAM nhất, đổi sang float32 nếu cần chính xác số học cao hơn (hiếm khi cần cho việc này)"
         required: false
-        default: "60"
+        default: "int8"
         type: string
 
-      fine_rescan_min_duration:
-        description: "Fine-rescan vùng dài hơn giá trị này (giây); giảm để ưu tiên bắt đủ boundary"
+      beam_size:
+        description: "Beam size khi decode. Tăng lên (vd 8-10) có thể cho timestamp/nhận diện ổn định hơn nhưng chậm hơn"
         required: false
-        default: "1.5"
+        default: "5"
         type: string
 
-      refine_radius:
-        description: "Khoảng refine quanh boundary, giây"
+      vad_min_silence_ms:
+        description: "Tham số vad_filter nội bộ của faster-whisper (dựa trên Silero VAD): khoảng lặng tối thiểu (ms) để coi là ranh giới giữa 2 đoạn thoại, dùng để loại nhạc nền/khoảng câm trước khi đưa vào ASR"
         required: false
-        default: "0.35"
+        default: "300"
         type: string
 
-      max_short_gap:
-        description: "Chỉ bridge khoảng mất tín hiệu rất ngắn (mất frame/nhiễu); để thấp để tránh gộp 2 câu qua 1 khoảng đen"
-        required: false
-        default: "0.10"
-        type: string
-
-      min_cue_duration:
-        description: "Loại bỏ cue cực ngắn sau khi timing; để rất thấp vì câu ngắn (1-2 chữ) giờ được giữ nhờ cluster-split, không còn phụ thuộc vào ngưỡng này để sống sót"
-        required: false
-        default: "0.06"
-        type: string
-
-      cluster_diff_threshold:
-        description: "Ngưỡng khác biệt nội dung (0-1) để coi là 2 câu sub khác nhau, đo bằng lượng mực chữ + hình dạng phân bố mực theo cột (không so pixel thô nên ít nhạy với rung/nội suy hình). Xem log 'DIFF DISTRIBUTION' hoặc 'diff_distribution' trong timing.json để chỉnh theo số liệu thật của video thay vì đoán. Thấp quá sẽ tách vụn 1 câu thành nhiều đoạn nhỏ; cao quá sẽ gộp 2 câu liền nhau"
+      max_word_gap:
+        description: "Khoảng lặng tối thiểu (giây) GIỮA 2 TỪ để buộc tách thành 2 câu sub khác nhau, kể cả khi cả 2 từ nằm trong cùng 1 segment mà Whisper tự nhận diện. Giảm xuống nếu 2 câu liền nhau bị gộp; tăng lên nếu 1 câu bị tách vụn giữa các từ"
         required: false
         default: "0.45"
         type: string
 
-      cluster_confirm_seconds:
-        description: "Thời gian (giây) một nội dung mới phải giữ ổn định liên tục trước khi được công nhận là 1 câu sub mới, để chống nhiễu vài khung hình do nén video. Tính theo giây (không theo số khung) nên không cần đổi khi scan_fps thay đổi. Tăng lên nếu vẫn còn bị tách vụn; giảm xuống (kể cả 0 để tắt) nếu bị gộp mất câu ngắn/liền nhau"
+      max_cue_duration:
+        description: "Nếu 1 cụm từ liên tục (không có khoảng lặng đủ lớn) kéo dài hơn giá trị này (giây), buộc tìm khoảng lặng nhỏ nhất gần giữa để tách — tránh 1 câu sub quá dài do thoại liên tục không ngắt hơi rõ"
         required: false
-        default: "0.10"
+        default: "6.0"
         type: string
 
-      local_window_seconds:
-        description: "Cửa sổ (giây) để tính nền cục bộ khi phát hiện sub yếu/ngắn (so với nền lân cận thay vì so với cả video)"
+      speech_pad_seconds:
+        description: "Nới thêm đầu/cuối mỗi cue (giây) vì mốc thời gian theo từ của Whisper đôi khi hơi khít so với lúc sub thực sự xuất hiện/biến mất trên hình"
         required: false
-        default: "2.0"
+        default: "0.08"
         type: string
 
-      local_margin:
-        description: "Biên độ tối thiểu (điểm số) để coi 1 frame là 'nổi bật hơn nền cục bộ' -> có sub"
+      min_cue_duration:
+        description: "Loại bỏ cue cực ngắn sau khi xử lý (giây)"
         required: false
-        default: "0.00006"
+        default: "0.12"
         type: string
-
-      save_debug_frames:
-        description: "Lưu frame timing để debug"
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: write
@@ -108,11 +102,12 @@ jobs:
       # ============================================================
       # SYSTEM PACKAGES
       # ============================================================
+      # No opencv/libgl needed anymore — this pass never touches video frames.
       - name: Install system packages
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libgl1 libglib2.0-0
+          sudo apt-get install -y ffmpeg
 
       # ============================================================
       # PYTHON PACKAGES
@@ -121,12 +116,12 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
+          # CPU-only torch build (small download, no CUDA needed on the runner)
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
-            numpy==1.26.4 \
-            pandas==2.2.2 \
-            opencv-python-headless==4.10.0.84 \
+            numpy \
             tqdm \
-            pysubs2 \
+            faster-whisper \
             yt-dlp
 
       # ============================================================
@@ -136,7 +131,7 @@ jobs:
         run: |
           set -euxo pipefail
           rm -rf work
-          mkdir -p work work/debug_frames
+          mkdir -p work
           rm -f timing.srt process.py
 
       # ============================================================
@@ -185,1028 +180,247 @@ jobs:
           ls -lh work/
 
       # ============================================================
+      # EXTRACT AUDIO
+      # ============================================================
+      - name: Extract audio track
+        run: |
+          set -euxo pipefail
+          # 16kHz mono PCM matches what Silero VAD / faster-whisper expect,
+          # so no internal resampling surprises.
+          ffmpeg -hide_banner -loglevel error -y \
+            -i work/source.mp4 -vn -ac 1 -ar 16000 -c:a pcm_s16le \
+            work/audio.wav
+          ls -lh work/audio.wav
+
+      # ============================================================
       # CREATE PROCESS SCRIPT
       # ============================================================
-      - name: Create subtitle extraction script
+      - name: Create subtitle timing script
         run: |
           cat > process.py <<'PY'
           """
-          TIMING ONLY — multi-signal hard-subtitle timing.
-          
-          Design borrowed from the useful timing ideas in open-source hard-sub extractors:
-          - sample every source frame (SCAN_FPS=0 => source FPS), analogous to VideOCR's
-            recommendation of frames_to_skip=0 for best timestamps;
-          - use a separate subtitle-PRESENCE signal (is there text at all) so OCR
-            recognition errors can never decide cue timing, with hysteresis + short-gap
-            recovery to avoid losing frames to anti-aliasing/compression flicker;
-          - within a presence run, decide "same cue vs. new cue" the way VideoSubFinder's
-            sub-image comparator and PySceneDetect's content-detector do it: keep a
-            reference for the run and measure how far each new frame's subtitle content
-            has drifted from it, instead of only looking for a quiet gap between cues.
-            The content signature is built the way a person would compare two subtitle
-            images by eye — crop tightly to just the ink (no background padding),
-            binarize, then compare total ink amount, crop width, and the column-wise
-            ink profile (shape) — rather than a raw pixel-by-pixel mask diff, because
-            raw pixel comparison is extremely sensitive to sub-pixel rendering/encode
-            jitter on text that hasn't actually changed. This is what makes back-to-back
-            cues with *zero* blank frame between them splittable, and it is what
-            previously caused "câu liền quá nó gộp hết vào với nhau" (adjacent lines with
-            no gap got merged), because the old peak-picking change-detector required a
-            strong isolated spike with quiet neighbours on both sides;
-          - the reference is a rolling average over recent matched frames of the same
-            cue (not a frozen first frame), so ordinary encode noise doesn't slowly
-            accumulate into a false split;
-          - a short run-length confirmation (default 0.10s) before accepting a new
-            cluster suppresses brief compression/motion-blur flicker so it doesn't get
-            mistaken for a real cue boundary, without needing a hard minimum-cue-duration
-            cutoff that used to discard genuinely short one-word cues
-            ("câu ngắn quá nó bỏ qua");
-          - a high-FPS rescan re-runs the exact same clustering logic (not a different
-            algorithm) around/within regions, so boundaries found there are consistent
-            with the native-FPS pass, then frame-level boundary refinement tightens the
-            start/end to the true first/last frame with text.
-          
-          No OCR is used in this workflow.
+          TIMING ONLY — audio/ASR-based hard-subtitle timing.
+
+          Replaces the earlier pixel-diff (hard-sub image OCR-free detection)
+          approach. That approach had to hand-tune per-video pixel thresholds
+          for text color/edges/occupancy, which is fragile across fonts,
+          outlines, busy backgrounds, and compression. Here, cue boundaries are
+          derived from the AUDIO track instead, on the assumption that hard-sub
+          cues track spoken dialogue (true for the vast majority of Bilibili
+          drama/variety hard-subs).
+
+          Pipeline, borrowing directly from well-established open-source
+          speech-timing tools rather than reinventing signal processing:
+
+          - faster-whisper (SYSTRAN/CTranslate2 port of OpenAI Whisper) does the
+            heavy lifting: it decodes the audio with its own internal Silero VAD
+            pre-filter (vad_filter=True) to strip music/silence before ASR, then
+            returns per-WORD start/end timestamps (word_timestamps=True). Using
+            a speech model instead of a raw energy/VAD threshold means the
+            timing signal is robust to background music, sound effects, and
+            noise in a way plain VAD or pixel analysis is not.
+          - Whisper's own segments already correspond fairly well to spoken
+            sentence-like chunks (this is analogous to what whisper-timestamped
+            / stable-ts / WhisperX build on), but a segment can still bundle
+            multiple subtitle lines together if the speaker doesn't pause much.
+            So, similar in spirit to stable-ts's "regroup" step, we re-split
+            each segment ourselves at its own internal word gaps
+            (max_word_gap) and enforce a maximum cue duration
+            (max_cue_duration) so one long uninterrupted line of dialogue does
+            not become one giant subtitle cue. This mirrors the old script's
+            "presence region -> content cluster split" idea, except the split
+            signal is now silence-between-words instead of image content diff.
+          - Each cue is padded slightly (speech_pad_seconds) since word-level
+            ASR timestamps can be a touch tighter than when the hard-sub
+            actually appears/disappears on screen, then cues are de-overlapped.
+
+          No OCR is used. This script has no opinion on the actual subtitle
+          text — timing.srt cues are placeholders ([TIMING_0001], ...), exactly
+          like the previous image-based version, so it drops into the same
+          downstream pipeline. The real ASR transcript IS kept in timing.json
+          per cue purely for QA/debugging (to sanity-check that a cue's timing
+          actually lines up with a spoken line), not as the final subtitle
+          text.
+
+          Known limitation vs. the old approach: this assumes on-screen hard
+          subtitles line up with spoken audio. Silent on-screen text (titles,
+          location cards, non-verbal captions) will NOT be picked up here,
+          because there is no corresponding audio. If that matters for your
+          videos, the old image-based pass is still the right tool for those
+          cues, or the two signals should be combined/unioned.
           """
-          
+
           import os
-          import re
           import json
-          import math
           import subprocess
           from pathlib import Path
-          from collections import deque
-          
-          import cv2
-          import numpy as np
-          from tqdm import tqdm
-          
+
+          from faster_whisper import WhisperModel
+
           WORK = Path("work")
-          VIDEO = WORK / "source.mp4"
+          AUDIO = WORK / "audio.wav"
           TIMING_JSON = WORK / "timing.json"
-          DEBUG_JSON = WORK / "all_debug.json"
           OUTPUT_SRT = Path("timing.srt")
-          DEBUG_FRAMES_DIR = WORK / "debug_frames"
-          
+
           def env_float(name, default):
               return float(os.environ.get(name, default))
-          
-          def env_bool(name, default):
-              return os.environ.get(name, default).strip().lower() == "true"
-          
-          # 0 = automatically use the video's native reported FPS.
-          SCAN_FPS = env_float("SCAN_FPS", "0")
-          FINE_RESCAN_FPS = env_float("FINE_RESCAN_FPS", "60")
-          FINE_RESCAN_MIN_DURATION = env_float("FINE_RESCAN_MIN_DURATION", "1.5")
-          REFINE_RADIUS = env_float("REFINE_RADIUS", "0.45")
-          MAX_SHORT_GAP = env_float("MAX_SHORT_GAP", "0.12")
-          MIN_CUE_DURATION = env_float("MIN_CUE_DURATION", "0.06")
-          LOCAL_WINDOW_SECONDS = env_float("LOCAL_WINDOW_SECONDS", "1.5")
-          LOCAL_MARGIN = env_float("LOCAL_MARGIN", "0.000035")
-          LOCAL_K_MAD = 2.5
-          SAVE_DEBUG_FRAMES = env_bool("SAVE_DEBUG_FRAMES", "true")
-          
-          # Content-based cue splitting (replaces the old isolated-spike change
-          # detector). See module docstring: this is a VideoSubFinder/PySceneDetect
-          # style reference comparator, not a peak-picker, so it can split two cues
-          # that touch with zero blank frame between them. The reference is a
-          # rolling average of ink amount / width / column-ink-profile (see
-          # build_text_signature + average_signature) over recent matched frames,
-          # not a frozen first frame, so ordinary encode jitter on an unchanged
-          # subtitle doesn't accumulate into a false split. Because the signature
-          # aggregates ink spatially (per-column sums, total ink, crop width)
-          # instead of comparing raw pixels 1:1, sub-pixel rendering jitter washes
-          # out far more than it did with a raw pixel-mask comparison, so this
-          # threshold should need much less per-video tuning — check the
-          # "DIFF DISTRIBUTION" log / diff_distribution in timing.json if it still
-          # does.
-          CLUSTER_DIFF_THRESHOLD = env_float("CLUSTER_DIFF_THRESHOLD", "0.30")
-          # Expressed in seconds (not frames) so it behaves the same at 24, 25, 30,
-          # or 60 native FPS. A candidate boundary must hold for this long before
-          # being accepted, which is what absorbs multi-frame noise bursts.
-          CLUSTER_CONFIRM_SECONDS = env_float("CLUSTER_CONFIRM_SECONDS", "0.10")
-          
-          # Subtitle band. Keep a little more vertical area than before to avoid clipping
-          # top strokes/second lines.
-          ROI_Y1_RATIO = 0.58
-          ROI_Y2_RATIO = 0.99
-          
-          # White/yellow/outlined subtitle detector.
-          BRIGHT_THRESHOLD = 145
-          TOPHAT_KERNEL = (31, 9)
-          EDGE_THRESHOLD_1 = 35
-          EDGE_THRESHOLD_2 = 110
-          
-          # Temporal / segmentation.
-          MIN_SEGMENT_DURATION = 0.10
-          
-          # Column-profile resolution for the ink/shape signature (build_text_signature).
-          TEXT_PROFILE_BINS = 96
-          
+
+          def env_str(name, default):
+              value = os.environ.get(name, default)
+              return value if value else default
+
+          MODEL_SIZE = env_str("MODEL_SIZE", "medium")
+          LANGUAGE = os.environ.get("LANGUAGE", "").strip() or None
+          COMPUTE_TYPE = env_str("COMPUTE_TYPE", "int8")
+          BEAM_SIZE = int(env_float("BEAM_SIZE", "5"))
+          VAD_MIN_SILENCE_MS = int(env_float("VAD_MIN_SILENCE_MS", "300"))
+          MAX_WORD_GAP = env_float("MAX_WORD_GAP", "0.45")
+          MAX_CUE_DURATION = env_float("MAX_CUE_DURATION", "6.0")
+          SPEECH_PAD_SECONDS = env_float("SPEECH_PAD_SECONDS", "0.08")
+          MIN_CUE_DURATION = env_float("MIN_CUE_DURATION", "0.12")
+
           def log(message):
               print(message, flush=True)
-          
-          def json_safe(obj):
-              if isinstance(obj, np.integer):
-                  return int(obj)
-              if isinstance(obj, np.floating):
-                  return float(obj)
-              if isinstance(obj, np.bool_):
-                  return bool(obj)
-              if isinstance(obj, np.ndarray):
-                  return [json_safe(x) for x in obj.tolist()]
-              if isinstance(obj, dict):
-                  return {str(k): json_safe(v) for k, v in obj.items()}
-              if isinstance(obj, (list, tuple)):
-                  return [json_safe(x) for x in obj]
-              return obj
-          
-          def write_json(path, data):
-              path.write_text(
-                  json.dumps(json_safe(data), ensure_ascii=False, indent=2),
-                  encoding="utf-8",
-              )
-          
-          def probe_video():
+
+          def probe_duration():
               cmd = [
                   "ffprobe", "-hide_banner", "-v", "error",
-                  "-select_streams", "v:0",
-                  "-show_entries", "stream=width,height,r_frame_rate",
                   "-show_entries", "format=duration",
-                  "-of", "json", str(VIDEO),
+                  "-of", "json", str(AUDIO),
               ]
               result = subprocess.run(
                   cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                   text=True, check=True
               )
-              data = json.loads(result.stdout)
-              stream = data["streams"][0]
-              width = int(stream["width"])
-              height = int(stream["height"])
-              fps_num, fps_den = stream["r_frame_rate"].split("/")
-              fps = float(fps_num) / float(fps_den)
-              duration = float(data["format"]["duration"])
-              return {"width": width, "height": height, "fps": fps, "duration": duration}
-          
-          def get_frame(time_sec):
-              time_sec = max(0.0, float(time_sec))
-              cmd = [
-                  "ffmpeg", "-hide_banner", "-loglevel", "error",
-                  "-ss", f"{time_sec:.6f}", "-i", str(VIDEO),
-                  "-frames:v", "1",
-                  "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"
-              ]
-              result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              if result.returncode != 0 or not result.stdout:
-                  return None
-              raw = np.frombuffer(result.stdout, dtype=np.uint8)
-              return cv2.imdecode(raw, cv2.IMREAD_COLOR)
-          
-          def get_roi(frame, video_info):
-              height = video_info["height"]
-              width = video_info["width"]
-              y1 = int(height * ROI_Y1_RATIO)
-              y2 = int(height * ROI_Y2_RATIO)
-              return frame[y1:y2, 0:width], y1, y2
-          
-          def subtitle_features(roi):
-              """
-              Returns several complementary signals.
-          
-              The previous version required BRIGHT AND EDGE. That is a major source of
-              false negatives: a low-contrast/blurred subtitle can have one strong cue
-              but not both. Here we retain:
-                - bright mask,
-                - local top-hat mask,
-                - edge/text mask,
-                - a permissive union mask.
-              """
-              if roi is None:
-                  return None
-          
-              gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-          
-              # Global bright text.
-              bright = cv2.inRange(gray, BRIGHT_THRESHOLD, 255)
-          
-              # Local bright structures: catches white text over bright-ish backgrounds.
-              kernel = cv2.getStructuringElement(cv2.MORPH_RECT, TOPHAT_KERNEL)
-              tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-              local_bright = cv2.inRange(tophat, 18, 255)
-          
-              # Adaptive threshold catches thin/soft characters missed by a fixed cutoff.
-              adaptive = cv2.adaptiveThreshold(
-                  gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                  cv2.THRESH_BINARY, 31, -4
-              )
-          
-              edges = cv2.Canny(gray, EDGE_THRESHOLD_1, EDGE_THRESHOLD_2)
-              edges = cv2.dilate(
-                  edges,
-                  cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                  iterations=1
-              )
-          
-              # Prefer locally bright/adaptive text, but retain edge-only evidence.
-              text = cv2.bitwise_or(bright, local_bright)
-              text = cv2.bitwise_or(text, adaptive)
-              text = cv2.bitwise_and(
-                  text,
-                  cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-              )
-          
-              # A second permissive channel: top-hat alone can preserve tiny characters
-              # that disappear after the edge intersection.
-              local_text = cv2.morphologyEx(
-                  local_bright, cv2.MORPH_CLOSE,
-                  cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-              )
-          
-              # Clean small isolated noise while keeping short Chinese cues.
-              text = cv2.morphologyEx(
-                  text, cv2.MORPH_CLOSE,
-                  cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
-              )
-              text = cv2.morphologyEx(
-                  text, cv2.MORPH_OPEN,
-                  cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-              )
-          
-              union = cv2.bitwise_or(text, local_text)
-          
-              return {
-                  "gray": gray,
-                  "mask": union,
-                  "strict_mask": text,
-              }
-          
-          def subtitle_score(features):
-              if features is None:
-                  return 0.0
-          
-              mask = features["mask"]
-              h, w = mask.shape
-              area = float(max(1, h * w))
-              occupancy = float(np.count_nonzero(mask)) / area
-          
-              # Subtitle pixels tend to form one/two dense horizontal rows.
-              row_counts = np.count_nonzero(mask, axis=1)
-              peak = float(np.max(row_counts)) if row_counts.size else 0.0
-              if peak <= 0:
-                  return occupancy
-          
-              active_rows = np.count_nonzero(row_counts >= max(2.0, peak * 0.16))
-              row_concentration = active_rows / max(1, h)
-          
-              # Connected components: reject a frame made only of scattered noise.
-              num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-              components = 0
-              largest = 0
-              for i in range(1, num_labels):
-                  area_i = int(stats[i, cv2.CC_STAT_AREA])
-                  ww = int(stats[i, cv2.CC_STAT_WIDTH])
-                  hh = int(stats[i, cv2.CC_STAT_HEIGHT])
-                  if area_i >= 5 and ww >= 2 and hh >= 2:
-                      components += 1
-                      largest = max(largest, area_i)
-          
-              component_bonus = min(0.0020, components * 0.00008)
-              largest_bonus = min(0.0020, largest / area * 0.12)
-          
-              return float(
-                  occupancy
-                  + row_concentration * 0.0045
-                  + component_bonus
-                  + largest_bonus
-              )
-          
-          def calculate_global_threshold(scores):
-              values = np.asarray(scores, dtype=np.float64)
-              values = values[np.isfinite(values)]
-              positive = values[values > 0]
-          
-              if values.size == 0 or not positive.size:
-                  return 0.00035
-          
-              # Deliberately permissive: presence is allowed to over-detect. The next
-              # temporal stages decide whether it is a real subtitle run.
-              q25 = float(np.percentile(positive, 25))
-              q50 = float(np.percentile(positive, 50))
-              threshold = max(0.00035, min(q25, q50 * 0.72))
-          
+              return float(json.loads(result.stdout)["format"]["duration"])
+
+          def transcribe():
+              log(f"Loading faster-whisper model={MODEL_SIZE} compute_type={COMPUTE_TYPE}")
+              model = WhisperModel(MODEL_SIZE, device="cpu", compute_type=COMPUTE_TYPE)
+
               log(
-                  f"PRESENCE THRESHOLD = {threshold:.7f} "
-                  f"(positive q25={q25:.7f}, q50={q50:.7f})"
+                  f"Transcribing (language={LANGUAGE or 'auto'}, beam_size={BEAM_SIZE}, "
+                  f"vad_min_silence_ms={VAD_MIN_SILENCE_MS}) ..."
               )
-              return float(threshold)
-          
-          def calculate_local_active(scores, scan_fps):
-              window_frames = max(3, int(round(LOCAL_WINDOW_SECONDS * scan_fps)))
-              window = window_frames * 2 + 1
-          
-              series = np.asarray(scores, dtype=np.float64)
-              med = cv2.blur(series.reshape(-1, 1), (1, window)).reshape(-1)
-              # Rolling MAD without pandas: use a local median approximation plus
-              # a robust global floor. This is intentionally sensitive.
-              abs_dev = np.abs(series - med)
-              mad = cv2.blur(abs_dev.reshape(-1, 1), (1, window)).reshape(-1)
-              threshold = med + np.maximum(LOCAL_K_MAD * mad, LOCAL_MARGIN)
-          
-              active = series >= threshold
-          
-              # Do not let the adaptive detector erase frames that have a clearly
-              # subtitle-like absolute score.
-              global_floor = float(np.percentile(series[series > 0], 20)) if np.any(series > 0) else 0.0
-              if global_floor > 0:
-                  active |= series >= global_floor * 1.25
-          
+              segments, info = model.transcribe(
+                  str(AUDIO),
+                  language=LANGUAGE,
+                  beam_size=BEAM_SIZE,
+                  word_timestamps=True,
+                  vad_filter=True,
+                  vad_parameters=dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS),
+                  condition_on_previous_text=False,
+              )
+
               log(
-                  f"LOCAL ADAPTIVE: window={LOCAL_WINDOW_SECONDS:.2f}s "
-                  f"k_mad={LOCAL_K_MAD:.2f} flagged={int(active.sum())}/{len(active)}"
+                  f"Detected language={info.language} "
+                  f"(p={info.language_probability:.3f}) duration={info.duration:.3f}s"
               )
-              return active
-          
-          def compute_active_regions(samples, global_threshold, local_active_mask, duration, scan_fps):
-              n = len(samples)
-              if n == 0:
-                  return []
-          
-              scores = np.asarray([s["score"] for s in samples], dtype=np.float64)
-              active = (
-                  (scores >= global_threshold)
-                  | np.asarray(local_active_mask, dtype=bool)
-              )
-          
-              # Hysteresis: once text is convincingly active, require a few consecutive
-              # weak frames before turning it off. This is much safer than a single
-              # threshold and prevents missing subtitles because of anti-aliasing.
-              on_threshold = max(global_threshold, float(np.percentile(scores[scores > 0], 18)) if np.any(scores > 0) else global_threshold)
-              positive = scores[scores > 0]
-              off_threshold = max(global_threshold * 0.42, on_threshold * 0.35)
-          
-              state = np.zeros(n, dtype=np.uint8)
-              on = False
-              weak_run = 0
-              max_weak = max(1, int(round(0.10 * scan_fps)))
-          
-              for i, score in enumerate(scores):
-                  if not on:
-                      if score >= on_threshold or active[i]:
-                          on = True
-                          state[i] = 1
-                          weak_run = 0
-                  else:
-                      if score >= off_threshold or active[i]:
-                          state[i] = 1
-                          weak_run = 0
-                      else:
-                          weak_run += 1
-                          if weak_run <= max_weak:
-                              state[i] = 1
-                          else:
-                              on = False
-                              weak_run = 0
-          
-              # Bridge only short real detection holes, using the same principle as
-              # max_merge_gap in VideOCR, but keep the gap substantially shorter.
-              max_gap_frames = max(1, int(round(MAX_SHORT_GAP * scan_fps)))
-              i = 0
-              while i < n:
-                  if state[i]:
-                      i += 1
-                      continue
-                  j = i
-                  while j < n and not state[j]:
-                      j += 1
-                  if i > 0 and j < n and (j - i) <= max_gap_frames:
-                      state[i:j] = 1
-                  i = j
-          
-              for i, sample in enumerate(samples):
-                  sample["active"] = bool(state[i])
-          
-              regions = []
-              start = None
-              for i, val in enumerate(state):
-                  if val and start is None:
-                      start = i
-                  elif not val and start is not None:
-                      regions.append((start, i - 1))
-                      start = None
-              if start is not None:
-                  regions.append((start, n - 1))
-          
-              result = []
-              for a, b in regions:
-                  st = float(samples[a]["time"])
-                  en = min(duration, float(samples[b]["time"] + 1.0 / scan_fps))
-                  if en - st >= MIN_CUE_DURATION:
-                      result.append({
-                          "start_index": int(a),
-                          "end_index": int(b),
-                          "start": st,
-                          "end": en,
+
+              all_words = []
+              raw_segments = []
+              for seg in segments:
+                  words = list(seg.words or [])
+                  if not words:
+                      # Fallback: no word-level breakdown for this segment (rare),
+                      # keep it as a single atomic chunk instead of dropping it.
+                      words = [type("W", (), {
+                          "start": seg.start, "end": seg.end, "word": seg.text.strip()
+                      })()]
+                  raw_segments.append({
+                      "start": float(seg.start),
+                      "end": float(seg.end),
+                      "text": seg.text.strip(),
+                  })
+                  for w in words:
+                      all_words.append({
+                          "start": float(w.start),
+                          "end": float(w.end),
+                          "text": str(w.word).strip(),
+                          "segment_start": float(seg.start),
+                          "segment_end": float(seg.end),
                       })
-              return result
-          
-          def crop_to_ink(mask):
+
+              log(f"ASR segments = {len(raw_segments)} | words = {len(all_words)}")
+              return all_words, raw_segments, info
+
+          def split_words_into_cues(words):
               """
-              Crop a binary text mask tightly to its actual ink (the "cắt đúng chiều
-              cao của sub" step) so background/padding pixels never dilute the
-              comparison. Returns None when there's no ink at all (blank frame).
+              Group words into cues. Never merges across a Whisper segment
+              boundary. Within a segment, starts a new cue whenever:
+                - the silent gap to the previous word exceeds MAX_WORD_GAP, or
+                - the running cue would exceed MAX_CUE_DURATION and there is at
+                  least some small gap to split at (so we don't cut a word in
+                  half; if truly zero gap exists, the cue is allowed to run
+                  long rather than mangling a word boundary).
               """
-              ys, xs = np.nonzero(mask)
-              if xs.size < 3:
-                  return None
-              x0, x1 = int(xs.min()), int(xs.max())
-              y0, y1 = int(ys.min()), int(ys.max())
-              return mask[y0:y1 + 1, x0:x1 + 1]
-          
-          def build_text_signature(features, profile_bins=TEXT_PROFILE_BINS):
-              """
-              "Chữ trắng, nền đen" signature, but instead of comparing raw pixels
-              (which is what made the old Jaccard-on-resized-mask metric so noisy —
-              a 1px sub-pixel rendering jitter shifts which exact pixels are lit
-              without changing the text at all), this measures three things that
-              only change when the CONTENT changes:
-                - ink: total lit-pixel count in the tight crop (roughly proportional
-                  to character count/stroke weight — a different sentence almost
-                  always has a different amount of ink);
-                - width: the crop's horizontal extent (a different sentence is
-                  almost always a different length);
-                - profile: the column-wise ink histogram (how much ink sits in each
-                  horizontal slice of the crop, resampled to a fixed number of bins)
-                  — this is the actual shape of the text, and because it sums pixels
-                  down each column it washes out single-pixel jitter that would
-                  otherwise dominate a raw pixel-to-pixel comparison.
-              """
-              if features is None:
-                  return {"ink": 0.0, "width": 0.0, "profile": None}
-          
-              crop = crop_to_ink(features["mask"])
-              if crop is None:
-                  return {"ink": 0.0, "width": 0.0, "profile": None}
-          
-              ink = float(np.count_nonzero(crop))
-              col_profile = crop.astype(np.float32).sum(axis=0)
-              total = float(col_profile.sum())
-              if total <= 0:
-                  return {"ink": 0.0, "width": 0.0, "profile": None}
-          
-              norm = (col_profile / total).reshape(1, -1)
-              resized = cv2.resize(
-                  norm, (profile_bins, 1), interpolation=cv2.INTER_AREA
-              ).flatten().astype(np.float32)
-          
-              return {
-                  "ink": ink,
-                  "width": float(crop.shape[1]),
-                  "profile": resized,
-              }
-          
-          def signature_diff(a, b):
-              """
-              0 = same subtitle content, 1 = clearly different. Blank-vs-text always
-              counts as maximally different; two blanks are identical.
-              """
-              if a is None or b is None:
-                  return 1.0
-              if a["ink"] <= 0 and b["ink"] <= 0:
-                  return 0.0
-              if a["ink"] <= 0 or b["ink"] <= 0:
-                  return 1.0
-          
-              ink_diff = abs(a["ink"] - b["ink"]) / max(a["ink"], b["ink"])
-              width_diff = abs(a["width"] - b["width"]) / max(a["width"], b["width"], 1.0)
-          
-              corr = 0.0
-              if a["profile"] is not None and b["profile"] is not None:
-                  pa, pb = a["profile"], b["profile"]
-                  if np.std(pa) > 1e-6 and np.std(pb) > 1e-6:
-                      corr = float(np.corrcoef(pa, pb)[0, 1])
-              if not np.isfinite(corr):
-                  corr = 0.0
-              profile_diff = (1.0 - corr) / 2.0
-          
-              return float(0.5 * profile_diff + 0.3 * ink_diff + 0.2 * width_diff)
-          
-          def average_signature(sig_list):
-              """
-              Rolling reference for a cluster of matched frames: average the ink,
-              width, and profile of recent frames belonging to the same cue. This is
-              what lets ordinary frame-to-frame jitter cancel out over a run instead
-              of drifting a frozen single-frame reference away from later frames of
-              the very same subtitle.
-              """
-              valid = [s for s in sig_list if s["profile"] is not None]
-              if not valid:
-                  return sig_list[-1]
-              profiles = np.stack([s["profile"] for s in valid], axis=0)
-              return {
-                  "ink": float(np.mean([s["ink"] for s in valid])),
-                  "width": float(np.mean([s["width"] for s in valid])),
-                  "profile": profiles.mean(axis=0).astype(np.float32),
-              }
-          
-          def cluster_split_indexes(samples, start_index, end_index, diff_threshold, confirm_frames, ref_window=6, diag=None):
-              """
-              Reference-cluster segmentation (VideoSubFinder/PySceneDetect style),
-              with a rolling-average ink/profile reference (see average_signature)
-              so ordinary encode noise on an unchanged subtitle does not accumulate
-              into a false boundary.
-          
-              A candidate new cue must hold together for `confirm_frames`
-              consecutive frames (matched against the candidate's own frames, not
-              the old reference) before it is accepted — this absorbs 1-2 frame
-              flicker without a duration cutoff. Its start index is recorded the
-              moment the content changes, not after the confirmation delay, so
-              short cues are not truncated. Because the comparison is against a
-              running content reference rather than a "quiet vs. spike" pattern,
-              back-to-back cues with zero blank frames between them still split
-              correctly.
-          
-              If `diag` (a list) is passed, every frame's diff against the current
-              reference is appended to it — this is how we build a real
-              distribution of "same cue" vs "different cue" diff values per video,
-              instead of guessing a global threshold blind.
-              """
-              if end_index < start_index:
-                  return []
-          
-              boundaries = []
-              recent = deque([samples[start_index]["text_sig"]], maxlen=ref_window)
-              ref_sig = recent[-1]
-              pending = None
-          
-              for i in range(start_index + 1, end_index + 1):
-                  sig = samples[i]["text_sig"]
-                  d = signature_diff(ref_sig, sig)
-                  if diag is not None:
-                      diag.append(float(d))
-          
-                  if d <= diff_threshold:
-                      recent.append(sig)
-                      ref_sig = average_signature(list(recent))
-                      pending = None
-                      continue
-          
-                  if pending is None or signature_diff(pending["sig"], sig) > diff_threshold:
-                      pending = {"start": i, "sig": sig, "count": 1, "frames": [sig]}
-                  else:
-                      pending["count"] += 1
-                      pending["frames"].append(sig)
-          
-                  if pending["count"] >= confirm_frames:
-                      boundaries.append(pending["start"])
-                      recent = deque(pending["frames"], maxlen=ref_window)
-                      ref_sig = average_signature(list(recent))
-                      pending = None
-          
-              return boundaries
-          
-          def split_region_by_clusters(samples, region, duration, scan_fps, diff_threshold, confirm_seconds, diag=None):
-              confirm_frames = max(1, int(round(confirm_seconds * scan_fps)))
-              boundaries = cluster_split_indexes(
-                  samples, region["start_index"], region["end_index"],
-                  diff_threshold, confirm_frames, diag=diag
-              )
-              indexes = [region["start_index"], *boundaries, region["end_index"] + 1]
-          
               cues = []
-              for k in range(len(indexes) - 1):
-                  a = indexes[k]
-                  b = indexes[k + 1] - 1
-                  if b < a:
-                      continue
-          
-                  st = float(samples[a]["time"])
-                  en = min(duration, float(samples[b]["time"] + 1.0 / scan_fps))
-                  if en - st < MIN_SEGMENT_DURATION:
-                      continue
-          
-                  cues.append({
+              current = None
+
+              def flush():
+                  nonlocal current
+                  if current is not None and current["words"]:
+                      cues.append(current)
+                  current = None
+
+              prev_word = None
+              for w in words:
+                  new_segment = (
+                      prev_word is not None
+                      and w["segment_start"] != prev_word["segment_start"]
+                  )
+                  gap = (w["start"] - prev_word["end"]) if prev_word else None
+
+                  start_new = current is None or new_segment
+                  if not start_new and gap is not None and gap >= MAX_WORD_GAP:
+                      start_new = True
+                  if (
+                      not start_new
+                      and current is not None
+                      and (w["end"] - current["start"]) > MAX_CUE_DURATION
+                      and gap is not None
+                      and gap > 0.02
+                  ):
+                      start_new = True
+
+                  if start_new:
+                      flush()
+                      current = {"start": w["start"], "end": w["end"], "words": [w]}
+                  else:
+                      current["end"] = w["end"]
+                      current["words"].append(w)
+
+                  prev_word = w
+
+              flush()
+              return cues
+
+          def pad_and_dedupe(cues, duration):
+              padded = []
+              for cue in cues:
+                  st = max(0.0, cue["start"] - SPEECH_PAD_SECONDS)
+                  en = min(duration, cue["end"] + SPEECH_PAD_SECONDS)
+                  padded.append({
                       "start": st,
                       "end": en,
-                      "start_index": int(a),
-                      "end_index": int(b),
+                      "text": "".join(w["text"] for w in cue["words"]),
                   })
-              return cues
-          
-          def extract_region_frames(video_info, start, end, fps):
-              width, height = video_info["width"], video_info["height"]
-              y1 = int(height * ROI_Y1_RATIO)
-              y2 = int(height * ROI_Y2_RATIO)
-              roi_width, roi_height = width, y2 - y1
-          
-              pad = 0.20
-              seek = max(0.0, start - pad)
-              span = (end - start) + 2 * pad
-          
-              filter_graph = f"fps={fps},crop={roi_width}:{roi_height}:0:{y1}"
-              cmd = [
-                  "ffmpeg", "-hide_banner", "-loglevel", "error",
-                  "-ss", f"{seek:.6f}", "-i", str(VIDEO),
-                  "-t", f"{span:.6f}",
-                  "-vf", filter_graph, "-an", "-sn", "-dn",
-                  "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
-              ]
-              result = subprocess.run(
-                  cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-              )
-              if result.returncode != 0:
-                  log("FINE RESCAN ffmpeg error: " + result.stderr.decode("utf-8", errors="replace"))
-                  return []
-          
-              frame_size = roi_width * roi_height * 3
-              raw = result.stdout
-              n_frames = len(raw) // frame_size
-          
-              frames = []
-              prev = None
-              for i in range(n_frames):
-                  chunk = raw[i * frame_size:(i + 1) * frame_size]
-                  roi = np.frombuffer(chunk, dtype=np.uint8).reshape((roi_height, roi_width, 3))
-                  feat = subtitle_features(roi)
-                  score = subtitle_score(feat)
-                  text_sig = build_text_signature(feat)
-                  change = signature_diff(prev, text_sig) if prev is not None else 1.0
-          
-                  frames.append({
-                      "time": float(seek + i / fps),
-                      "score": float(score),
-                      "change": float(change),
-                      "text_sig": text_sig,
-                  })
-                  prev = text_sig
-              return frames
-          
-          def fine_rescan_region(video_info, region_start, region_end, diff_threshold, confirm_seconds):
-              """
-              Safety-net rescan for long active regions: re-samples the region at
-              FINE_RESCAN_FPS and runs the *same* content reference-cluster splitter
-              used on the native-FPS pass (cluster_split_indexes), just with more
-              frames to work with. This exists because native FPS (often 24-30) can
-              occasionally straddle a very fast cut so the confirm-time check never
-              gets enough evidence; the high-FPS pass gives it more samples to
-              confirm against without changing the underlying logic.
-              """
-              fine_frames = extract_region_frames(
-                  video_info, region_start, region_end, FINE_RESCAN_FPS
-              )
-              fine_frames = [
-                  f for f in fine_frames
-                  if region_start - 0.08 <= f["time"] <= region_end + 0.08
-              ]
-              if len(fine_frames) < 5:
-                  return None
-          
-              fine_confirm = max(1, int(round(confirm_seconds * FINE_RESCAN_FPS)))
-              boundaries = cluster_split_indexes(
-                  fine_frames, 0, len(fine_frames) - 1, diff_threshold, fine_confirm
-              )
-              if not boundaries:
-                  return None
-          
-              indexes = [0, *boundaries, len(fine_frames)]
-              cues = []
-              for k in range(len(indexes) - 1):
-                  a = indexes[k]
-                  b = indexes[k + 1] - 1
-                  if b < a:
-                      continue
-                  st = max(region_start, float(fine_frames[a]["time"]))
-                  en = min(region_end, float(fine_frames[b]["time"] + 1.0 / FINE_RESCAN_FPS))
-                  if en - st >= MIN_SEGMENT_DURATION:
-                      cues.append({"start": st, "end": en})
-          
-              return cues if len(cues) > 1 else None
-          
-          def analyze_frame_time(time_sec, video_info):
-              frame = get_frame(time_sec)
-              if frame is None:
-                  return {"score": 0.0}
-              roi, _, _ = get_roi(frame, video_info)
-              feat = subtitle_features(roi)
-              return {"score": float(subtitle_score(feat))}
-          
-          def refine_start(approximate, threshold, video_info):
-              fps = max(1.0, float(video_info["fps"]))
-              step = 1.0 / fps
-              left = max(0.0, approximate - REFINE_RADIUS)
-              right = min(video_info["duration"], approximate + REFINE_RADIUS)
-          
-              # Search from early -> late and require two consecutive supporting frames.
-              times = np.arange(left, right + step * 0.5, step)
-              recent = []
-              for time_sec in times:
-                  score = analyze_frame_time(float(time_sec), video_info)["score"]
-                  recent.append(score)
-                  if len(recent) > 2:
-                      recent.pop(0)
-                  if len(recent) >= 2 and recent[-1] >= threshold and recent[-2] >= threshold:
-                      return float(time_sec - step)
-              return float(approximate)
-          
-          def refine_end(approximate, threshold, video_info):
-              fps = max(1.0, float(video_info["fps"]))
-              step = 1.0 / fps
-              left = max(0.0, approximate - REFINE_RADIUS)
-              right = min(video_info["duration"], approximate + REFINE_RADIUS)
-          
-              last_active = None
-              weak_run = 0
-              max_weak = max(1, int(round(0.06 * fps)))
-          
-              for time_sec in np.arange(left, right + step * 0.5, step):
-                  score = analyze_frame_time(float(time_sec), video_info)["score"]
-                  if score >= threshold:
-                      last_active = float(time_sec)
-                      weak_run = 0
-                  else:
-                      weak_run += 1
-                      if last_active is not None and weak_run >= max_weak:
-                          return min(video_info["duration"], last_active + step)
-              if last_active is not None:
-                  return min(video_info["duration"], last_active + step)
-              return float(approximate)
-          
-          def refine_presence_boundaries(cues, threshold, video_info):
-              # Very permissive threshold: we would rather extend a cue by a frame than
-              # lose the first/last subtitle frame.
-              refine_threshold = max(0.00035, threshold * 0.45)
-              refined = []
-              for cue in cues:
-                  st = refine_start(cue["start"], refine_threshold, video_info)
-                  en = refine_end(cue["end"], refine_threshold, video_info)
-                  if en - st >= MIN_CUE_DURATION:
-                      refined.append({"start": float(st), "end": float(en)})
-              return refined
-          
-          def dedupe_and_fix_overlaps(cues, duration):
-              if not cues:
-                  return []
-          
-              cues = sorted(cues, key=lambda x: (x["start"], x["end"]))
+
+              padded.sort(key=lambda c: (c["start"], c["end"]))
               final = []
-              for cue in cues:
-                  st = max(0.0, float(cue["start"]))
-                  en = min(duration, float(cue["end"]))
-                  if en <= st:
-                      continue
-          
+              for cue in padded:
+                  st, en = cue["start"], cue["end"]
                   if final:
                       prev = final[-1]
-                      # If two cues overlap only because boundary refinement expanded them,
-                      # split at the midpoint instead of allowing invalid/ambiguous overlap.
                       if st < prev["end"]:
                           mid = (st + prev["end"]) / 2.0
                           prev["end"] = mid
                           st = mid
-                      if en <= st:
-                          continue
-          
-                  final.append({"start": st, "end": en})
-          
-              # Do not merge neighboring cues here: a short gap may be a genuine sentence
-              # boundary, and missing a boundary is the user's main failure mode.
-              return final
-          
-          def build_timing_cues(samples, global_threshold, local_active_mask, video_info, scan_fps):
-              duration = video_info["duration"]
-              regions = compute_active_regions(
-                  samples, global_threshold, local_active_mask, duration, scan_fps
-              )
-              log(f"ACTIVE REGIONS = {len(regions)}")
-          
-              raw_cues = []
-              fine_rescan_count = 0
-              diff_diag = []
-          
-              for region in regions:
-                  parts = split_region_by_clusters(
-                      samples, region, duration, scan_fps,
-                      CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS, diag=diff_diag
-                  )
-                  if not parts:
-                      parts = [{"start": region["start"], "end": region["end"]}]
-          
-                  region_duration = region["end"] - region["start"]
-          
-                  # Unlike the old version, rescan *all* long regions, not only those that
-                  # produced exactly one cue. This catches a long region where one boundary
-                  # was found but two more were missed.
-                  if region_duration >= FINE_RESCAN_MIN_DURATION:
-                      log(
-                          f"FINE RESCAN {region['start']:.3f}->{region['end']:.3f} "
-                          f"({region_duration:.3f}s)"
-                      )
-                      fine_parts = fine_rescan_region(
-                          video_info, region["start"], region["end"],
-                          CLUSTER_DIFF_THRESHOLD, CLUSTER_CONFIRM_SECONDS
-                      )
-                      if fine_parts and len(fine_parts) > len(parts):
-                          fine_rescan_count += 1
-                          log(f"FINE RESCAN improved {len(parts)} -> {len(fine_parts)} cues")
-                          parts = fine_parts
-          
-                  raw_cues.extend(parts)
-          
-              log(
-                  f"RAW TIMING CUES = {len(raw_cues)} "
-                  f"(fine-rescanned regions = {fine_rescan_count})"
-              )
-          
-              # Real distribution of frame-to-reference diffs for THIS video, so the
-              # threshold can be tuned from actual numbers instead of guessing blind.
-              # If most diffs sit well under CLUSTER_DIFF_THRESHOLD but you're still
-              # seeing merged cues, the threshold is too high — lower it toward p90/p95.
-              # If p95/p99 are already close to or above the threshold with no merging
-              # problem, the threshold has little headroom and false splits are likely.
-              diff_stats = {}
-              if diff_diag:
-                  arr = np.asarray(diff_diag, dtype=np.float64)
-                  diff_stats = {
-                      "count": int(arr.size),
-                      "p50": float(np.percentile(arr, 50)),
-                      "p75": float(np.percentile(arr, 75)),
-                      "p90": float(np.percentile(arr, 90)),
-                      "p95": float(np.percentile(arr, 95)),
-                      "p99": float(np.percentile(arr, 99)),
-                      "max": float(np.max(arr)),
-                  }
-                  log(
-                      "DIFF DISTRIBUTION (frame-to-reference, all active frames): "
-                      f"p50={diff_stats['p50']:.3f} p75={diff_stats['p75']:.3f} "
-                      f"p90={diff_stats['p90']:.3f} p95={diff_stats['p95']:.3f} "
-                      f"p99={diff_stats['p99']:.3f} max={diff_stats['max']:.3f} "
-                      f"| threshold={CLUSTER_DIFF_THRESHOLD:.3f}"
-                  )
-          
-              refined = refine_presence_boundaries(
-                  raw_cues, global_threshold, video_info
-              )
-              final_cues = dedupe_and_fix_overlaps(refined, duration)
-          
-              final = []
-              for index, cue in enumerate(final_cues):
-                  st, en = float(cue["start"]), float(cue["end"])
-                  if en <= st:
+                  if en - st < MIN_CUE_DURATION:
                       continue
-                  final.append({
-                      "index": int(index),
-                      "start": st,
-                      "end": en,
-                      "duration": float(en - st),
-                      "midpoint": float((st + en) / 2.0),
-                  })
-              return final, diff_stats
-          
-          def timing_pass():
-              video_info = probe_video()
-              width, height, duration = (
-                  video_info["width"], video_info["height"], video_info["duration"]
-              )
-          
-              actual_scan_fps = (
-                  video_info["fps"] if SCAN_FPS <= 0 else min(SCAN_FPS, max(1.0, video_info["fps"] * 2.0))
-              )
-              roi_y1 = int(height * ROI_Y1_RATIO)
-              roi_y2 = int(height * ROI_Y2_RATIO)
-          
-              log("\n==========================================")
-              log("PASS 1 — NATIVE-FPS MULTI-SIGNAL TIMING")
-              log("==========================================")
-              log(f"VIDEO       : {width}x{height} @ {video_info['fps']:.6f}fps, {duration:.3f}s")
-              log(f"SCAN FPS    : {actual_scan_fps:.6f} (0=input means native FPS)")
-              log(f"FINE RESCAN : {FINE_RESCAN_FPS:.3f}fps")
-              log(f"ROI         : y={roi_y1}..{roi_y2}")
-              log(f"MAX_SHORT_GAP={MAX_SHORT_GAP}s | MIN_CUE_DURATION={MIN_CUE_DURATION}s")
-          
-              filter_graph = (
-                  f"fps={actual_scan_fps:.6f},crop={width}:{roi_y2-roi_y1}:0:{roi_y1}"
-              )
-              cmd = [
-                  "ffmpeg", "-hide_banner", "-loglevel", "error",
-                  "-i", str(VIDEO),
-                  "-vf", filter_graph, "-an", "-sn", "-dn",
-                  "-pix_fmt", "bgr24", "-f", "rawvideo", "-"
-              ]
-          
-              process = subprocess.Popen(
-                  cmd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.PIPE,
-                  bufsize=1024 * 1024 * 64
-              )
-          
-              roi_width, roi_height = width, roi_y2 - roi_y1
-              frame_size = roi_width * roi_height * 3
-              expected = int(math.ceil(duration * actual_scan_fps))
-          
-              samples = []
-              previous = None
-              pbar = tqdm(total=expected, desc="Native timing scan")
-              index = 0
-          
-              try:
-                  while True:
-                      raw = process.stdout.read(frame_size)
-                      if len(raw) != frame_size:
-                          break
-          
-                      roi = np.frombuffer(
-                          raw, dtype=np.uint8
-                      ).reshape((roi_height, roi_width, 3))
-          
-                      feat = subtitle_features(roi)
-                      score = subtitle_score(feat)
-          
-                      text_sig = build_text_signature(feat)
-                      change = signature_diff(previous, text_sig) if previous is not None else 1.0
-          
-                      samples.append({
-                          "index": int(index),
-                          "time": float(index / actual_scan_fps),
-                          "score": float(score),
-                          "change": float(change),
-                          "text_sig": text_sig,
-                      })
-          
-                      previous = text_sig
-                      index += 1
-                      pbar.update(1)
-              finally:
-                  pbar.close()
-                  if process.stdout:
-                      process.stdout.close()
-                  stderr_data = b""
-                  if process.stderr:
-                      stderr_data = process.stderr.read()
-                      process.stderr.close()
-                  return_code = process.wait()
-                  if return_code != 0:
-                      raise RuntimeError(
-                          "FFmpeg timing scan failed:\n"
-                          + stderr_data.decode("utf-8", errors="replace")
-                      )
-          
-              scores = [s["score"] for s in samples]
-              global_threshold = calculate_global_threshold(scores)
-              local_active_mask = calculate_local_active(scores, actual_scan_fps)
-              compute_active_regions(
-                  samples, global_threshold, local_active_mask, duration, actual_scan_fps
-              )
-          
-              log(
-                  f"CLUSTER DIFF THRESHOLD = {CLUSTER_DIFF_THRESHOLD:.4f} "
-                  f"CONFIRM SECONDS = {CLUSTER_CONFIRM_SECONDS}"
-              )
-          
-              timing_cues, diff_stats = build_timing_cues(
-                  samples,
-                  global_threshold,
-                  local_active_mask,
-                  video_info,
-                  actual_scan_fps
-              )
-          
-              log(f"\nFINAL TIMING CUES = {len(timing_cues)}")
-              for cue in timing_cues:
-                  log(
-                      "[%04d] %.6f -> %.6f mid=%.6f"
-                      % (
-                          cue["index"], cue["start"], cue["end"], cue["midpoint"]
-                      )
-                  )
-          
-              # text_sig holds a numpy profile array kept only for in-memory
-              # clustering; dumping it into timing.json would bloat the debug
-              # artifact, so log only the lightweight scalar fields per sample.
-              samples_for_json = [
-                  {k: v for k, v in s.items() if k != "text_sig"}
-                  for s in samples
-              ]
-          
-              write_json(TIMING_JSON, {
-                  "video": video_info,
-                  "scan_fps_requested": float(SCAN_FPS),
-                  "scan_fps_actual": float(actual_scan_fps),
-                  "fine_rescan_fps": float(FINE_RESCAN_FPS),
-                  "fine_rescan_min_duration": float(FINE_RESCAN_MIN_DURATION),
-                  "roi": {"y1": int(roi_y1), "y2": int(roi_y2)},
-                  "global_threshold": float(global_threshold),
-                  "cluster_diff_threshold": float(CLUSTER_DIFF_THRESHOLD),
-                  "cluster_confirm_seconds": float(CLUSTER_CONFIRM_SECONDS),
-                  "diff_distribution": diff_stats,
-                  "max_short_gap": float(MAX_SHORT_GAP),
-                  "min_cue_duration": float(MIN_CUE_DURATION),
-                  "local_window_seconds": float(LOCAL_WINDOW_SECONDS),
-                  "samples": samples_for_json,
-                  "cues": timing_cues,
-              })
-          
-              return video_info, timing_cues
-          
+                  final.append({"start": st, "end": en, "text": cue["text"]})
+              return final
+
           def save_timing_srt(cues):
               lines = []
               for i, cue in enumerate(cues, 1):
@@ -1214,7 +428,7 @@ jobs:
                   end_ms = int(round(cue["end"] * 1000))
                   if end_ms <= start_ms:
                       end_ms = start_ms + 100
-          
+
                   def fmt(ms):
                       h = ms // 3600000
                       ms %= 3600000
@@ -1223,39 +437,72 @@ jobs:
                       s = ms // 1000
                       milli = ms % 1000
                       return f"{h:02d}:{m:02d}:{s:02d},{milli:03d}"
-          
+
                   lines.append(
                       f"{i}\n"
                       f"{fmt(start_ms)} --> {fmt(end_ms)}\n"
                       f"[TIMING_{i:04d}]\n"
                   )
-          
+
               OUTPUT_SRT.write_text("\n".join(lines), encoding="utf-8")
-          
+
           def main():
-              if not VIDEO.exists():
-                  raise RuntimeError(f"Video không tồn tại: {VIDEO}")
-          
-              video_info, timing_cues = timing_pass()
-              save_timing_srt(timing_cues)
-          
-              write_json(DEBUG_JSON, {
-                  "video": video_info,
-                  "timing_cues": timing_cues,
-              })
-          
+              if not AUDIO.exists():
+                  raise RuntimeError(f"Audio không tồn tại: {AUDIO}")
+
+              duration = probe_duration()
+              words, raw_segments, info = transcribe()
+
+              grouped = split_words_into_cues(words)
+              log(f"CUES BEFORE PAD/DEDUPE = {len(grouped)}")
+
+              final_cues = pad_and_dedupe(grouped, duration)
+              log(f"FINAL TIMING CUES = {len(final_cues)}")
+
+              for i, cue in enumerate(final_cues, 1):
+                  log(
+                      "[%04d] %.6f -> %.6f  (asr: %s)"
+                      % (i, cue["start"], cue["end"], cue["text"][:40])
+                  )
+
+              save_timing_srt(final_cues)
+
+              write_data = {
+                  "duration": duration,
+                  "model_size": MODEL_SIZE,
+                  "language_requested": LANGUAGE,
+                  "language_detected": info.language,
+                  "language_probability": float(info.language_probability),
+                  "max_word_gap": MAX_WORD_GAP,
+                  "max_cue_duration": MAX_CUE_DURATION,
+                  "speech_pad_seconds": SPEECH_PAD_SECONDS,
+                  "min_cue_duration": MIN_CUE_DURATION,
+                  "vad_min_silence_ms": VAD_MIN_SILENCE_MS,
+                  "asr_segments": raw_segments,
+                  "cues": [
+                      {
+                          "index": i,
+                          "start": cue["start"],
+                          "end": cue["end"],
+                          "duration": cue["end"] - cue["start"],
+                          "asr_text_reference_only": cue["text"],
+                      }
+                      for i, cue in enumerate(final_cues, 1)
+                  ],
+              }
+              TIMING_JSON.write_text(
+                  json.dumps(write_data, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+
               log("\n==========================================")
               log("FINAL TIMING RESULT")
               log("==========================================")
-              log(f"Timing cues : {len(timing_cues)}")
+              log(f"Timing cues : {len(final_cues)}")
               log(f"Output      : {OUTPUT_SRT}")
-          
+
               log("\n========== TIMING SRT ==========")
-              if OUTPUT_SRT.exists():
-                  print(OUTPUT_SRT.read_text(encoding="utf-8"))
-              else:
-                  log("Timing SRT không tồn tại.")
-          
+              print(OUTPUT_SRT.read_text(encoding="utf-8"))
+
           if __name__ == "__main__":
               main()
           PY
@@ -1263,19 +510,17 @@ jobs:
       # ============================================================
       # RUN
       # ============================================================
-      - name: Run subtitle extraction
+      - name: Run subtitle timing extraction
         env:
-          SCAN_FPS: ${{ inputs.scan_fps }}
-          FINE_RESCAN_FPS: ${{ inputs.fine_rescan_fps }}
-          FINE_RESCAN_MIN_DURATION: ${{ inputs.fine_rescan_min_duration }}
-          REFINE_RADIUS: ${{ inputs.refine_radius }}
-          MAX_SHORT_GAP: ${{ inputs.max_short_gap }}
+          MODEL_SIZE: ${{ inputs.model_size }}
+          LANGUAGE: ${{ inputs.language }}
+          COMPUTE_TYPE: ${{ inputs.compute_type }}
+          BEAM_SIZE: ${{ inputs.beam_size }}
+          VAD_MIN_SILENCE_MS: ${{ inputs.vad_min_silence_ms }}
+          MAX_WORD_GAP: ${{ inputs.max_word_gap }}
+          MAX_CUE_DURATION: ${{ inputs.max_cue_duration }}
+          SPEECH_PAD_SECONDS: ${{ inputs.speech_pad_seconds }}
           MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
-          CLUSTER_DIFF_THRESHOLD: ${{ inputs.cluster_diff_threshold }}
-          CLUSTER_CONFIRM_SECONDS: ${{ inputs.cluster_confirm_seconds }}
-          LOCAL_WINDOW_SECONDS: ${{ inputs.local_window_seconds }}
-          LOCAL_MARGIN: ${{ inputs.local_margin }}
-          SAVE_DEBUG_FRAMES: ${{ inputs.save_debug_frames }}
         run: |
           set -euxo pipefail
           python process.py
@@ -1330,7 +575,7 @@ jobs:
 
           echo ""
           echo "=========================================="
-          echo "TIMING JSON"
+          echo "TIMING JSON (ASR reference text, QA only)"
           echo "=========================================="
           if [ -f work/timing.json ]; then
             python - <<'PY'
@@ -1340,8 +585,12 @@ jobs:
           data = json.loads(Path("work/timing.json").read_text(encoding="utf-8"))
           cues = data.get("cues", [])
           print("Timing cues:", len(cues))
+          print("Detected language:", data.get("language_detected"))
           for cue in cues:
-              print("[%04d] %.6f -> %.6f mid=%.6f" % (cue["index"], cue["start"], cue["end"], cue["midpoint"]))
+              print(
+                  "[%04d] %.6f -> %.6f  | %s"
+                  % (cue["index"], cue["start"], cue["end"], cue["asr_text_reference_only"])
+              )
           PY
           fi
 
@@ -1355,8 +604,7 @@ jobs:
           name: subtitle-debug
           path: |
             work/timing.json
-            work/all_debug.json
-            work/debug_frames/
+            work/audio.wav
             timing.srt
           if-no-files-found: warn
           retention-days: 7
@@ -1379,7 +627,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "timing.srt không thay đổi, không cần commit."
           else
-            git commit -m "extract: subtitle timing"
+            git commit -m "extract: subtitle timing (audio/ASR)"
             git push origin HEAD:${{ github.ref_name }}
           fi
 
