@@ -938,6 +938,12 @@ jobs:
           name: bilibili-vietnamese-result
           path: |
             output/video_vi.mp4
+            work/chinese.srt
+            work/vietnamese.srt
+            work/vietnamese.ass
+            work/subtitle_region.json
+            work/translation_debug.txt
+            work/blur_mask.png
           if-no-files-found: warn
           retention-days: 7
 
