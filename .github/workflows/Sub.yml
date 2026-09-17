@@ -1,4 +1,4 @@
-name: Bilibili → Vietnamese (All-in-one: Audio ASR → Translate → Render)
+name: Bilibili → Vietnamese
 
 on:
   workflow_dispatch:
