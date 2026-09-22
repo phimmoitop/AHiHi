@@ -74,20 +74,20 @@ on:
       sub_y1_ratio:
         description: "Dự phòng (chỉ dùng khi không đo được sub): mép trên theo tỉ lệ chiều cao video"
         required: false
-        default: "0.8"
+        default: "0.86"
         type: string
 
       sub_y2_ratio:
         description: "Dự phòng (chỉ dùng khi không đo được sub): mép dưới theo tỉ lệ chiều cao video"
         required: false
-        default: "0.95"
+        default: "0.96"
         type: string
 
       # ---------- RENDER ----------
       font_size:
         description: "Cỡ chữ phụ đề tiếng Việt"
         required: false
-        default: "30"
+        default: "35"
         type: string
 
       blur_sigma:
@@ -307,6 +307,8 @@ jobs:
           BLUR_X_RATIO = 0.75
           SUB_SEARCH_Y_RATIO = 0.5          # chi tim chu trong nua duoi khung hinh
           SUB_DETECT_SAMPLES = int(env_f("SUB_DETECT_SAMPLES", "15"))
+          SUB_DETECT_MIN_DELTA = 0.22        # do lech tan suat on-off toi thieu de tinh la "chu"
+          SUB_DETECT_PROFILE_CUT = 0.15      # nguong % so voi hang/cot dam nhat de xac dinh bien
           SUB_HEIGHT_MULTIPLIER = env_f("SUB_HEIGHT_MULTIPLIER", "1.5")
           SUB_Y1_RATIO = env_f("SUB_Y1_RATIO", "0.86")
           SUB_Y2_RATIO = env_f("SUB_Y2_RATIO", "0.96")
@@ -480,42 +482,85 @@ jobs:
               return cv2.bitwise_and(mask, cv2.inRange(gray, 165, 255))
 
 
-          def detect_sub_height(cues, width, height):
-              """Lay vai chuc frame LUC DANG CO SUB, do chieu cao thuc te cua chu
-              (khong can frame KHONG SUB de so sanh nhu ban cu -> nhanh hon nhieu)."""
-              y0 = int(height * SUB_SEARCH_Y_RATIO)
+          def pick_on_off_times(cues, duration, n):
+              """Lay mau thoi diem CO sub (giua moi cue) va KHONG sub (giua cac khoang lang)."""
               on_times = [(c["start"] + c["end"]) / 2.0 for c in cues if c["end"] - c["start"] >= 0.25]
-              if len(on_times) > SUB_DETECT_SAMPLES:
-                  step = len(on_times) / float(SUB_DETECT_SAMPLES)
-                  on_times = [on_times[int(i * step)] for i in range(SUB_DETECT_SAMPLES)]
 
-              heights, centers = [], []
-              for t in on_times:
-                  frame = get_frame(t)
-                  if frame is None:
-                      continue
-                  gray = cv2.cvtColor(frame[y0:height, 0:width], cv2.COLOR_BGR2GRAY)
-                  rows = np.where((text_mask(gray) > 0).sum(axis=1) > 0)[0]
-                  if rows.size < 3:
-                      continue
-                  ry1, ry2 = int(rows.min()), int(rows.max())
-                  if ry2 - ry1 < 4:
-                      continue
-                  heights.append(ry2 - ry1)
-                  centers.append(y0 + (ry1 + ry2) / 2.0)
+              off_times, prev_end = [], 0.0
+              for c in cues:
+                  gap = c["start"] - prev_end
+                  if gap >= 0.8:
+                      off_times.append(prev_end + gap / 2.0)
+                  prev_end = max(prev_end, c["end"])
+              if duration - prev_end >= 1.0:
+                  off_times.append(prev_end + (duration - prev_end) / 2.0)
 
-              if len(heights) < 3:
-                  log(f"DETECT: chi do duoc {len(heights)} mau -> dung ty le mac dinh.")
+              def spread(values, count):
+                  if len(values) <= count:
+                      return values
+                  step = len(values) / float(count)
+                  return [values[int(i * step)] for i in range(count)]
+
+              return spread(on_times, n), spread(off_times, n)
+
+
+          def detect_sub_band(cues, width, height, duration):
+              """So sanh frame LUC CO SUB voi frame LUC KHONG SUB de loai nhieu nen
+              (da cam thach / vien vang sang cung bi tophat bat nham neu chi xet 1 chieu).
+              Chi giu lai pixel THAY DOI giua 2 nhom -> do dung chieu cao + vi tri chu that."""
+              y0 = int(height * SUB_SEARCH_Y_RATIO)
+              on_times, off_times = pick_on_off_times(cues, duration, SUB_DETECT_SAMPLES)
+              log(f"DETECT: {len(on_times)} frame CO sub / {len(off_times)} frame KHONG sub")
+
+              if len(on_times) < 4 or len(off_times) < 2:
+                  log("DETECT: khong du mau -> dung ty le mac dinh.")
                   return None
 
-              text_h = float(np.median(heights))
-              center_y = float(np.median(centers))
-              log(f"DETECT: {len(heights)} mau, chieu cao chu ~{text_h:.1f}px, tam ~{center_y:.1f}px")
+              def accumulate(times):
+                  acc, used = None, 0
+                  for t in times:
+                      frame = get_frame(t)
+                      if frame is None:
+                          continue
+                      gray = cv2.cvtColor(frame[y0:height, 0:width], cv2.COLOR_BGR2GRAY)
+                      m = (text_mask(gray) > 0).astype(np.float32)
+                      acc = m if acc is None else acc + m
+                      used += 1
+                  return None if used == 0 else acc / used
+
+              on_freq = accumulate(on_times)
+              off_freq = accumulate(off_times)
+              if on_freq is None or off_freq is None:
+                  log("DETECT: khong trich duoc frame -> dung ty le mac dinh.")
+                  return None
+
+              band = ((on_freq - off_freq) >= SUB_DETECT_MIN_DELTA).astype(np.float32)
+              if band.sum() < 40:
+                  log("DETECT: tin hieu qua yeu -> dung ty le mac dinh.")
+                  return None
+
+              row_profile = band.sum(axis=1)
+              peak = row_profile.max()
+              if peak <= 0:
+                  return None
+              rows = np.nonzero(row_profile >= peak * SUB_DETECT_PROFILE_CUT)[0]
+              if rows.size == 0:
+                  return None
+
+              ry1, ry2 = int(rows.min()), int(rows.max())
+              if ry2 - ry1 < 4:
+                  log("DETECT: bang chu qua mong -> dung ty le mac dinh.")
+                  return None
+
+              text_h = float(ry2 - ry1)
+              center_y = float(y0 + (ry1 + ry2) / 2.0)
+              log(f"DETECT: chieu cao chu ~{text_h:.1f}px, tam ~{center_y:.1f}px "
+                  f"(tu {len(on_times)} frame on / {len(off_times)} frame off)")
               return text_h, center_y
 
 
-          def build_blur_region(cues, width, height):
-              detected = detect_sub_height(cues, width, height)
+          def build_blur_region(cues, width, height, duration):
+              detected = detect_sub_band(cues, width, height, duration)
 
               if detected:
                   text_h, center_y = detected
@@ -829,8 +874,8 @@ jobs:
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
 
-              # 3. Vung blur: do chieu cao chu that tu vai frame co sub, roi nhan 1.5x
-              region = build_blur_region(cues, width, height)
+              # 3. Vung blur: so sanh frame co/khong co sub de do dung chieu cao + vi tri chu, roi nhan 1.5x
+              region = build_blur_region(cues, width, height, duration)
               mask_path = create_feather_mask(region)
               (WORK / "subtitle_region.json").write_text(
                   json.dumps(region, ensure_ascii=False, indent=2), encoding="utf-8")
