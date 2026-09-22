@@ -62,26 +62,32 @@ on:
         type: string
 
       # ---------- BLUR ----------
-      # Vùng blur giờ CỐ ĐỊNH cho toàn bộ video (không dò theo từng thời điểm):
-      # bề rộng luôn bằng 3/4 chiều rộng video (canh giữa), chỉ cần xác định
-      # đúng vị trí trên/dưới theo 2 tỉ lệ bên dưới.
-      sub_y1_ratio:
-        description: "Mép trên vùng blur theo tỉ lệ chiều cao video (vị trí bắt đầu dòng sub cứng)"
+      # Vùng blur được TỰ ĐỘNG đo theo chiều cao chữ thật của sub cứng (lấy mẫu vài
+      # chục frame đang có thoại), rồi nhân với hệ số bên dưới để ra chiều cao vùng che.
+      # Bề rộng luôn cố định bằng 3/4 chiều rộng video (canh giữa).
+      sub_height_multiplier:
+        description: "Chiều cao vùng blur = hệ số này x chiều cao chữ sub đo được"
         required: false
-        default: "0.86"
+        default: "1.5"
+        type: string
+
+      sub_y1_ratio:
+        description: "Dự phòng (chỉ dùng khi không đo được sub): mép trên theo tỉ lệ chiều cao video"
+        required: false
+        default: "0.8"
         type: string
 
       sub_y2_ratio:
-        description: "Mép dưới vùng blur theo tỉ lệ chiều cao video (vị trí kết thúc dòng sub cứng)"
+        description: "Dự phòng (chỉ dùng khi không đo được sub): mép dưới theo tỉ lệ chiều cao video"
         required: false
-        default: "0.96"
+        default: "0.95"
         type: string
 
       # ---------- RENDER ----------
       font_size:
         description: "Cỡ chữ phụ đề tiếng Việt"
         required: false
-        default: "35"
+        default: "30"
         type: string
 
       blur_sigma:
@@ -295,9 +301,13 @@ jobs:
           CPU_THREADS = max(1, os.cpu_count() or 4)
 
           # ---- BLUR ----
-          # Vung blur co dinh cho toan bo video: rong = 3/4 chieu rong video (canh giua),
-          # vi tri tren/duoi lay theo SUB_Y1_RATIO / SUB_Y2_RATIO. Khong con do/sample gi ca.
+          # Vung blur = 1.5x chieu cao thuc te cua chu sub (do tu vai chuc frame co sub),
+          # rong co dinh = 3/4 chieu rong video (canh giua). Neu khong do duoc (video qua it
+          # cue hoac frame loi) thi fallback ve ty le SUB_Y1_RATIO/SUB_Y2_RATIO.
           BLUR_X_RATIO = 0.75
+          SUB_SEARCH_Y_RATIO = 0.5          # chi tim chu trong nua duoi khung hinh
+          SUB_DETECT_SAMPLES = int(env_f("SUB_DETECT_SAMPLES", "15"))
+          SUB_HEIGHT_MULTIPLIER = env_f("SUB_HEIGHT_MULTIPLIER", "1.5")
           SUB_Y1_RATIO = env_f("SUB_Y1_RATIO", "0.86")
           SUB_Y2_RATIO = env_f("SUB_Y2_RATIO", "0.96")
           MIN_BOTTOM_GAP = 8
@@ -454,12 +464,71 @@ jobs:
           # ============================================================
           # BUOC 3: VUNG BLUR CO DINH (khong dò, ap dung cho toan bo video)
           # ============================================================
-          def build_blur_region(width, height):
+          def get_frame(time_sec):
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, time_sec):.3f}",
+                     "-i", str(VIDEO), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"]
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if r.returncode != 0 or not r.stdout:
+                  return None
+              return cv2.imdecode(np.frombuffer(r.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+          def text_mask(gray):
+              kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 9))
+              tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+              _, mask = cv2.threshold(tophat, 22, 255, cv2.THRESH_BINARY)
+              return cv2.bitwise_and(mask, cv2.inRange(gray, 165, 255))
+
+
+          def detect_sub_height(cues, width, height):
+              """Lay vai chuc frame LUC DANG CO SUB, do chieu cao thuc te cua chu
+              (khong can frame KHONG SUB de so sanh nhu ban cu -> nhanh hon nhieu)."""
+              y0 = int(height * SUB_SEARCH_Y_RATIO)
+              on_times = [(c["start"] + c["end"]) / 2.0 for c in cues if c["end"] - c["start"] >= 0.25]
+              if len(on_times) > SUB_DETECT_SAMPLES:
+                  step = len(on_times) / float(SUB_DETECT_SAMPLES)
+                  on_times = [on_times[int(i * step)] for i in range(SUB_DETECT_SAMPLES)]
+
+              heights, centers = [], []
+              for t in on_times:
+                  frame = get_frame(t)
+                  if frame is None:
+                      continue
+                  gray = cv2.cvtColor(frame[y0:height, 0:width], cv2.COLOR_BGR2GRAY)
+                  rows = np.where((text_mask(gray) > 0).sum(axis=1) > 0)[0]
+                  if rows.size < 3:
+                      continue
+                  ry1, ry2 = int(rows.min()), int(rows.max())
+                  if ry2 - ry1 < 4:
+                      continue
+                  heights.append(ry2 - ry1)
+                  centers.append(y0 + (ry1 + ry2) / 2.0)
+
+              if len(heights) < 3:
+                  log(f"DETECT: chi do duoc {len(heights)} mau -> dung ty le mac dinh.")
+                  return None
+
+              text_h = float(np.median(heights))
+              center_y = float(np.median(centers))
+              log(f"DETECT: {len(heights)} mau, chieu cao chu ~{text_h:.1f}px, tam ~{center_y:.1f}px")
+              return text_h, center_y
+
+
+          def build_blur_region(cues, width, height):
+              detected = detect_sub_height(cues, width, height)
+
+              if detected:
+                  text_h, center_y = detected
+                  blur_h = text_h * SUB_HEIGHT_MULTIPLIER
+                  y1 = int(center_y - blur_h / 2)
+                  y2 = int(center_y + blur_h / 2)
+              else:
+                  y1 = int(height * SUB_Y1_RATIO)
+                  y2 = int(height * SUB_Y2_RATIO)
+
               band_w = int(width * BLUR_X_RATIO)
               x1 = int(width / 2 - band_w / 2)
               x2 = x1 + band_w
-              y1 = int(height * SUB_Y1_RATIO)
-              y2 = int(height * SUB_Y2_RATIO)
 
               x1 = max(0, x1); x2 = min(width, x2)
               y1 = max(0, y1); y2 = min(height - MIN_BOTTOM_GAP, y2)
@@ -475,13 +544,13 @@ jobs:
               feather = max(MIN_FEATHER_PX, feather)
 
               region = {
-                  "source": "fixed",
+                  "source": "auto-height" if detected else "fallback-ratio",
                   "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
                   "width": int(width), "height": int(height),
                   "blur_width": int(x2 - x1), "blur_height": int(y2 - y1),
                   "bottom_gap": int(height - y2), "feather_px": int(feather),
               }
-              log(f"FIXED BLUR REGION (toan bo video): {region}")
+              log(f"BLUR REGION: {region}")
               return region
 
 
@@ -760,8 +829,8 @@ jobs:
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
 
-              # 3. Vung blur (co dinh, khong can dò)
-              region = build_blur_region(width, height)
+              # 3. Vung blur: do chieu cao chu that tu vai frame co sub, roi nhan 1.5x
+              region = build_blur_region(cues, width, height)
               mask_path = create_feather_mask(region)
               (WORK / "subtitle_region.json").write_text(
                   json.dumps(region, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -794,6 +863,7 @@ jobs:
           MAX_CUE_DURATION: ${{ inputs.max_cue_duration }}
           SPEECH_PAD_SECONDS: ${{ inputs.speech_pad_seconds }}
           MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
+          SUB_HEIGHT_MULTIPLIER: ${{ inputs.sub_height_multiplier }}
           SUB_Y1_RATIO: ${{ inputs.sub_y1_ratio }}
           SUB_Y2_RATIO: ${{ inputs.sub_y2_ratio }}
           FONT_SIZE: ${{ inputs.font_size }}
