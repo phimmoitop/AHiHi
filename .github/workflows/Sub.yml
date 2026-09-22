@@ -68,7 +68,7 @@ on:
       sub_height_multiplier:
         description: "Chiều cao vùng blur = hệ số này x chiều cao chữ sub đo được"
         required: false
-        default: "1.5"
+        default: "2"
         type: string
 
       sub_y1_ratio:
@@ -93,7 +93,7 @@ on:
       blur_sigma:
         description: "Độ mạnh blur che sub cứng cũ (bán kính mỗi lần blur, blur 2 lần liên tiếp)"
         required: false
-        default: "18"
+        default: "30"
         type: string
 
 permissions:
