@@ -315,6 +315,8 @@ jobs:
           MIN_BOTTOM_GAP = 8
           MIN_BLUR_HEIGHT = 24
           BLUR_FEATHER_RATIO = 0.25
+          BLUR_FEATHER_Y_RATIO = 0.15    # feather truc doc: nho de khong an het vung "loi" alpha=255
+          BLUR_FEATHER_Y_MAX_PX = 12     # gioi han tuyet doi cho feather doc
           MIN_FEATHER_PX = 6
           BLUR_SIGMA = int(env_f("BLUR_SIGMA", "18"))
           BLUR_POWER = int(env_f("BLUR_POWER", "2"))
@@ -586,16 +588,23 @@ jobs:
               if (y2 - y1) % 2:
                   y2 -= 1
 
-              feather = max(MIN_FEATHER_PX, int((x2 - x1) * BLUR_FEATHER_RATIO))
-              feather = min(feather, (x2 - x1) // 2, (y2 - y1) // 2)
-              feather = max(MIN_FEATHER_PX, feather)
+              # Feather truc X (trai/phai): giu to cho min chuyen mau, khong anh huong chu.
+              feather_x = max(MIN_FEATHER_PX, int((x2 - x1) * BLUR_FEATHER_RATIO))
+              feather_x = min(feather_x, (x2 - x1) // 2)
+
+              # Feather truc Y (tren/duoi): PHAI nho hon nhieu so voi chieu cao box,
+              # neu khong se an het vung "loi" alpha=255 va lam lo chu sub goc.
+              feather_y = max(MIN_FEATHER_PX, int((y2 - y1) * BLUR_FEATHER_Y_RATIO))
+              feather_y = min(feather_y, BLUR_FEATHER_Y_MAX_PX, (y2 - y1) // 4)
+              feather_y = max(MIN_FEATHER_PX, feather_y)
 
               region = {
                   "source": "auto-height" if detected else "fallback-ratio",
                   "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
                   "width": int(width), "height": int(height),
                   "blur_width": int(x2 - x1), "blur_height": int(y2 - y1),
-                  "bottom_gap": int(height - y2), "feather_px": int(feather),
+                  "bottom_gap": int(height - y2),
+                  "feather_x_px": int(feather_x), "feather_y_px": int(feather_y),
               }
               log(f"BLUR REGION: {region}")
               return region
@@ -604,10 +613,11 @@ jobs:
           def create_feather_mask(region):
               width, height = region["width"], region["height"]
               x1, y1, x2, y2 = region["x1"], region["y1"], region["x2"], region["y2"]
-              feather = region["feather_px"]
+              feather_x = region["feather_x_px"]
+              feather_y = region["feather_y_px"]
 
-              cx1 = max(0, x1 - feather); cy1 = max(0, y1 - feather)
-              cx2 = min(width, x2 + feather); cy2 = min(height, y2 + feather)
+              cx1 = max(0, x1 - feather_x); cy1 = max(0, y1 - feather_y)
+              cx2 = min(width, x2 + feather_x); cy2 = min(height, y2 + feather_y)
               if (cx2 - cx1) % 2:
                   cx2 -= 1
               if (cy2 - cy1) % 2:
@@ -619,7 +629,12 @@ jobs:
 
               mask = np.zeros((ch, cw), dtype=np.uint8)
               mask[max(0, y1 - cy1):min(ch, y2 - cy1), max(0, x1 - cx1):min(cw, x2 - cx1)] = 255
-              mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), max(1.0, feather / 2.0))
+              # ksize/sigma rieng cho tung truc: truc doc (Y) mo nhe de van con
+              # mot vung loi alpha=255 phu het chu, truc ngang (X) mo rong cho tu nhien.
+              ksize = (feather_x * 2 + 1, feather_y * 2 + 1)
+              mask = cv2.GaussianBlur(mask, ksize,
+                                       sigmaX=max(1.0, feather_x / 2.0),
+                                       sigmaY=max(1.0, feather_y / 2.0))
 
               mask_path = WORK / "blur_mask.png"
               if not cv2.imwrite(str(mask_path), mask):
@@ -627,7 +642,8 @@ jobs:
 
               region.update({"crop_x1": int(cx1), "crop_y1": int(cy1),
                              "crop_x2": int(cx2), "crop_y2": int(cy2)})
-              log(f"FEATHER MASK: crop=({cx1},{cy1})-({cx2},{cy2}) size={cw}x{ch} feather={feather}px")
+              log(f"FEATHER MASK: crop=({cx1},{cy1})-({cx2},{cy2}) size={cw}x{ch} "
+                  f"feather_x={feather_x}px feather_y={feather_y}px")
               return mask_path
 
 
