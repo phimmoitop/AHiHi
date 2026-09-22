@@ -62,44 +62,26 @@ on:
         type: string
 
       # ---------- BLUR ----------
-      blur_mode:
-        description: "auto = tự dò vùng sub cứng bằng cách so sánh frame LÚC CÓ THOẠI với frame LÚC IM LẶNG (dùng chính timing vừa tạo, không cần OCR). manual = dùng 3 tỉ lệ bên dưới"
-        required: false
-        default: "auto"
-        type: choice
-        options:
-          - "auto"
-          - "manual"
-
-      manual_x_ratio:
-        description: "manual: bề rộng vùng blur theo tỉ lệ chiều rộng video (canh giữa)"
-        required: false
-        default: "0.70"
-        type: string
-
-      manual_y1_ratio:
-        description: "manual: mép trên vùng blur theo tỉ lệ chiều cao"
+      # Vùng blur giờ CỐ ĐỊNH cho toàn bộ video (không dò theo từng thời điểm):
+      # bề rộng luôn bằng 3/4 chiều rộng video (canh giữa), chỉ cần xác định
+      # đúng vị trí trên/dưới theo 2 tỉ lệ bên dưới.
+      sub_y1_ratio:
+        description: "Mép trên vùng blur theo tỉ lệ chiều cao video (vị trí bắt đầu dòng sub cứng)"
         required: false
         default: "0.86"
         type: string
 
-      manual_y2_ratio:
-        description: "manual: mép dưới vùng blur theo tỉ lệ chiều cao"
+      sub_y2_ratio:
+        description: "Mép dưới vùng blur theo tỉ lệ chiều cao video (vị trí kết thúc dòng sub cứng)"
         required: false
         default: "0.96"
-        type: string
-
-      detect_samples:
-        description: "auto: số frame lấy mẫu mỗi nhóm (có sub / không sub)"
-        required: false
-        default: "40"
         type: string
 
       # ---------- RENDER ----------
       font_size:
         description: "Cỡ chữ phụ đề tiếng Việt"
         required: false
-        default: "40"
+        default: "35"
         type: string
 
       blur_sigma:
@@ -182,6 +164,14 @@ jobs:
           echo "FONT_FAMILY=$FONT_FAMILY" >> "$GITHUB_ENV"
           echo "Font su dung: $FONT_FAMILY"
 
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
       # Khong con PaddleOCR/PaddlePaddle. opencv chi dung de do vung blur (so pixel,
       # khong nhan dang chu).
       - name: Install Python packages
@@ -193,7 +183,6 @@ jobs:
             yt-dlp \
             numpy==1.26.4 \
             opencv-python-headless==4.10.0.84 \
-            tqdm \
             pysubs2 \
             faster-whisper \
             google-genai
@@ -225,7 +214,8 @@ jobs:
             --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
             --add-header "Referer: https://www.bilibili.com/" \
             --add-header "Origin: https://www.bilibili.com" \
-            -f "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b" \
+            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" \
+            -S "res,codec:avc1:h264,ext:mp4:m4a" \
             --merge-output-format mp4 \
             -o "work/source.%(ext)s" \
             "$BILIBILI_URL"
@@ -278,7 +268,6 @@ jobs:
           import cv2
           import numpy as np
           import pysubs2
-          from tqdm import tqdm
           from faster_whisper import WhisperModel
           from google import genai
           from google.genai import types
@@ -303,19 +292,14 @@ jobs:
           MAX_CUE_DURATION = env_f("MAX_CUE_DURATION", "6.0")
           SPEECH_PAD_SECONDS = env_f("SPEECH_PAD_SECONDS", "0.08")
           MIN_CUE_DURATION = env_f("MIN_CUE_DURATION", "0.12")
+          CPU_THREADS = max(1, os.cpu_count() or 4)
 
           # ---- BLUR ----
-          BLUR_MODE = env_s("BLUR_MODE", "auto").lower()
-          MANUAL_X_RATIO = env_f("MANUAL_X_RATIO", "0.70")
-          MANUAL_Y1_RATIO = env_f("MANUAL_Y1_RATIO", "0.86")
-          MANUAL_Y2_RATIO = env_f("MANUAL_Y2_RATIO", "0.96")
-          DETECT_SAMPLES = int(env_f("DETECT_SAMPLES", "40"))
-          DETECT_Y_RATIO = 0.55
-          DETECT_MIN_DELTA = 0.22
-          PROFILE_CUT = 0.08
-          BLUR_PAD_X = 10
-          BLUR_PAD_Y_TOP = 8
-          BLUR_PAD_Y_BOTTOM = 10
+          # Vung blur co dinh cho toan bo video: rong = 3/4 chieu rong video (canh giua),
+          # vi tri tren/duoi lay theo SUB_Y1_RATIO / SUB_Y2_RATIO. Khong con do/sample gi ca.
+          BLUR_X_RATIO = 0.75
+          SUB_Y1_RATIO = env_f("SUB_Y1_RATIO", "0.86")
+          SUB_Y2_RATIO = env_f("SUB_Y2_RATIO", "0.96")
           MIN_BOTTOM_GAP = 8
           MIN_BLUR_HEIGHT = 24
           BLUR_FEATHER_RATIO = 0.25
@@ -373,21 +357,12 @@ jobs:
                       float(a) / float(b), float(data["format"]["duration"]))
 
 
-          def get_frame(time_sec):
-              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, time_sec):.3f}",
-                     "-i", str(VIDEO), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "2", "-"]
-              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              if r.returncode != 0 or not r.stdout:
-                  return None
-              return cv2.imdecode(np.frombuffer(r.stdout, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-
           # ============================================================
           # BUOC 1-2: ASR -> CUE TIENG TRUNG
           # ============================================================
           def transcribe():
-              log(f"Loading faster-whisper model={MODEL_SIZE}")
-              model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+              log(f"Loading faster-whisper model={MODEL_SIZE} (cpu_threads={CPU_THREADS})")
+              model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
 
               log(f"Transcribing (language={LANGUAGE or 'auto'}, beam_size={BEAM_SIZE}) ...")
               segments, info = model.transcribe(
@@ -477,103 +452,14 @@ jobs:
 
 
           # ============================================================
-          # BUOC 3: DO VUNG SUB CUNG (khong OCR)
+          # BUOC 3: VUNG BLUR CO DINH (khong dò, ap dung cho toan bo video)
           # ============================================================
-          def text_mask(gray):
-              kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (31, 9))
-              tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-              _, mask = cv2.threshold(tophat, 22, 255, cv2.THRESH_BINARY)
-              return cv2.bitwise_and(mask, cv2.inRange(gray, 165, 255))
-
-
-          def sample_times(cues, duration, n):
-              on_times = [(c["start"] + c["end"]) / 2.0 for c in cues if c["end"] - c["start"] >= 0.25]
-
-              off_times, prev_end = [], 0.0
-              for c in cues:
-                  gap = c["start"] - prev_end
-                  if gap >= 0.8:
-                      off_times.append(prev_end + gap / 2.0)
-                  prev_end = max(prev_end, c["end"])
-              if duration - prev_end >= 1.0:
-                  off_times.append(prev_end + (duration - prev_end) / 2.0)
-
-              def spread(values, count):
-                  if len(values) <= count:
-                      return values
-                  step = len(values) / float(count)
-                  return [values[int(i * step)] for i in range(count)]
-
-              return spread(on_times, n), spread(off_times, n)
-
-
-          def detect_subtitle_band(cues, width, height, duration):
-              y0 = int(height * DETECT_Y_RATIO)
-              on_times, off_times = sample_times(cues, duration, DETECT_SAMPLES)
-              log(f"DETECT: {len(on_times)} frame CO sub / {len(off_times)} frame KHONG sub")
-
-              if len(on_times) < 5 or len(off_times) < 3:
-                  log("DETECT: khong du mau -> dung manual ratio.")
-                  return None
-
-              def accumulate(times, label):
-                  acc, used = None, 0
-                  for t in tqdm(times, desc=label):
-                      frame = get_frame(t)
-                      if frame is None:
-                          continue
-                      gray = cv2.cvtColor(frame[y0:height, 0:width], cv2.COLOR_BGR2GRAY)
-                      m = (text_mask(gray) > 0).astype(np.float32)
-                      acc = m if acc is None else acc + m
-                      used += 1
-                  return None if used == 0 else acc / used
-
-              on_freq = accumulate(on_times, "Sampling ON")
-              off_freq = accumulate(off_times, "Sampling OFF")
-              if on_freq is None or off_freq is None:
-                  return None
-
-              band = ((on_freq - off_freq) >= DETECT_MIN_DELTA).astype(np.float32)
-              if band.sum() < 50:
-                  log("DETECT: tin hieu qua yeu -> dung manual ratio.")
-                  return None
-
-              def bounds(profile):
-                  peak = profile.max()
-                  if peak <= 0:
-                      return None
-                  idx = np.nonzero(profile >= peak * PROFILE_CUT)[0]
-                  return int(idx.min()), int(idx.max())
-
-              rb = bounds(band.sum(axis=1))
-              cb = bounds(band.sum(axis=0))
-              if rb is None or cb is None:
-                  return None
-
-              result = {"x1": cb[0], "y1": y0 + rb[0], "x2": cb[1], "y2": y0 + rb[1]}
-              log(f"DETECT RAW BAND: {result}")
-              return result
-
-
-          def build_blur_region(cues, width, height, fps, duration):
-              detected = detect_subtitle_band(cues, width, height, duration) if BLUR_MODE == "auto" else None
-
-              if detected is None:
-                  band_w = int(width * MANUAL_X_RATIO)
-                  x1 = int(width / 2 - band_w / 2)
-                  x2 = x1 + band_w
-                  y1 = int(height * MANUAL_Y1_RATIO)
-                  y2 = int(height * MANUAL_Y2_RATIO)
-                  source = "manual"
-              else:
-                  x1 = detected["x1"] - BLUR_PAD_X
-                  x2 = detected["x2"] + BLUR_PAD_X
-                  y1 = detected["y1"] - BLUR_PAD_Y_TOP
-                  y2 = detected["y2"] + BLUR_PAD_Y_BOTTOM
-                  half = max(width / 2 - x1, x2 - width / 2)
-                  x1 = int(width / 2 - half)
-                  x2 = int(width / 2 + half)
-                  source = "auto"
+          def build_blur_region(width, height):
+              band_w = int(width * BLUR_X_RATIO)
+              x1 = int(width / 2 - band_w / 2)
+              x2 = x1 + band_w
+              y1 = int(height * SUB_Y1_RATIO)
+              y2 = int(height * SUB_Y2_RATIO)
 
               x1 = max(0, x1); x2 = min(width, x2)
               y1 = max(0, y1); y2 = min(height - MIN_BOTTOM_GAP, y2)
@@ -589,13 +475,13 @@ jobs:
               feather = max(MIN_FEATHER_PX, feather)
 
               region = {
-                  "source": source,
+                  "source": "fixed",
                   "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
-                  "width": int(width), "height": int(height), "fps": float(fps),
+                  "width": int(width), "height": int(height),
                   "blur_width": int(x2 - x1), "blur_height": int(y2 - y1),
                   "bottom_gap": int(height - y2), "feather_px": int(feather),
               }
-              log(f"FINAL BLUR REGION: {region}")
+              log(f"FIXED BLUR REGION (toan bo video): {region}")
               return region
 
 
@@ -874,8 +760,8 @@ jobs:
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
 
-              # 3. Vung blur
-              region = build_blur_region(cues, width, height, fps, duration)
+              # 3. Vung blur (co dinh, khong can dò)
+              region = build_blur_region(width, height)
               mask_path = create_feather_mask(region)
               (WORK / "subtitle_region.json").write_text(
                   json.dumps(region, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -908,11 +794,8 @@ jobs:
           MAX_CUE_DURATION: ${{ inputs.max_cue_duration }}
           SPEECH_PAD_SECONDS: ${{ inputs.speech_pad_seconds }}
           MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
-          BLUR_MODE: ${{ inputs.blur_mode }}
-          MANUAL_X_RATIO: ${{ inputs.manual_x_ratio }}
-          MANUAL_Y1_RATIO: ${{ inputs.manual_y1_ratio }}
-          MANUAL_Y2_RATIO: ${{ inputs.manual_y2_ratio }}
-          DETECT_SAMPLES: ${{ inputs.detect_samples }}
+          SUB_Y1_RATIO: ${{ inputs.sub_y1_ratio }}
+          SUB_Y2_RATIO: ${{ inputs.sub_y2_ratio }}
           FONT_SIZE: ${{ inputs.font_size }}
           BLUR_SIGMA: ${{ inputs.blur_sigma }}
           FONT_NAME: ${{ env.FONT_FAMILY }}
