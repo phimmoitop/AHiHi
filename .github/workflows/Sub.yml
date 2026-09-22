@@ -87,13 +87,13 @@ on:
       font_size:
         description: "Cỡ chữ phụ đề tiếng Việt"
         required: false
-        default: "35"
+        default: "40"
         type: string
 
       blur_sigma:
-        description: "Độ mạnh blur che sub cứng cũ"
+        description: "Độ mạnh blur che sub cứng cũ (bán kính mỗi lần blur, blur 2 lần liên tiếp)"
         required: false
-        default: "9"
+        default: "18"
         type: string
 
 permissions:
@@ -316,7 +316,8 @@ jobs:
           MIN_BLUR_HEIGHT = 24
           BLUR_FEATHER_RATIO = 0.25
           MIN_FEATHER_PX = 6
-          BLUR_SIGMA = int(env_f("BLUR_SIGMA", "9"))
+          BLUR_SIGMA = int(env_f("BLUR_SIGMA", "18"))
+          BLUR_POWER = int(env_f("BLUR_POWER", "2"))
 
           # ---- STYLE ----
           FONT_NAME = env_s("FONT_NAME", "Arial")
@@ -324,8 +325,9 @@ jobs:
           LETTER_SPACING = -1
           OUTLINE_SIZE = 1
           SHADOW_SIZE = 0
-          BOX_BACKGROUND_ENABLED = True
+          BOX_BACKGROUND_ENABLED = False
           BOX_BACKGROUND_ALPHA = 140
+          SUB_TEXT_COLOR = (255, 214, 0)   # vang, dinh dang (R,G,B)
 
           # ---- GEMINI ----
           GEMINI_MODEL = "gemini-2.5-flash"
@@ -773,11 +775,11 @@ jobs:
               style = pysubs2.SSAStyle()
               style.fontname = FONT_NAME
               style.fontsize = FONT_SIZE
-              style.primarycolor = pysubs2.Color(255, 255, 255, 0)
-              style.secondarycolor = pysubs2.Color(255, 255, 255, 0)
+              style.primarycolor = pysubs2.Color(*SUB_TEXT_COLOR, 0)
+              style.secondarycolor = pysubs2.Color(*SUB_TEXT_COLOR, 0)
               style.outlinecolor = pysubs2.Color(0, 0, 0, 0)
               style.backcolor = pysubs2.Color(0, 0, 0, 255 - BOX_BACKGROUND_ALPHA) if BOX_BACKGROUND_ENABLED \
-                  else pysubs2.Color(0, 0, 0, 0)
+                  else pysubs2.Color(0, 0, 0, 255)
               style.borderstyle = 3 if BOX_BACKGROUND_ENABLED else 1
               style.outline = OUTLINE_SIZE
               style.shadow = SHADOW_SIZE
@@ -829,7 +831,7 @@ jobs:
               video_filter = (
                   f"[0:v]format=yuv420p,split=2[base1][base2];"
                   f"[base1]crop=w={cw}:h={ch}:x={cx1}:y={cy1},"
-                  f"boxblur=luma_radius={BLUR_SIGMA}:luma_power=1:chroma_radius={BLUR_SIGMA}:chroma_power=1,"
+                  f"boxblur=luma_radius={BLUR_SIGMA}:luma_power={BLUR_POWER}:chroma_radius={BLUR_SIGMA}:chroma_power={BLUR_POWER},"
                   f"format=yuv420p,setsar=1[blur_crop];"
                   f"[1:v]format=gray,scale=w={cw}:h={ch}:flags=neighbor,setsar=1[mask];"
                   f"[blur_crop][mask]alphamerge,format=yuva420p[blur_rgba];"
