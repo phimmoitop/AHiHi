@@ -1,0 +1,761 @@
+name: Bilibili → Thuyết Minh (Nữ, TTS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ---------- SOURCE ----------
+      url:
+        description: "Bilibili video URL"
+        required: true
+        type: string
+
+      # ---------- CLOUDFLARE DEPLOY ----------
+      slug:
+        description: "Slug"
+        required: true
+        type: string
+      token:
+        description: "Token"
+        required: true
+        type: string
+      page:
+        description: "Page"
+        required: true
+        type: string
+      account:
+        description: "Account"
+        required: true
+        type: string
+
+      # ---------- ASR ----------
+      model_size:
+        description: "faster-whisper model. medium = cân bằng tốt trên CPU runner; large-v3 chính xác nhất nhưng chậm hơn nhiều"
+        required: false
+        default: "medium"
+        type: choice
+        options:
+          - "small"
+          - "medium"
+          - "large-v3"
+      language:
+        description: "Mã ngôn ngữ nguồn (zh = tiếng Trung). Để trống để tự nhận diện"
+        required: false
+        default: "zh"
+        type: string
+      beam_size:
+        description: "Beam size khi decode"
+        required: false
+        default: "5"
+        type: string
+      vad_min_silence_ms:
+        description: "Silero VAD: khoảng lặng tối thiểu (ms) để coi là ranh giới giữa 2 đoạn thoại"
+        required: false
+        default: "300"
+        type: string
+      max_word_gap:
+        description: "Khoảng lặng (giây) giữa 2 từ để buộc tách thành 2 câu sub"
+        required: false
+        default: "0.45"
+        type: string
+      max_cue_duration:
+        description: "Cue dài quá giá trị này (giây) sẽ bị ép tách tại khoảng lặng gần nhất"
+        required: false
+        default: "6.0"
+        type: string
+      speech_pad_seconds:
+        description: "Nới thêm đầu/cuối mỗi cue (giây)"
+        required: false
+        default: "0.08"
+        type: string
+      min_cue_duration:
+        description: "Loại bỏ cue ngắn hơn giá trị này (giây)"
+        required: false
+        default: "0.12"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+      LC_ALL: "C.UTF-8"
+      LANG: "C.UTF-8"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install system packages
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      - name: Install Python packages
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install \
+            yt-dlp \
+            faster-whisper \
+            google-genai \
+            pysubs2 \
+            webvtt-py \
+            edge-tts
+
+      - name: Prepare directories
+        run: |
+          set -eux
+          mkdir -p work output chunks
+
+      - name: Prepare Bilibili cookies
+        env:
+          BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BILIBILI_COOKIES:-}" ]; then
+            echo "::error::GitHub Secret BILIBILI_COOKIES chua duoc cau hinh."
+            exit 1
+          fi
+          printf '%s\n' "$BILIBILI_COOKIES" > work/cookies.txt
+          chmod 600 work/cookies.txt
+
+      - name: Download Bilibili video
+        env:
+          BILIBILI_URL: ${{ inputs.url }}
+        run: |
+          set -euo pipefail
+          yt-dlp --cookies work/cookies.txt --no-playlist \
+            --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
+            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
+            --add-header "Referer: https://www.bilibili.com/" \
+            --add-header "Origin: https://www.bilibili.com" \
+            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" \
+            -S "res,codec:avc1:h264,ext:mp4:m4a" \
+            --merge-output-format mp4 \
+            -o "raw_video.mp4" \
+            "$BILIBILI_URL"
+
+          if [ ! -f raw_video.mp4 ]; then
+            echo "::error::raw_video.mp4 khong ton tai."
+            find . -maxdepth 2 -type f -ls
+            exit 1
+          fi
+          ls -lh .
+
+      - name: Extract audio track (for ASR)
+        run: |
+          set -eux
+          ffmpeg -hide_banner -loglevel error -y \
+            -i raw_video.mp4 -vn -ac 1 -ar 16000 -c:a pcm_s16le \
+            work/audio.wav
+          ls -lh work/audio.wav
+
+      - name: Create ASR + Translate script
+        run: |
+          cat > asr_translate.py <<'PY'
+          """
+          ASR (faster-whisper) tu audio goc -> cue tieng Trung -> dich sang tieng Viet
+          bang Gemini. KHONG render video, KHONG blur sub cung. Ket qua cuoi cung la
+          work/vietnamese.vtt (dung lam input cho buoc TTS) cung voi cac file .srt de
+          doi chieu / debug.
+          """
+
+          import os, re, json, time, random, subprocess
+          from pathlib import Path
+
+          import pysubs2
+          from faster_whisper import WhisperModel
+          from google import genai
+          from google.genai import types
+
+          WORK = Path("work")
+          VIDEO = Path("raw_video.mp4")
+          AUDIO = WORK / "audio.wav"
+
+          def env_f(name, default):
+              return float(os.environ.get(name, default) or default)
+
+          def env_s(name, default):
+              return (os.environ.get(name) or default).strip()
+
+          # ---- ASR ----
+          MODEL_SIZE = env_s("MODEL_SIZE", "medium")
+          LANGUAGE = os.environ.get("LANGUAGE", "").strip() or None
+          BEAM_SIZE = int(env_f("BEAM_SIZE", "5"))
+          VAD_MIN_SILENCE_MS = int(env_f("VAD_MIN_SILENCE_MS", "300"))
+          MAX_WORD_GAP = env_f("MAX_WORD_GAP", "0.45")
+          MAX_CUE_DURATION = env_f("MAX_CUE_DURATION", "6.0")
+          SPEECH_PAD_SECONDS = env_f("SPEECH_PAD_SECONDS", "0.08")
+          MIN_CUE_DURATION = env_f("MIN_CUE_DURATION", "0.12")
+          CPU_THREADS = max(1, os.cpu_count() or 4)
+
+          # ---- GEMINI ----
+          GEMINI_MODEL = "gemini-3.5-flash-lite"
+          GEMINI_BATCH_SIZE = 150
+          GEMINI_MAX_RETRIES = 10
+          RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
+          GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
+
+          SYSTEM_INSTRUCTION = (
+              "You are a professional video subtitle translator. Translate the text into natural, fluent Vietnamese.\n"
+              "CRITICAL RULES:\n"
+              "1. You MUST output EVERY line with its exact index. Never skip any index.\n"
+              "2. Maintain the exact same line identifiers like [0], [1], [2], etc. Do not merge, skip, or group any lines.\n"
+              "3. If a line is empty or just '...', output the identifier with '...'.\n"
+              "4. Translate naturally based on the surrounding context of the whole video.\n"
+              "5. Output ONLY the translated numbered lines. No markdown, no notes, no extra text.\n"
+              "6. PRONOUN SAFETY (VERY IMPORTANT): The source is Chinese, where family/relationship terms "
+              "(mother, older brother, uncle, etc.) are usually explicit in the dialogue itself. When translating "
+              "to Vietnamese, ALWAYS use the correct relational pronoun based on the clear relationship stated or "
+              "implied (mẹ/con, anh/em, cô/cháu, etc.) — never swap the roles.\n"
+              "7. If the relationship between speaker and listener is AMBIGUOUS or CANNOT be determined from the "
+              "given line alone, DO NOT guess a specific relational pronoun. Instead, rephrase the sentence to be "
+              "SHORTER and more NEUTRAL — using no pronoun, an implied subject, or a generic/neutral phrasing — "
+              "so the sentence still sounds natural in Vietnamese without committing to an incorrect relationship."
+          )
+
+
+          def log(msg):
+              print(msg, flush=True)
+
+
+          def probe_duration():
+              cmd = ["ffprobe", "-hide_banner", "-v", "error",
+                     "-show_entries", "format=duration", "-of", "json", str(VIDEO)]
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+              data = json.loads(r.stdout)
+              return float(data["format"]["duration"])
+
+
+          # ============================================================
+          # ASR -> CUE TIENG TRUNG
+          # ============================================================
+          def transcribe():
+              log(f"Loading faster-whisper model={MODEL_SIZE} (cpu_threads={CPU_THREADS})")
+              model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=CPU_THREADS)
+
+              log(f"Transcribing (language={LANGUAGE or 'auto'}, beam_size={BEAM_SIZE}) ...")
+              segments, info = model.transcribe(
+                  str(AUDIO),
+                  language=LANGUAGE,
+                  beam_size=BEAM_SIZE,
+                  word_timestamps=True,
+                  vad_filter=True,
+                  vad_parameters=dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS),
+                  condition_on_previous_text=False,
+              )
+              log(f"Detected language={info.language} (p={info.language_probability:.3f})")
+
+              words = []
+              for seg in segments:
+                  seg_words = list(seg.words or [])
+                  if not seg_words:
+                      words.append({"start": float(seg.start), "end": float(seg.end),
+                                    "text": seg.text.strip(), "seg": float(seg.start)})
+                      continue
+                  for w in seg_words:
+                      words.append({"start": float(w.start), "end": float(w.end),
+                                    "text": str(w.word).strip(), "seg": float(seg.start)})
+
+              log(f"ASR words = {len(words)}")
+              return words
+
+
+          def group_words(words):
+              cues, current, prev = [], None, None
+
+              def flush():
+                  nonlocal current
+                  if current and current["words"]:
+                      cues.append(current)
+                  current = None
+
+              for w in words:
+                  gap = (w["start"] - prev["end"]) if prev else None
+                  new_seg = prev is not None and w["seg"] != prev["seg"]
+
+                  start_new = current is None or new_seg
+                  if not start_new and gap is not None and gap >= MAX_WORD_GAP:
+                      start_new = True
+                  if (not start_new and current
+                          and (w["end"] - current["start"]) > MAX_CUE_DURATION
+                          and gap is not None and gap > 0.02):
+                      start_new = True
+
+                  if start_new:
+                      flush()
+                      current = {"start": w["start"], "end": w["end"], "words": [w]}
+                  else:
+                      current["end"] = w["end"]
+                      current["words"].append(w)
+                  prev = w
+
+              flush()
+              return cues
+
+
+          def finalize_cues(grouped, duration):
+              padded = []
+              for c in grouped:
+                  st = max(0.0, c["start"] - SPEECH_PAD_SECONDS)
+                  en = min(duration, c["end"] + SPEECH_PAD_SECONDS)
+                  text = re.sub(r"\s+", "", "".join(w["text"] for w in c["words"])).strip()
+                  if text:
+                      padded.append({"start": st, "end": en, "text": text})
+
+              padded.sort(key=lambda c: (c["start"], c["end"]))
+              final = []
+              for c in padded:
+                  st, en = c["start"], c["end"]
+                  if final and st < final[-1]["end"]:
+                      mid = (st + final[-1]["end"]) / 2.0
+                      final[-1]["end"] = mid
+                      st = mid
+                  if en - st < MIN_CUE_DURATION:
+                      continue
+                  final.append({"start": st, "end": en, "text": c["text"]})
+
+              log(f"CHINESE CUES = {len(final)}")
+              if not final:
+                  raise RuntimeError("ASR khong tao duoc cue nao.")
+              return final
+
+
+          # ============================================================
+          # DICH
+          # ============================================================
+          def get_random_gemini_client():
+              key = random.choice(GEMINI_API_KEYS)
+              return genai.Client(api_key=key), key
+
+
+          def call_gemini_with_retry(prompt_text, max_retries=GEMINI_MAX_RETRIES):
+              for attempt in range(max_retries):
+                  wait = 6 * (2 ** attempt)
+                  client, key = get_random_gemini_client()
+                  log(f">> GUI GEMINI - Lan {attempt + 1}/{max_retries} | Key #{GEMINI_API_KEYS.index(key) + 1} | {time.strftime('%H:%M:%S')}")
+                  try:
+                      t0 = time.time()
+                      response = client.models.generate_content(
+                          model=GEMINI_MODEL,
+                          contents=prompt_text,
+                          config=types.GenerateContentConfig(
+                              system_instruction=SYSTEM_INSTRUCTION,
+                              temperature=0.3,
+                          )
+                      )
+                      log(f"<< NHAN KET QUA - Thanh cong sau {time.time() - t0:.1f}s")
+                      return response.text
+                  except Exception as e:
+                      err = str(e)
+                      log(f"<< LOI API: {err}")
+                      if any(c in err for c in ("503", "429", "500", "UNAVAILABLE")):
+                          log(f"   Server ban/qua tai/limit. Doi key va cho {wait}s...")
+                          time.sleep(wait)
+                      else:
+                          log("   Loi khong the retry. Dung thu lai.")
+                          break
+              return None
+
+
+          def parse_translated(response_text):
+              out = {}
+              for line in response_text.strip().split("\n"):
+                  if "]" in line:
+                      try:
+                          head, val = line.split("]", 1)
+                          val = val.strip()
+                          out[int(head.replace("[", "").strip())] = "" if val == "..." else val
+                      except Exception:
+                          pass
+              return out
+
+
+          def translate_cues(cues):
+              if not GEMINI_API_KEYS:
+                  raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
+
+              total = len(cues)
+              total_batches = (total + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
+              log(f"BAT DAU DICH - {total} dong / {total_batches} batch")
+
+              results = []
+              for i in range(0, total, GEMINI_BATCH_SIZE):
+                  batch = cues[i:i + GEMINI_BATCH_SIZE]
+                  bn = i // GEMINI_BATCH_SIZE + 1
+                  log(f"[BATCH {bn}/{total_batches}] Dong {i + 1}-{min(i + GEMINI_BATCH_SIZE, total)}")
+
+                  prompt_text = "".join(f"[{idx}] {c['text'].strip() or '...'}\n" for idx, c in enumerate(batch))
+                  log(">> NOI DUNG GUI LEN API:")
+                  for line in prompt_text.strip().split("\n"):
+                      log(f"   {line}")
+
+                  response_text = call_gemini_with_retry(prompt_text)
+                  if response_text is None:
+                      raise RuntimeError(f"[THAT BAI] Khong the dich batch {bn}.")
+
+                  log(">> KET QUA DICH TU AI:")
+                  for line in response_text.strip().split("\n"):
+                      log(f"   {line}")
+
+                  translated = parse_translated(response_text)
+
+                  missing = [idx for idx in range(len(batch)) if not translated.get(idx)]
+                  if missing:
+                      log(f">> CANH BAO: AI bo sot {len(missing)} dong: {missing}. Retry...")
+                      rp = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
+                      rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in missing)
+                      rp += "\nOutput ONLY the missing lines with their exact [index] prefix."
+                      rr = call_gemini_with_retry(rp)
+                      if rr:
+                          log(">> KET QUA RETRY:")
+                          for line in rr.strip().split("\n"):
+                              log(f"   {line}")
+                          translated.update(parse_translated(rr))
+
+                  fallback = 0
+                  for idx, cue in enumerate(batch):
+                      if translated.get(idx):
+                          vi = translated[idx]
+                      else:
+                          vi = cue["text"]
+                          fallback += 1
+                          log(f"   [{i + idx + 1:04d}] FALLBACK (giu nguyen goc): {cue['text']!r}")
+                      results.append({"start": cue["start"], "end": cue["end"],
+                                      "text": cue["text"], "vi": vi})
+
+                  if fallback:
+                      log(f">> Batch {bn}: {fallback} dong giu nguyen tieng Trung.")
+                  log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
+                  time.sleep(3)
+
+              with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
+                  for idx, r in enumerate(results):
+                      zh, vi = len(r["text"]), len(r["vi"])
+                      flag = " [SUSPICIOUS]" if vi < zh * 0.6 else ""
+                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s{flag}\n")
+                      f.write(f"  ZH ({zh}): {r['text']}\n")
+                      f.write(f"  VI ({vi}): {r['vi']}\n\n")
+
+              return results
+
+
+          # ============================================================
+          # LUU FILE SUB (SRT + VTT). Khong render, khong blur.
+          # ============================================================
+          def save_sub(cues, path, field):
+              subs = pysubs2.SSAFile()
+              for c in cues:
+                  subs.events.append(pysubs2.SSAEvent(
+                      start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c[field]))
+              subs.save(str(path), encoding="utf-8")
+
+
+          def main():
+              if not VIDEO.exists():
+                  raise RuntimeError(f"Video khong ton tai: {VIDEO}")
+              if not AUDIO.exists():
+                  raise RuntimeError(f"Audio khong ton tai: {AUDIO}")
+
+              duration = probe_duration()
+              log(f"VIDEO DURATION = {duration:.2f}s")
+
+              cues = finalize_cues(group_words(transcribe()), duration)
+              save_sub(cues, WORK / "chinese.srt", "text")
+              for i, c in enumerate(cues, 1):
+                  log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
+
+              translated = translate_cues(cues)
+              save_sub(translated, WORK / "vietnamese.srt", "vi")
+              save_sub(translated, WORK / "vietnamese.vtt", "vi")
+
+              log("ASR + TRANSLATE COMPLETE")
+              log(f"Chinese SRT   : {WORK / 'chinese.srt'}")
+              log(f"Vietnamese SRT: {WORK / 'vietnamese.srt'}")
+              log(f"Vietnamese VTT: {WORK / 'vietnamese.vtt'} (dung cho buoc TTS)")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run ASR → Translate
+        env:
+          MODEL_SIZE: ${{ inputs.model_size }}
+          LANGUAGE: ${{ inputs.language }}
+          BEAM_SIZE: ${{ inputs.beam_size }}
+          VAD_MIN_SILENCE_MS: ${{ inputs.vad_min_silence_ms }}
+          MAX_WORD_GAP: ${{ inputs.max_word_gap }}
+          MAX_CUE_DURATION: ${{ inputs.max_cue_duration }}
+          SPEECH_PAD_SECONDS: ${{ inputs.speech_pad_seconds }}
+          MIN_CUE_DURATION: ${{ inputs.min_cue_duration }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+        run: |
+          set -euo pipefail
+          python asr_translate.py
+
+      - name: Check ASR/Translate output
+        run: |
+          set -e
+          echo "===== VIETNAMESE VTT (head) ====="
+          head -40 work/vietnamese.vtt || true
+          wc -l work/vietnamese.vtt || true
+
+      - name: TTS Generation (from Vietnamese VTT)
+        run: |
+          python3 <<'EOF'
+          import webvtt, os, re, asyncio, edge_tts, subprocess, sys
+
+          MAX_CONCURRENT_TTS = 3
+          ERROR_THRESHOLD = 5  # Ngưỡng lỗi để dừng workflow
+          failed_count = 0
+
+          def normalize_for_tts(text):
+              text = text.lower()
+              text = re.sub(r'<[^>]+>', '', text)
+              text = re.sub(r'\b([a-zà-ỹđ])-\1', r'\1', text)
+              text = re.sub(r'\s+', ' ', text).strip()
+              text = text.replace('"', '').replace('[', '').replace(']', '')
+              text = text.replace(",", ", ").replace(".", ". ")
+              if not text.endswith((".", "!", "?", "...")): text += "."
+              return text
+
+          async def generate_tts(text, out, idx, semaphore):
+              global failed_count
+              async with semaphore:
+                  try:
+                      tts_text = normalize_for_tts(text)
+                      if not tts_text or tts_text == ".":
+                          raise Exception("Empty text")
+
+                      for attempt in range(2):
+                          try:
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+27%")
+                              await tts.save(out)
+                              if os.path.exists(out) and os.path.getsize(out) > 0:
+                                  break
+                          except:
+                              if attempt == 1: raise
+                              await asyncio.sleep(1)
+
+                      tmp_out = out + ".tmp.mp3"
+                      subprocess.run(["ffmpeg", "-y", "-i", out, "-af", "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:stop_periods=0:stop_threshold=-50dB:stop_duration=0", tmp_out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                      os.rename(tmp_out, out)
+                  except Exception as e:
+                      failed_count += 1
+                      print(f"Lỗi đoạn {idx}: {e}")
+                      subprocess.run(["ffmpeg","-y","-f","lavfi","-i","anullsrc=r=24000:cl=mono","-t","0.1",out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+          async def main():
+              vtt_path = "work/vietnamese.vtt"
+              if not os.path.exists(vtt_path):
+                  print(f"Missing {vtt_path}"); sys.exit(1)
+
+              vtt = webvtt.read(vtt_path)
+              os.makedirs("chunks", exist_ok=True)
+              semaphore = asyncio.Semaphore(MAX_CONCURRENT_TTS)
+
+              tasks = [generate_tts(c.text, f"chunks/c_{i}.mp3", i, semaphore) for i, c in enumerate(vtt)]
+              await asyncio.gather(*tasks)
+
+              print(f"Tổng số đoạn lỗi: {failed_count}")
+              if failed_count > ERROR_THRESHOLD:
+                  print(f"Phát hiện {failed_count} đoạn lỗi (vượt ngưỡng {ERROR_THRESHOLD}). Dừng Workflow!")
+                  sys.exit(1)
+
+              with open("count.txt", "w") as f: f.write(str(len(vtt)))
+              print(f"[DONE] Generated {len(vtt)} TTS chunks")
+
+          asyncio.run(main())
+          EOF
+
+      - name: Build Audio Batches & Filter (Chia nhỏ 300 sub/lần)
+        run: |
+          VIDEO_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 raw_video.mp4)
+          AUDIO_RATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=noprint_wrappers=1:nokey=1 raw_video.mp4)
+          if [ -z "$AUDIO_RATE" ]; then AUDIO_RATE=44100; fi
+          echo "audio_rate=$AUDIO_RATE" >> $GITHUB_ENV
+
+          export VIDEO_DURATION=$VIDEO_DURATION
+          export AUDIO_RATE=$AUDIO_RATE
+
+          python3 <<'EOF'
+          import webvtt, os, subprocess, math
+          def to_ms(time_str):
+              h, m, s = time_str.replace(',', '.').split(':')
+              return int(float(h)*3600000 + float(m)*60000 + float(s)*1000)
+          def get_duration(file):
+              cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file]
+              return float(subprocess.check_output(cmd))
+
+          vtt = webvtt.read("work/vietnamese.vtt")
+          audio_rate = int(os.environ.get('AUDIO_RATE', 44100))
+          video_duration_ms = int(float(os.environ.get('VIDEO_DURATION', 0)) * 1000)
+
+          BATCH_SIZE = 300
+          total_subs = len(vtt)
+          num_batches = math.ceil(total_subs / BATCH_SIZE)
+
+          for b in range(num_batches):
+              start_idx = b * BATCH_SIZE
+              end_idx = min((b + 1) * BATCH_SIZE, total_subs)
+              batch_vtt = vtt[start_idx:end_idx]
+
+              filters = []
+              mix_labels = ""
+              inputs_args = []
+
+              for i_local, c in enumerate(batch_vtt):
+                  i_global = start_idx + i_local
+                  start_ms = to_ms(c.start)
+
+                  delay_samples = int(((start_ms + 500) * audio_rate) / 1000)
+
+                  if i_global < total_subs - 1:
+                      next_start_ms = to_ms(vtt[i_global+1].start)
+                      max_duration_ms = next_start_ms - start_ms + 300
+                  else:
+                      max_duration_ms = video_duration_ms - start_ms + 300 if video_duration_ms > 0 else 10000
+
+                  max_duration_ms = max(1000, max_duration_ms)
+                  max_duration_sec = max_duration_ms / 1000.0
+                  orig_duration_sec = get_duration(f"chunks/c_{i_global}.mp3")
+
+                  atempo_str = ""
+
+                  filters.append(
+                      f"[{i_local}:a]{atempo_str}aresample={audio_rate}:async=1,adelay={delay_samples}S|{delay_samples}S[a{i_local}]"
+                  )
+                  mix_labels += f"[a{i_local}]"
+                  inputs_args.extend(["-i", f"chunks/c_{i_global}.mp3"])
+
+              num_in_batch = len(batch_vtt)
+              filter_str = ";".join(filters) + f";{mix_labels}amix=inputs={num_in_batch}:normalize=0:dropout_transition=0,asetpts=PTS-STARTPTS,volume=1.5[out]"
+
+              with open(f"audio_filter_b{b}.txt", "w") as f:
+                  f.write(filter_str)
+
+              out_batch = f"batch_{b}.m4a"
+              print(f"[*] Rendering Batch {b} ({num_in_batch} subs)...")
+              cmd = ["ffmpeg", "-y"] + inputs_args + ["-filter_complex_script", f"audio_filter_b{b}.txt", "-map", "[out]", "-c:a", "aac", "-ar", str(audio_rate), "-b:a", "128k", out_batch]
+              subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+          with open("final_mix.txt", "w") as f:
+              f.write(f"[0:a]aresample={audio_rate}:async=1,asetpts=PTS-STARTPTS,volume=0.4[bg];")
+
+              if num_batches > 1:
+                  batch_labels = "".join([f"[{i+1}:a]" for i in range(num_batches)])
+                  f.write(f"{batch_labels}amix=inputs={num_batches}:normalize=0:dropout_transition=0,asetpts=PTS-STARTPTS[all_tts];")
+                  f.write(f"[bg][all_tts]amix=inputs=2:normalize=0:duration=first[out_audio]")
+              else:
+                  f.write(f"[bg][1:a]amix=inputs=2:normalize=0:duration=first[out_audio]")
+
+          with open("num_batches.txt", "w") as f:
+              f.write(str(num_batches))
+          EOF
+
+      - name: Render Final Video & HLS (Stream Copy)
+        run: |
+          NUM_BATCHES=$(cat num_batches.txt)
+
+          printf -- "-i\nraw_video.mp4\n" > ffmpeg_inputs.txt
+
+          for ((i=0; i<NUM_BATCHES; i++)); do
+            printf -- "-i\nbatch_$i.m4a\n" >> ffmpeg_inputs.txt
+          done
+
+          ffmpeg -y $(cat ffmpeg_inputs.txt) -filter_complex_script final_mix.txt \
+            -map 0:v -map "[out_audio]" \
+            -c:v copy \
+            -c:a aac -ar ${{ env.audio_rate }} -b:a 128k final.mp4
+
+          mkdir -p output
+          ffmpeg -i final.mp4 -c copy -f hls \
+            -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
+            -hls_segment_type fmp4 \
+            -hls_fmp4_init_filename "${{ github.event.inputs.slug }}-index.png" \
+            -hls_segment_filename "output/${{ github.event.inputs.slug }}-index%d.png" \
+            "output/${{ github.event.inputs.slug }}.m3u8"
+
+      - name: Deploy to Cloudflare Pages (first)
+        id: deploy1
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
+
+      - name: Verify Cloudflare deployment (branch domain check)
+        id: verify
+        continue-on-error: true
+        env:
+          PROJECT: ${{ github.event.inputs.page }}
+          BRANCH: ${{ github.event.inputs.slug }}
+        run: |
+          set -e
+          FILE_URL="https://${{ github.event.inputs.slug }}.${{ github.event.inputs.page }}.pages.dev/${{ github.event.inputs.slug }}.m3u8"
+
+          echo "[TARGET] $FILE_URL"
+
+          check () {
+            code=$(curl -L -o /dev/null -s -w "%{http_code}" "$FILE_URL")
+            echo "HTTP CODE: $code"
+            [ "$code" = "200" ]
+          }
+
+          echo "[WAIT] Waiting 1 minutes for Pages propagation..."
+          sleep 60
+
+          echo "[CHECK #1]"
+          if check; then
+            echo "[SUCCESS] File exists"
+            exit 0
+          fi
+
+          echo "[WAIT] Still not found, wait extra 3 minutes..."
+          sleep 180
+
+          echo "[CHECK #2]"
+          if check; then
+            echo "[SUCCESS] File exists after delay"
+            exit 0
+          fi
+
+          echo "[FAIL] File still missing → mark for redeploy"
+          echo "NEED_REDEPLOY=true" >> $GITHUB_ENV
+          exit 1
+
+      - name: Deploy to Cloudflare Pages (retry – reuse encoded files)
+        if: env.NEED_REDEPLOY == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ github.event.inputs.token }}
+          accountId: ${{ github.event.inputs.account }}
+          command: pages deploy ./output --project-name=${{ github.event.inputs.page }} --branch=${{ github.event.inputs.slug }}
+
+      - name: Cleanup cookies
+        if: always()
+        run: |
+          rm -f work/cookies.txt
+          echo "Cookie removed."
