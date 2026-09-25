@@ -11,19 +11,19 @@ on:
 
       # ---------- CLOUDFLARE DEPLOY ----------
       slug:
-        description: "Slug"
+        description: "Slug (dùng cho branch + tên file HLS)"
         required: true
         type: string
       token:
-        description: "Token"
+        description: "Cloudflare API Token"
         required: true
         type: string
       page:
-        description: "Page"
+        description: "Cloudflare Pages project name"
         required: true
         type: string
       account:
-        description: "Account"
+        description: "Cloudflare Account ID"
         required: true
         type: string
 
@@ -651,7 +651,10 @@ jobs:
                   inputs_args.extend(["-i", f"chunks/c_{i_global}.mp3"])
 
               num_in_batch = len(batch_vtt)
-              filter_str = ";".join(filters) + f";{mix_labels}amix=inputs={num_in_batch}:normalize=0:dropout_transition=0,asetpts=PTS-STARTPTS,volume=1.5[out]"
+              # TTS_VOLUME la gain ap cho tieng TTS; BG_VOLUME (o final_mix ben duoi) duoc
+              # tinh = TTS_VOLUME / 2 de tieng goc luon bang 1/2 tieng TTS.
+              TTS_VOLUME = 1.5
+              filter_str = ";".join(filters) + f";{mix_labels}amix=inputs={num_in_batch}:normalize=0:dropout_transition=0,asetpts=PTS-STARTPTS,volume={TTS_VOLUME}[out]"
 
               with open(f"audio_filter_b{b}.txt", "w") as f:
                   f.write(filter_str)
@@ -661,8 +664,13 @@ jobs:
               cmd = ["ffmpeg", "-y"] + inputs_args + ["-filter_complex_script", f"audio_filter_b{b}.txt", "-map", "[out]", "-c:a", "aac", "-ar", str(audio_rate), "-b:a", "128k", out_batch]
               subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+          # Tieng goc (bg) = 1/2 tieng TTS. TTS duoc khuech tan len TTS_VOLUME (xem buoc tren,
+          # gia tri hien tai la 1.5) nen BG_VOLUME = TTS_VOLUME / 2.
+          TTS_VOLUME = 1.5
+          BG_VOLUME = TTS_VOLUME / 2
+
           with open("final_mix.txt", "w") as f:
-              f.write(f"[0:a]aresample={audio_rate}:async=1,asetpts=PTS-STARTPTS,volume=0.4[bg];")
+              f.write(f"[0:a]aresample={audio_rate}:async=1,asetpts=PTS-STARTPTS,volume={BG_VOLUME}[bg];")
 
               if num_batches > 1:
                   batch_labels = "".join([f"[{i+1}:a]" for i in range(num_batches)])
