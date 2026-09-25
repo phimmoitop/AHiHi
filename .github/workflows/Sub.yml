@@ -332,8 +332,8 @@ jobs:
           SUB_TEXT_COLOR = (255, 214, 0)   # vang, dinh dang (R,G,B)
 
           # ---- GEMINI ----
-          GEMINI_MODEL = "gemini-2.5-flash"
-          GEMINI_BATCH_SIZE = 100
+          GEMINI_MODEL = "gemini-3.5-flash-lite"
+          GEMINI_BATCH_SIZE = 150
           GEMINI_MAX_RETRIES = 10
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
