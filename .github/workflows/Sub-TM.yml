@@ -554,7 +554,7 @@ jobs:
 
                       for attempt in range(2):
                           try:
-                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+31%")
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+33%")
                               await tts.save(out)
                               if os.path.exists(out) and os.path.getsize(out) > 0:
                                   break
