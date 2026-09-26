@@ -670,8 +670,8 @@ jobs:
           # Tieng goc (bg) phai nho hon nhieu so voi TTS de TTS at duoc tieng goc.
           # TTS duoc khuech tan len TTS_VOLUME (xem buoc tren, gia tri hien tai la 2.2),
           # con tieng goc bi giam manh xuong con TTS_VOLUME / 8.
-          TTS_VOLUME = 2.2
-          BG_VOLUME = TTS_VOLUME / 8
+          TTS_VOLUME = 3
+          BG_VOLUME = TTS_VOLUME / 10
 
           with open("final_mix.txt", "w") as f:
               f.write(f"[0:a]aresample={audio_rate}:async=1,asetpts=PTS-STARTPTS,volume={BG_VOLUME}[bg];")
