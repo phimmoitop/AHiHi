@@ -554,7 +554,7 @@ jobs:
 
                       for attempt in range(2):
                           try:
-                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+30%")
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+31%")
                               await tts.save(out)
                               if os.path.exists(out) and os.path.getsize(out) > 0:
                                   break
@@ -656,7 +656,7 @@ jobs:
               num_in_batch = len(batch_vtt)
               # TTS_VOLUME la gain ap cho tieng TTS; BG_VOLUME (o final_mix ben duoi) duoc
               # tinh tu TTS_VOLUME de tieng goc luon nho hon nhieu so voi TTS.
-              TTS_VOLUME = 3
+              TTS_VOLUME = 3.5
               filter_str = ";".join(filters) + f";{mix_labels}amix=inputs={num_in_batch}:normalize=0:dropout_transition=0,asetpts=PTS-STARTPTS,volume={TTS_VOLUME}[out]"
 
               with open(f"audio_filter_b{b}.txt", "w") as f:
@@ -670,8 +670,8 @@ jobs:
           # Tieng goc (bg) phai nho hon nhieu so voi TTS de TTS at duoc tieng goc.
           # TTS duoc khuech tan len TTS_VOLUME (xem buoc tren, gia tri hien tai la 2.2),
           # con tieng goc bi giam manh xuong con TTS_VOLUME / 8.
-          TTS_VOLUME = 3
-          BG_VOLUME = 0.15
+          TTS_VOLUME = 3.5
+          BG_VOLUME = 0.1
 
           with open("final_mix.txt", "w") as f:
               f.write(f"[0:a]aresample={audio_rate}:async=1,asetpts=PTS-STARTPTS,volume={BG_VOLUME}[bg];")
