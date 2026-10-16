@@ -122,7 +122,128 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/ocr
-          python tools/ocr_hardsub.py raw_video.mp4 \
+
+          cat > work/ocr_hardsub.py <<'PY'
+          import argparse
+          import re
+          import subprocess
+          from pathlib import Path
+
+          import cv2
+          import numpy as np
+          from rapidocr_onnxruntime import RapidOCR
+
+          parser = argparse.ArgumentParser()
+          parser.add_argument("video")
+          parser.add_argument("--out", required=True)
+          parser.add_argument("--fps", type=float, default=5.0)
+          parser.add_argument("--bottom", type=float, default=0.78)
+          args = parser.parse_args()
+
+          if args.fps <= 0:
+              parser.error("--fps must be greater than zero")
+          if not 0 <= args.bottom < 1:
+              parser.error("--bottom must be between 0 and 1")
+
+          out = Path(args.out)
+          out.mkdir(parents=True, exist_ok=True)
+          duration = float(subprocess.check_output(
+              ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=nw=1:nk=1", args.video],
+              text=True,
+          ).strip())
+          step = 1 / args.fps
+
+          # Decode sequentially and crop/resize before OCR; seeking each sample is slow.
+          video_filter = (
+              f"fps={args.fps},crop=iw:ih*{1 - args.bottom}:0:ih*{args.bottom},scale=1280:-2"
+          )
+          command = [
+              "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", args.video,
+              "-vf", video_filter, "-f", "image2pipe", "-vcodec", "mjpeg",
+              "-q:v", "3", "pipe:1",
+          ]
+          pipe = subprocess.Popen(command, stdout=subprocess.PIPE)
+          engine = RapidOCR()
+          observations = []
+          frame_index = 0
+
+          while True:
+              jpeg = bytearray()
+              while not jpeg.endswith(b"\xff\xd9"):
+                  chunk = pipe.stdout.read(1)
+                  if not chunk:
+                      break
+                  jpeg.extend(chunk)
+                  if len(jpeg) >= 2 and jpeg[:2] != b"\xff\xd8":
+                      raise RuntimeError("ffmpeg emitted invalid JPEG frame")
+              if len(jpeg) < 4:
+                  break
+
+              frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+              timestamp = frame_index * step
+              frame_index += 1
+              result, _ = engine(frame)
+              texts = []
+              if result:
+                  for box, text, score in result:
+                      text = re.sub(r"\s+", "", text)
+                      if score >= 0.45 and any("\u4e00" <= char <= "\u9fff" for char in text):
+                          texts.append((min(point[1] for point in box), text, float(score)))
+              texts.sort(key=lambda item: item[0])
+              line = "".join(item[1] for item in texts)
+              if line:
+                  observations.append((timestamp, line, max(item[2] for item in texts)))
+              if frame_index % 10 == 0:
+                  print(f"OCR frames {frame_index}", flush=True)
+
+          pipe.stdout.close()
+          return_code = pipe.wait()
+          if return_code:
+              raise RuntimeError(f"ffmpeg exited with status {return_code}")
+
+          tag = f"{args.fps:g}fps"
+          with (out / f"ocr-raw-{tag}.tsv").open("w", encoding="utf-8") as raw_file:
+              for timestamp, text, score in observations:
+                  raw_file.write(f"{timestamp:.3f}\t{score:.3f}\t{text}\n")
+
+          # Group consecutive identical readings and discard one-frame flicker.
+          segments = []
+          for timestamp, text, _score in observations:
+              if (segments and segments[-1]["text"] == text
+                      and timestamp - segments[-1]["last"] <= step * 1.51):
+                  segments[-1]["last"] = timestamp
+                  segments[-1]["count"] += 1
+              else:
+                  segments.append({"text": text, "first": timestamp,
+                                   "last": timestamp, "count": 1})
+          segments = [segment for segment in segments
+                      if segment["count"] >= 2 or duration < 10]
+
+          def srt_timestamp(seconds):
+              milliseconds = max(0, round(seconds * 1000))
+              hours, milliseconds = divmod(milliseconds, 3_600_000)
+              minutes, milliseconds = divmod(milliseconds, 60_000)
+              seconds, milliseconds = divmod(milliseconds, 1_000)
+              return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
+
+          srt_path = out / f"hardsub-{tag}.srt"
+          with srt_path.open("w", encoding="utf-8") as srt_file:
+              for index, segment in enumerate(segments, start=1):
+                  start = max(0, segment["first"] - step / 2)
+                  end = min(duration, segment["last"] + step / 2)
+                  if end <= start:
+                      continue
+                  srt_file.write(
+                      f"{index}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n"
+                      f"{segment['text']}\n\n"
+                  )
+
+          print(f"duration={duration:.3f}, observations={len(observations)}, "
+                f"cues={len(segments)}, output={srt_path}", flush=True)
+          PY
+
+          python work/ocr_hardsub.py raw_video.mp4 \
             --fps 5 \
             --bottom 0.78 \
             --out work/ocr
