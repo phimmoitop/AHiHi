@@ -8,12 +8,6 @@ on:
         description: "Bilibili video URL"
         required: true
         type: string
-      sub_lang:
-        description: "Mã sub gốc của Bilibili cần tải (mặc định ai-zh = sub AI tiếng Trung)"
-        required: false
-        default: "ai-zh"
-        type: string
-
       # ---------- CLOUDFLARE DEPLOY ----------
       slug:
         description: "Slug (dùng cho branch + tên file HLS)"
@@ -75,6 +69,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             yt-dlp \
+            rapidocr_onnxruntime \
             google-genai \
             pysubs2 \
             webvtt-py \
@@ -123,47 +118,32 @@ jobs:
           fi
           ls -lh .
 
-      - name: Download native Bilibili subtitle (ai-zh)
-        env:
-          BILIBILI_URL: ${{ inputs.url }}
-          SUB_LANG: ${{ inputs.sub_lang }}
+      - name: OCR hardcoded Chinese subtitles from video
         run: |
-          set -uo pipefail
-          SUB_LANG="${SUB_LANG:-ai-zh}"
+          set -euo pipefail
+          mkdir -p work/ocr
+          python tools/ocr_hardsub.py raw_video.mp4 \
+            --fps 5 \
+            --bottom 0.78 \
+            --out work/ocr
 
-          echo "===== DANH SACH SUB CO SAN CUA VIDEO ====="
-          yt-dlp --cookies work/cookies.txt --no-playlist \
-            --add-header "Referer: https://www.bilibili.com/" \
-            --list-subs "$BILIBILI_URL" || true
-
-          rm -f native*.srt native*.json native*.vtt native*.ass 2>/dev/null || true
-
-          yt-dlp --cookies work/cookies.txt --no-playlist \
-            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
-            --add-header "Referer: https://www.bilibili.com/" \
-            --add-header "Origin: https://www.bilibili.com" \
-            --skip-download \
-            --write-subs \
-            --sub-langs "$SUB_LANG" \
-            --sub-format "srt/best" \
-            --convert-subs srt \
-            -o "native.%(ext)s" \
-            "$BILIBILI_URL" || true
-
-          echo "===== FILE SUB SAU KHI TAI ====="
-          ls -lh native* 2>/dev/null || true
-
-          SUB_FILE=$(ls native*.srt 2>/dev/null | head -n 1 || true)
-          if [ -z "$SUB_FILE" ]; then
-            echo "::error::Video nay KHONG co sub '$SUB_LANG' (hoac cookies khong du quyen lay sub AI). Xem danh sach sub o tren."
+          OCR_SRT="work/ocr/hardsub-5fps.srt"
+          if [ ! -s "$OCR_SRT" ]; then
+            echo "::error::OCR khong tao duoc phu de tieng Trung tu video."
+            find work/ocr -maxdepth 1 -type f -ls || true
             exit 1
           fi
 
-          cp "$SUB_FILE" work/native.srt
-          echo "Dung sub: $SUB_FILE -> work/native.srt"
-          echo "===== NATIVE SRT (head) ====="
+          cp "$OCR_SRT" work/native.srt
+          echo "Dung SRT OCR: $OCR_SRT -> work/native.srt"
+          echo "===== OCR SRT (head) ====="
           head -30 work/native.srt || true
-          grep -c -- '-->' work/native.srt || true
+          CUE_COUNT=$(grep -c -- '-->' work/native.srt || true)
+          echo "So cue OCR: $CUE_COUNT"
+          if [ "$CUE_COUNT" -eq 0 ]; then
+            echo "::error::SRT OCR khong co cue hop le."
+            exit 1
+          fi
 
       - name: Create Translate script
         run: |
