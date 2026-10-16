@@ -1,4 +1,4 @@
-name: Bilibili → Thuyết Minh (Nữ, TTS) — Sub gốc
+name: Bilibili → Thuyết Minh (Nữ, TTS) — Sub ZH
 
 on:
   workflow_dispatch:
