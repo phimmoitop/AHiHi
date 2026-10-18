@@ -5,7 +5,7 @@ on:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "https://www.bilibili.com/video/BV1Fi3E6DEXj"
+        description: "https://www.bilibili.com/video/BV1YZJb6RELN"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
@@ -39,7 +39,7 @@ jobs:
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
       X264_PRESET: "medium"
-      X264_CRF: "23"
+      X264_CRF: "21"
 
     steps:
       - name: Checkout repository
@@ -1036,7 +1036,7 @@ jobs:
           GAP_MS = 60                # nghỉ tối thiểu giữa 2 câu
           MAX_DRIFT_MS = 1500        # được phép trễ tối đa so với mốc cue
           LOOKAHEAD_MS = 400         # được mượn tối đa 400ms của khe trước câu kế tiếp
-          MAX_SPEEDUP = 1.30         # tăng tốc thêm tối đa (nhân với +25% sẵn có)
+          MAX_SPEEDUP = 1.35         # tăng tốc thêm tối đa (nhân với +25% sẵn có)
           DUCK_PRE_MS = 500          # hạ tiếng gốc trước cue
           DUCK_POST_MS = 400         # và giữ thấp sau cue
           SIL_THRESH = 10 ** (-50 / 20)
