@@ -5,7 +5,7 @@ on:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "https://www.bilibili.com/video/BV15d7D6UEN1"
+        description: "https://www.bilibili.com/video/BV1Fi3E6DEXj"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
