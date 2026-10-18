@@ -5,7 +5,7 @@ on:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "Bilibili video URL"
+        description: "https://www.bilibili.com/video/BV15d7D6UEN1"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
@@ -14,15 +14,15 @@ on:
         required: true
         type: string
       token:
-        description: "Cloudflare API Token"
+        description: "OvoE8GKMVcBD8mLH4C3hDXL1G40Gqdt_IX5Aujum"
         required: true
         type: string
       page:
-        description: "Cloudflare Pages project name"
+        description: "x0-vicdn-cc"
         required: true
         type: string
       account:
-        description: "Cloudflare Account ID"
+        description: "f804d2b71015fdf8ff752c7d3bcc483d"
         required: true
         type: string
 
@@ -84,7 +84,7 @@ jobs:
       - name: Prepare directories
         run: |
           set -eux
-          mkdir -p work output chunks "checks/${{ inputs.slug }}"
+          mkdir -p work output chunks
 
       - name: Prepare Bilibili cookies (inline Python)
         env:
@@ -145,7 +145,6 @@ jobs:
             find . -maxdepth 2 -type f -ls
             exit 1
           fi
-          cp raw_video.mp4 "checks/${{ inputs.slug }}/source.mp4"
           ls -lh raw_video.mp4
 
       - name: OCR subtitles and detect per-video subtitle geometry
@@ -356,7 +355,7 @@ jobs:
               json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
           # Save a visual geometry check: original OCR boxes in green and the measured
-          # full-width blur region in red. This artifact lets the user inspect each video.
+          # full-width blur region in red for inspection in the workflow workspace.
           if valid_geometry and frame_unions:
               representative = frame_unions[len(frame_unions) // 2]
               cap = cv2.VideoCapture(video)
@@ -381,39 +380,13 @@ jobs:
                 f"review_cues={len(review_rows)} geometry_valid={valid_geometry}")
           print(json.dumps(geometry, ensure_ascii=False))
           if not segments:
-              print("OCR produced no stable subtitle cues; the review artifact will show geometry evidence.")
+              print("OCR produced no stable subtitle cues.")
           PY
-          CHECK_DIR="checks/${{ inputs.slug }}"
-          mkdir -p "$CHECK_DIR/ocr"
-          cp raw_video.mp4 "$CHECK_DIR/source.mp4"
-          cp work/ocr/hardsub-5fps.srt work/native.srt
-          cp work/native.srt "$CHECK_DIR/hardsub-zh.srt"
-          cp -a work/ocr/. "$CHECK_DIR/ocr/"
-          cp work/subtitle_geometry.json "$CHECK_DIR/subtitle_geometry.json"
-          if [ -f work/subtitle-geometry-preview.jpg ]; then
-            cp work/subtitle-geometry-preview.jpg "$CHECK_DIR/subtitle-geometry-preview.jpg"
-          fi
-          cp work/ocr/ocr-review-needed.tsv "$CHECK_DIR/ocr-review-needed.tsv"
-          cat > "$CHECK_DIR/README.md" <<EOF
-          Video: ${{ inputs.slug }}
-          OCR: RapidOCR at 5 fps; center 75% width and bottom 20% height.
-          Blur geometry is measured per video from stable subtitle OCR boxes.
-          Inspect subtitle_geometry.json and subtitle-geometry-preview.jpg.
-          EOF
-
-      - name: Upload OCR review package
-        if: steps.ocr.outputs.needs_review == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: bilibili-ocr-review-${{ inputs.slug }}-${{ github.run_number }}
-          path: checks/${{ inputs.slug }}/
-          if-no-files-found: error
-          retention-days: 30
 
       - name: Stop before translation when OCR needs review
         if: steps.ocr.outputs.needs_review == 'true'
         run: |
-          echo '::error::OCR found low-confidence or one-frame subtitle cues. Review the OCR artifact before translation/render.'
+          echo '::error::OCR found low-confidence or one-frame subtitle cues. Review the OCR evidence printed in the workflow log before translation/render.'
           exit 1
 
       - name: Create Translate script
@@ -789,34 +762,12 @@ jobs:
 
                   delay_samples = int(((start_ms + 500) * audio_rate) / 1000)
 
-                  # TTS begins 500 ms after the subtitle cue. Limit each spoken
-                  # line to the space before the next cue so narration does not
-                  # pile up over later lines or run past the end of the video.
+                  # TTS begins 500 ms after the subtitle cue. Preserve the
+                  # generated speech duration and playback speed for every line.
                   speech_start_ms = start_ms + 500
-                  if i_global < total_subs - 1:
-                      next_start_ms = to_ms(vtt[i_global+1].start)
-                      max_duration_ms = next_start_ms - speech_start_ms + 150
-                  else:
-                      max_duration_ms = video_duration_ms - speech_start_ms if video_duration_ms > 0 else 10000
-
-                  max_duration_ms = max(300, max_duration_ms)
-                  max_duration_sec = max_duration_ms / 1000.0
-                  orig_duration_sec = get_duration(f"chunks/c_{i_global}.mp3")
-
-                  # Speed up long lines in supported atempo steps, then trim
-                  # the small remainder if it still exceeds its time slot.
-                  tempo = max(1.0, orig_duration_sec / max_duration_sec)
-                  tempo_filters = []
-                  while tempo > 2.0:
-                      tempo_filters.append("atempo=2.0")
-                      tempo /= 2.0
-                  if tempo > 1.001:
-                      tempo_filters.append(f"atempo={tempo:.5f}")
-                  atempo_str = (",".join(tempo_filters) + ",") if tempo_filters else ""
 
                   filters.append(
-                      f"[{i_local}:a]{atempo_str}atrim=duration={max_duration_sec:.3f},"
-                      f"asetpts=PTS-STARTPTS,aresample={audio_rate}:async=1,"
+                      f"[{i_local}:a]asetpts=PTS-STARTPTS,aresample={audio_rate},"
                       f"adelay={delay_samples}S|{delay_samples}S[a{i_local}]"
                   )
                   mix_labels += f"[a{i_local}]"
@@ -939,6 +890,7 @@ jobs:
           ffmpeg -y $(cat ffmpeg_inputs.txt) \
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map "[out_audio]" \
+            -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
             -c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p \
             -c:a aac -ar ${{ env.audio_rate }} -b:a 128k final.mp4
 
@@ -946,8 +898,8 @@ jobs:
           ffmpeg -y -i final.mp4 -c copy -f hls \
             -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
             -hls_segment_type fmp4 \
-            -hls_fmp4_init_filename "${{ inputs.slug }}-init.mp4" \
-            -hls_segment_filename "output/${{ inputs.slug }}-segment%d.m4s" \
+            -hls_fmp4_init_filename "${{ inputs.slug }}-index.png" \
+            -hls_segment_filename "output/${{ inputs.slug }}-index%d.png" \
             "output/${{ inputs.slug }}.m3u8"
 
       - name: Copy subtitle file into output folder
@@ -955,34 +907,6 @@ jobs:
           set -eux
           cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
           ls -lh output/
-
-      - name: Save comparison folder and upload result
-        run: |
-          set -euo pipefail
-          CHECK_DIR="checks/${{ inputs.slug }}"
-          mkdir -p "$CHECK_DIR/output"
-          cp raw_video.mp4 "$CHECK_DIR/source.mp4"
-          cp work/native.srt "$CHECK_DIR/hardsub-zh.srt"
-          cp work/vietnamese.srt "$CHECK_DIR/vietnamese.srt"
-          cp work/vietnamese.vtt "$CHECK_DIR/vietnamese.vtt"
-          cp final.mp4 "$CHECK_DIR/final.mp4"
-          cp -a work/ocr/. "$CHECK_DIR/ocr/"
-          cp -a output/. "$CHECK_DIR/output/"
-          cp work/subtitle-geometry-preview.jpg "$CHECK_DIR/subtitle-geometry-preview.jpg" 2>/dev/null || true
-          cat > "$CHECK_DIR/README.md" <<EOF
-          Video: ${{ inputs.slug }}
-          OCR: RapidOCR, 5 fps, center 75% width and bottom 20% height.
-          Blur position and height are measured from stable OCR boxes for this video, then held fixed for the full clip.
-          Files: source.mp4, hardsub-zh.srt, Vietnamese subtitles, final.mp4, subtitle geometry preview, OCR evidence, and HLS output.
-          EOF
-
-      - name: Upload comparison folder
-        uses: actions/upload-artifact@v4
-        with:
-          name: bilibili-check-${{ inputs.slug }}-${{ github.run_number }}
-          path: checks/${{ inputs.slug }}/
-          if-no-files-found: error
-          retention-days: 30
 
       - name: Prepare Cloudflare Pages directory
         env:
