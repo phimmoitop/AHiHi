@@ -3,8 +3,26 @@ name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 18-10-2026
 on:
   workflow_dispatch:
     inputs:
-      video_id:
-        description: "Bilibili video ID, for example BV1jbi5B4EFs"
+      # ---------- SOURCE ----------
+      url:
+        description: "Bilibili video URL"
+        required: true
+        type: string
+      # ---------- CLOUDFLARE DEPLOY ----------
+      slug:
+        description: "Slug (dùng cho branch + tên file HLS)"
+        required: true
+        type: string
+      token:
+        description: "Cloudflare API Token"
+        required: true
+        type: string
+      page:
+        description: "Cloudflare Pages project name"
+        required: true
+        type: string
+      account:
+        description: "Cloudflare Account ID"
         required: true
         type: string
 
@@ -26,11 +44,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Validate video ID
+      - name: Validate Bilibili URL
         env:
-          VIDEO_ID: ${{ inputs.video_id }}
+          VIDEO_URL: ${{ inputs.url }}
         run: |
-          [[ "$VIDEO_ID" =~ ^BV[0-9A-Za-z]+$ ]] || { echo '::error::video_id must be a Bilibili BV id'; exit 1; }
+          [[ "$VIDEO_URL" =~ ^https?://([[:alnum:]-]+\.)?bilibili\.com/video/BV[0-9A-Za-z]+ ]] || { echo '::error::url must be a Bilibili video URL'; exit 1; }
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -66,7 +84,7 @@ jobs:
       - name: Prepare directories
         run: |
           set -eux
-          mkdir -p work output chunks "checks/${{ inputs.video_id }}"
+          mkdir -p work output chunks "checks/${{ inputs.slug }}"
 
       - name: Prepare Bilibili cookies (inline Python)
         env:
@@ -104,10 +122,10 @@ jobs:
 
       - name: Download Bilibili video
         env:
-          VIDEO_ID: ${{ inputs.video_id }}
+          VIDEO_URL: ${{ inputs.url }}
         run: |
           set -euo pipefail
-          BILIBILI_URL="https://www.bilibili.com/video/${VIDEO_ID}"
+          BILIBILI_URL="$VIDEO_URL"
           yt-dlp --cookies work/cookies.txt --no-playlist \
             --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
             --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
@@ -127,7 +145,7 @@ jobs:
             find . -maxdepth 2 -type f -ls
             exit 1
           fi
-          cp raw_video.mp4 "checks/${VIDEO_ID}/source.mp4"
+          cp raw_video.mp4 "checks/${{ inputs.slug }}/source.mp4"
           ls -lh raw_video.mp4
 
       - name: OCR subtitles and detect per-video subtitle geometry
@@ -365,7 +383,7 @@ jobs:
           if not segments:
               print("OCR produced no stable subtitle cues; the review artifact will show geometry evidence.")
           PY
-          CHECK_DIR="checks/${{ inputs.video_id }}"
+          CHECK_DIR="checks/${{ inputs.slug }}"
           mkdir -p "$CHECK_DIR/ocr"
           cp raw_video.mp4 "$CHECK_DIR/source.mp4"
           cp work/ocr/hardsub-5fps.srt work/native.srt
@@ -377,7 +395,7 @@ jobs:
           fi
           cp work/ocr/ocr-review-needed.tsv "$CHECK_DIR/ocr-review-needed.tsv"
           cat > "$CHECK_DIR/README.md" <<EOF
-          Video: ${{ inputs.video_id }}
+          Video: ${{ inputs.slug }}
           OCR: RapidOCR at 5 fps; center 75% width and bottom 20% height.
           Blur geometry is measured per video from stable subtitle OCR boxes.
           Inspect subtitle_geometry.json and subtitle-geometry-preview.jpg.
@@ -387,8 +405,8 @@ jobs:
         if: steps.ocr.outputs.needs_review == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: bilibili-ocr-review-${{ inputs.video_id }}-${{ github.run_number }}
-          path: checks/${{ inputs.video_id }}/
+          name: bilibili-ocr-review-${{ inputs.slug }}-${{ github.run_number }}
+          path: checks/${{ inputs.slug }}/
           if-no-files-found: error
           retention-days: 30
 
@@ -836,7 +854,7 @@ jobs:
 
       - name: Render Vietnamese video and HLS with detected subtitle blur
         env:
-          VIDEO_ID: ${{ inputs.video_id }}
+          SLUG: ${{ inputs.slug }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -928,20 +946,20 @@ jobs:
           ffmpeg -y -i final.mp4 -c copy -f hls \
             -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
             -hls_segment_type fmp4 \
-            -hls_fmp4_init_filename "${{ inputs.video_id }}-init.mp4" \
-            -hls_segment_filename "output/${{ inputs.video_id }}-segment%d.m4s" \
-            "output/${{ inputs.video_id }}.m3u8"
+            -hls_fmp4_init_filename "${{ inputs.slug }}-init.mp4" \
+            -hls_segment_filename "output/${{ inputs.slug }}-segment%d.m4s" \
+            "output/${{ inputs.slug }}.m3u8"
 
       - name: Copy subtitle file into output folder
         run: |
           set -eux
-          cp work/vietnamese.vtt "output/${{ inputs.video_id }}.vtt"
+          cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
           ls -lh output/
 
       - name: Save comparison folder and upload result
         run: |
           set -euo pipefail
-          CHECK_DIR="checks/${{ inputs.video_id }}"
+          CHECK_DIR="checks/${{ inputs.slug }}"
           mkdir -p "$CHECK_DIR/output"
           cp raw_video.mp4 "$CHECK_DIR/source.mp4"
           cp work/native.srt "$CHECK_DIR/hardsub-zh.srt"
@@ -952,7 +970,7 @@ jobs:
           cp -a output/. "$CHECK_DIR/output/"
           cp work/subtitle-geometry-preview.jpg "$CHECK_DIR/subtitle-geometry-preview.jpg" 2>/dev/null || true
           cat > "$CHECK_DIR/README.md" <<EOF
-          Video: ${{ inputs.video_id }}
+          Video: ${{ inputs.slug }}
           OCR: RapidOCR, 5 fps, center 75% width and bottom 20% height.
           Blur position and height are measured from stable OCR boxes for this video, then held fixed for the full clip.
           Files: source.mp4, hardsub-zh.srt, Vietnamese subtitles, final.mp4, subtitle geometry preview, OCR evidence, and HLS output.
@@ -961,50 +979,52 @@ jobs:
       - name: Upload comparison folder
         uses: actions/upload-artifact@v4
         with:
-          name: bilibili-check-${{ inputs.video_id }}-${{ github.run_number }}
-          path: checks/${{ inputs.video_id }}/
+          name: bilibili-check-${{ inputs.slug }}-${{ github.run_number }}
+          path: checks/${{ inputs.slug }}/
           if-no-files-found: error
           retention-days: 30
 
       - name: Prepare Cloudflare Pages directory
         env:
-          VIDEO_ID: ${{ inputs.video_id }}
+          SLUG: ${{ inputs.slug }}
         run: |
           set -euo pipefail
           cat > output/index.html <<EOF
           <!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-          <title>Video ${VIDEO_ID} — Vietsub</title>
+          <title>Video ${SLUG} — Vietsub</title>
           <style>body{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}video{width:100%;background:#000}a{color:#8cf}</style>
-          <h1>${VIDEO_ID} — Vietsub + thuyết minh</h1>
+          <h1>${SLUG} — Vietsub + thuyết minh</h1>
           <video id="v" controls playsinline></video>
-          <p><a href="${VIDEO_ID}.m3u8">Tải playlist HLS</a> · <a href="${VIDEO_ID}.vtt">Tải phụ đề VTT</a></p>
+          <p><a href="${SLUG}.m3u8">Tải playlist HLS</a> · <a href="${SLUG}.vtt">Tải phụ đề VTT</a></p>
           <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-          <script>const v=document.getElementById('v'),u='${VIDEO_ID}.m3u8';if(v.canPlayType('application/vnd.apple.mpegurl'))v.src=u;else if(Hls.isSupported()){const h=new Hls();h.loadSource(u);h.attachMedia(v)}</script>
+          <script>const v=document.getElementById('v'),u='${SLUG}.m3u8';if(v.canPlayType('application/vnd.apple.mpegurl'))v.src=u;else if(Hls.isSupported()){const h=new Hls();h.loadSource(u);h.attachMedia(v)}</script>
           </html>
           EOF
           ls -lh output/
 
       - name: Deploy video output to Cloudflare Pages
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.CF_API_TOKEN || secrets.CF_PAGES_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID || vars.CF_ACCOUNT_ID }}
-          CF_PAGES_PROJECT: ${{ vars.CF_PAGES_PROJECT || vars.CLOUDFLARE_PAGES_PROJECT }}
+          CLOUDFLARE_API_TOKEN: ${{ inputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account }}
+          CF_PAGES_PROJECT: ${{ inputs.page }}
         run: |
           set -euo pipefail
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
-            echo "::error::Set GitHub secret CLOUDFLARE_API_TOKEN (or CF_API_TOKEN)."
+            echo "::error::Enter the Cloudflare API Token in the workflow form."
             exit 1
           fi
           if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::Set GitHub secret CLOUDFLARE_ACCOUNT_ID."
+            echo "::error::Enter the Cloudflare Account ID in the workflow form."
             exit 1
           fi
           if [ -z "${CF_PAGES_PROJECT:-}" ]; then
-            echo "::error::Set GitHub repository variable CF_PAGES_PROJECT to the existing Pages project slug."
+            echo "::error::Enter the Cloudflare Pages project name in the workflow form."
             exit 1
           fi
           npx --yes wrangler@4 pages deploy output \
-            --project-name "${CF_PAGES_PROJECT}" --branch main
+            --project-name "${CF_PAGES_PROJECT}" \
+            --account-id "${CLOUDFLARE_ACCOUNT_ID}" \
+            --branch "${{ inputs.slug }}"
           echo "Cloudflare Pages deployment completed for ${CF_PAGES_PROJECT}."
 
       - name: Cleanup cookies
