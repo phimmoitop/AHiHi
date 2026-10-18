@@ -1,11 +1,11 @@
-name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 18-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 19-10-2026
 
 on:
   workflow_dispatch:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "https://www.bilibili.com/video/BV1Fi3E6DEXj"
+        description: "https://www.bilibili.com/video/BV1PjgP65EhZ"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
