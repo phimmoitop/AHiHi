@@ -173,10 +173,10 @@ jobs:
           if width <= 0 or height <= 0:
               raise SystemExit("Cannot read source video dimensions")
 
-          # OCR searches the center 75% horizontally and bottom 20% vertically.
-          # This keeps corner watermarks and unrelated on-screen text out of the OCR ROI.
-          x0, x1 = round(width * .125), round(width * .875)
-          y0 = round(height * .80)
+          # OCR searches the center 65% horizontally and bottom 35% vertically.
+          # The narrower ROI avoids AI description text in the lower-right corner.
+          x0, x1 = round(width * .175), round(width * .825)
+          y0 = round(height * .65)
           vf = f"fps={fps}"
           proc = subprocess.Popen(
               ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video, "-vf", vf,
