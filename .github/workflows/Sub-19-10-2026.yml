@@ -1,4 +1,4 @@
-name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 18-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 19-10-2026
 
 on:
   workflow_dispatch:
@@ -38,8 +38,8 @@ jobs:
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
-      X264_PRESET: "veryfast"
-      X264_CRF: "21"
+      X264_PRESET: "medium"
+      X264_CRF: "23"
 
     steps:
       - name: Checkout repository
@@ -626,6 +626,7 @@ jobs:
           Doc sub goc cua Bilibili (work/native.srt, tieng Trung) -> dich sang tieng Viet
           bang Gemini. KHONG ASR, KHONG render video. Ket qua cuoi cung la
           work/vietnamese.vtt (input cho buoc TTS) cung voi cac file .srt de doi chieu.
+          Sau khi dich co them buoc RUT GON cac cau qua dai so voi thoi luong cue.
           """
 
           import os, re, time, random
@@ -639,6 +640,9 @@ jobs:
           NATIVE_SRT = WORK / "native.srt"
 
           MIN_CUE_DURATION = 0.10
+
+          # So tu tieng Viet toi da moi giay de TTS doc kip (edge-tts +25% roi atempo toi da ~1.3x)
+          MAX_SYL_PER_SEC = 7.0
 
           # ---- GEMINI ----
           GEMINI_MODEL = "gemini-3.5-flash-lite"
@@ -762,7 +766,9 @@ jobs:
                       try:
                           head, val = line.split("]", 1)
                           val = val.strip()
-                          out[int(head.replace("[", "").strip())] = "" if val == "..." else val
+                          # chap nhan ca dang [12] va [12|9]
+                          idx = int(head.replace("[", "").split("|")[0].strip())
+                          out[idx] = "" if val == "..." else val
                       except Exception:
                           pass
               return out
@@ -826,15 +832,61 @@ jobs:
                   log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
                   time.sleep(3)
 
+              return results
+
+
+          # ============================================================
+          # RUT GON CAU QUA DAI (de TTS doc kip trong thoi luong cue)
+          # ============================================================
+          def count_syl(t):
+              return len(re.findall(r"\w+", t, re.UNICODE))
+
+
+          def shorten_long(results):
+              for _round in range(2):
+                  todo = []
+                  for i, r in enumerate(results):
+                      nxt = results[i + 1]["start"] if i + 1 < len(results) else r["end"] + 2
+                      budget = min(max(nxt - r["start"], 0.8), 10.0)
+                      limit = max(2, int(budget * MAX_SYL_PER_SEC))
+                      if count_syl(r["vi"]) > limit:
+                          todo.append((i, limit))
+                  log(f">> SHORTEN round {_round + 1}: {len(todo)} dong qua dai")
+                  if not todo:
+                      break
+                  for k in range(0, len(todo), 100):
+                      part = todo[k:k + 100]
+                      prompt = (
+                          "Rewrite each Vietnamese subtitle line to be SHORTER so it can be spoken within the time limit. "
+                          "Keep the core meaning, keep the same speaker relationship and pronouns (or drop pronouns if unsure), "
+                          "keep it natural and fluent, and drop filler words. Each line is formatted as [index|max_words] text. "
+                          "Your output for each line MUST be at most max_words words. "
+                          "Output ONLY '[index] shortened text' lines. Do NOT output the max_words number.\n\n"
+                          + "".join(f"[{i}|{lim}] {results[i]['vi']}\n" for i, lim in part)
+                      )
+                      resp = call_gemini_with_retry(prompt)
+                      if not resp:
+                          continue
+                      log(">> KET QUA RUT GON:")
+                      for line in resp.strip().split("\n"):
+                          log(f"   {line}")
+                      allowed = {i for i, _ in part}
+                      for i, txt in parse_translated(resp).items():
+                          if i in allowed and txt:
+                              results[i]["vi"] = txt
+                      time.sleep(2)
+              return results
+
+
+          def write_debug(results):
               with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
                   for idx, r in enumerate(results):
                       zh, vi = len(r["text"]), len(r["vi"])
                       flag = " [SUSPICIOUS]" if vi < zh * 0.6 else ""
-                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s{flag}\n")
+                      dur = r["end"] - r["start"]
+                      f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s ({dur:.2f}s){flag}\n")
                       f.write(f"  ZH ({zh}): {r['text']}\n")
-                      f.write(f"  VI ({vi}): {r['vi']}\n\n")
-
-              return results
+                      f.write(f"  VI ({vi}, {count_syl(r['vi'])} tu): {r['vi']}\n\n")
 
 
           # ============================================================
@@ -855,6 +907,8 @@ jobs:
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
 
               translated = translate_cues(cues)
+              translated = shorten_long(translated)
+              write_debug(translated)
               save_sub(translated, WORK / "vietnamese.srt", "vi")
               save_sub(translated, WORK / "vietnamese.vtt", "vi")
 
@@ -890,6 +944,7 @@ jobs:
           MAX_CONCURRENT_TTS = 8
           MAX_ATTEMPTS = 4
           ERROR_THRESHOLD = 5  # Ngưỡng lỗi để dừng workflow
+          TTS_RATE = "+25%"    # tốc độ gốc của giọng; phần tăng tốc thêm do bước mix quyết định
           failed_count = 0
           done_count = 0
 
@@ -914,7 +969,7 @@ jobs:
                       last_err = None
                       for attempt in range(MAX_ATTEMPTS):
                           try:
-                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+32%")
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate=TTS_RATE)
                               await tts.save(out)
                               if os.path.exists(out) and os.path.getsize(out) > 0:
                                   return
@@ -974,20 +1029,24 @@ jobs:
           import av
           import webvtt
 
-          TTS_PEAK = 0.60           # mỗi đoạn TTS được chuẩn hóa về mức này (thay cho gain cố định 3.5 gây vỡ tiếng)
-          BG_VOLUME = 0.1           # gain cho tiếng gốc (áp trong ffmpeg ở bước render)
-          DELAY_MS = 500            # TTS bắt đầu sau cue 500 ms
-          GAP_MS = 80               # khoảng nghỉ tối thiểu giữa 2 đoạn TTS liền nhau
-          MAX_DRIFT_MS = 2500       # cho phép lùi tối đa so với mốc cue; quá mức này mới chấp nhận chồng
-          MAX_SPEEDUP = 1.35        # tăng tốc thêm tối đa cho đoạn không vừa khe trống (nhân với +28% sẵn có)
-          SIL_THRESH = 10 ** (-50 / 20)   # -50 dB, cắt khoảng lặng đầu và cuối mỗi đoạn
+          TARGET_RMS = 0.20          # độ to TTS (RMS). Muốn to hơn: 0.23-0.25
+          BG_OUT = 0.12              # tiếng gốc khi KHÔNG có thoại (nhạc nền, hiệu ứng)
+          BG_IN = 0.01               # tiếng gốc khi có thoại TTS (gần như tắt hẳn)
+          DELAY_MS = 0               # TTS bắt đầu đúng mốc cue
+          GAP_MS = 60                # nghỉ tối thiểu giữa 2 câu
+          MAX_DRIFT_MS = 1500        # được phép trễ tối đa so với mốc cue
+          LOOKAHEAD_MS = 400         # được mượn tối đa 400ms của khe trước câu kế tiếp
+          MAX_SPEEDUP = 1.30         # tăng tốc thêm tối đa (nhân với +25% sẵn có)
+          DUCK_PRE_MS = 500          # hạ tiếng gốc trước cue
+          DUCK_POST_MS = 400         # và giữ thấp sau cue
+          SIL_THRESH = 10 ** (-50 / 20)
 
           rate = int(os.environ["AUDIO_RATE"])
           duration = float(os.environ["VIDEO_DURATION"])
 
-          def to_ms(time_str):
-              h, m, s = time_str.replace(',', '.').split(':')
-              return int(float(h) * 3600000 + float(m) * 60000 + float(s) * 1000)
+          def to_ms(s):
+              h, m, sec = s.replace(',', '.').split(':')
+              return int(float(h) * 3600000 + float(m) * 60000 + float(sec) * 1000)
 
           def as_list(x):
               if x is None: return []
@@ -1020,13 +1079,16 @@ jobs:
           buf = np.zeros(total, dtype=np.float32)
 
           vtt = webvtt.read("work/vietnamese.vtt")
-          starts = [int((to_ms(c.start) + DELAY_MS) * rate / 1000) for c in vtt]
+          n_cues = len(vtt)
+          starts = [max(0, int((to_ms(c.start) + DELAY_MS) * rate / 1000)) for c in vtt]
           gap = int(GAP_MS * rate / 1000)
           max_drift = int(MAX_DRIFT_MS * rate / 1000)
-          cursor = 0
-          placed = skipped = sped = overlapped = 0
-          max_shift = 0
-          for i, c in enumerate(vtt):
+          lookahead = int(LOOKAHEAD_MS * rate / 1000)
+
+          # ---------- Pass 1: đọc, cắt lặng, chuẩn hóa RMS ----------
+          clips = [None] * n_cues
+          skipped = 0
+          for i in range(n_cues):
               path = f"chunks/c_{i}.mp3"
               if not os.path.exists(path) or os.path.getsize(path) == 0:
                   skipped += 1
@@ -1041,23 +1103,48 @@ jobs:
               if loud.size == 0:
                   skipped += 1
                   continue
-              x = x[loud[0]:loud[-1] + 1]            # cắt lặng đầu VÀ cuối
+              x = x[loud[0]:loud[-1] + 1]
+              voiced = x[np.abs(x) > 0.02]
+              if voiced.size:
+                  rms = float(np.sqrt(np.mean(voiced ** 2)))
+                  if rms > 1e-4:
+                      x = x * min(8.0, TARGET_RMS / rms)
+              clips[i] = x
 
-              # Chuẩn hóa độ to từng đoạn (không dùng gain cố định nữa)
-              ref = float(np.percentile(np.abs(x), 99.5))
-              if ref > 1e-4:
-                  x = x * (TTS_PEAK / ref)
+          # ---------- Pass 2: tốc độ mục tiêu mỗi câu, làm mượt để tăng đều ----------
+          need = np.ones(n_cues)
+          for i, x in enumerate(clips):
+              if x is None: continue
+              nxt = starts[i + 1] if i + 1 < n_cues else total
+              avail = max(1, nxt - starts[i] - gap)
+              need[i] = len(x) / avail
+          target = np.clip(need, 1.0, MAX_SPEEDUP)
+          smooth = target.copy()
+          for i in range(n_cues):
+              l = target[i - 1] if i > 0 else target[i]
+              r = target[i + 1] if i + 1 < n_cues else target[i]
+              smooth[i] = max(target[i], 0.5 * target[i] + 0.25 * (l + r))
 
-              # Đặt tuần tự: đoạn sau không đè lên đoạn trước, tối đa lùi MAX_DRIFT
-              nxt = starts[i + 1] if i + 1 < len(vtt) else total
+          # ---------- Pass 3: đặt tuần tự ----------
+          cursor = 0
+          placed = sped = overlapped = 0
+          max_shift = 0
+          spans_ms = []   # vùng cần hạ tiếng gốc
+          for i, c in enumerate(vtt):
+              spans_ms.append((to_ms(c.start) - DUCK_PRE_MS, to_ms(c.end) + DUCK_POST_MS))
+              x = clips[i]
+              if x is None:
+                  continue
               pos = max(starts[i], cursor + gap)
               pos = min(pos, starts[i] + max_drift)
-              avail = nxt - pos
-              if avail > 0 and len(x) > avail:
-                  sp = min(MAX_SPEEDUP, len(x) / avail)
-                  if sp > 1.03:
-                      x = atempo(x, sp)
-                      sped += 1
+              nxt = starts[i + 1] if i + 1 < n_cues else total
+              avail = nxt + lookahead - pos
+              sp = float(smooth[i])
+              if avail > 0:
+                  sp = max(sp, min(MAX_SPEEDUP, len(x) / avail))
+              if sp > 1.03:
+                  x = atempo(x, sp)
+                  sped += 1
               if pos < cursor:
                   overlapped += 1
               if pos >= total:
@@ -1066,33 +1153,51 @@ jobs:
               buf[pos:pos + n] += x[:n]
               cursor = pos + n
               max_shift = max(max_shift, pos - starts[i])
+              spans_ms.append((pos * 1000.0 / rate - 150, (pos + n) * 1000.0 / rate + 250))
               placed += 1
-              if (i + 1) % 500 == 0:
-                  print(f"Mixed {i + 1}/{len(vtt)}", flush=True)
           print(f"TTS placed={placed} skipped={skipped} sped_up={sped} overlapped={overlapped} "
                 f"max_shift={max_shift / rate:.2f}s")
 
-          # Ghi 1 file wav duy nhất (mono int16), có soft limiter phòng khi vẫn còn đoạn chồng nhau
+          # ---------- Ghi tts_track.wav (soft limiter) ----------
           BLOCK = 1 << 22
           with wave.open("work/tts_track.wav", "wb") as wf:
-              wf.setnchannels(1)
-              wf.setsampwidth(2)
-              wf.setframerate(rate)
+              wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
               for s in range(0, total, BLOCK):
                   x = buf[s:s + BLOCK].copy()
                   a = np.abs(x)
-                  m = a > 0.9
+                  m = a > 0.85
                   if m.any():
-                      x[m] = np.sign(x[m]) * (0.9 + 0.1 * np.tanh((a[m] - 0.9) / 0.1))
+                      x[m] = np.sign(x[m]) * (0.85 + 0.15 * np.tanh((a[m] - 0.85) / 0.15))
                   wf.writeframes((np.clip(x, -1.0, 1.0) * 32767).astype("<i2").tobytes())
 
-          # Filter mix cuối: input 0 = video gốc, input 1 = tts_track.wav
+          # ---------- Đường cong hạ tiếng gốc (ducking) theo cue ----------
+          ENV_HZ = 1000
+          env = np.full(int((duration + 10) * ENV_HZ), BG_OUT, dtype=np.float32)
+          for a, b in spans_ms:
+              a = max(0, int(a * ENV_HZ / 1000)); b = min(len(env), int(b * ENV_HZ / 1000))
+              if b > a:
+                  env[a:b] = BG_IN
+          k = int(0.12 * ENV_HZ)   # làm mượt 120 ms để không bị "bập bùng"
+          env = np.convolve(env, np.ones(k, np.float32) / k, mode="same")
+          idx = np.arange(len(env), dtype=np.float64)
+          with wave.open("work/duck_env.wav", "wb") as wf:
+              wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+              for s in range(0, total, BLOCK):
+                  e = min(total, s + BLOCK)
+                  t = np.arange(s, e, dtype=np.float64) * 1000.0 / rate * (ENV_HZ / 1000.0)
+                  g = np.interp(t, idx, env)
+                  wf.writeframes((np.clip(g, 0, 1) * 32767).astype("<i2").tobytes())
+
+          # ---------- Filter mix: input 0 = video, 1 = tts, 3 = duck_env ----------
+          fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
           with open("final_mix.txt", "w") as f:
-              f.write(f"[0:a]aresample={rate}:async=1,asetpts=PTS-STARTPTS,volume={BG_VOLUME}[bg];")
-              f.write(f"[1:a]aresample={rate},asetpts=PTS-STARTPTS[tts];")
-              f.write("[bg][tts]amix=inputs=2:normalize=0:duration=first[out_audio]")
+              f.write(f"[0:a]aresample={rate}:async=1,{fmt},asetpts=PTS-STARTPTS[bg0];")
+              f.write(f"[3:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS[env];")
+              f.write("[bg0][env]amultiply[bg];")
+              f.write(f"[1:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS[tts];")
+              f.write("[bg][tts]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95:level=0[out_audio]")
           EOF
-          ls -lh work/tts_track.wav
+          ls -lh work/tts_track.wav work/duck_env.wav
 
       - name: Render Vietnamese video and HLS with detected subtitle blur
         env:
@@ -1157,7 +1262,7 @@ jobs:
           alpha = np.clip(alpha, 0.0, 1.0)
           cv2.imwrite("work/blur_mask.png", (alpha * 255).astype(np.uint8))
 
-          # Input: 0 = raw_video.mp4, 1 = work/tts_track.wav, 2 = work/blur_mask.png (lặp)
+          # Input: 0 = raw_video.mp4, 1 = work/tts_track.wav, 2 = work/blur_mask.png (lặp), 3 = work/duck_env.wav
           video_graph = (
               f"[0:v]split=2[vbase][vpatchsrc];"
               f"[vpatchsrc]crop={blur_w}:{blur_h}:{blur_x}:{blur_y},"
@@ -1178,6 +1283,7 @@ jobs:
 
           ffmpeg -y -i raw_video.mp4 -i work/tts_track.wav \
             -loop 1 -framerate 30 -t "$DUR" -i work/blur_mask.png \
+            -i work/duck_env.wav \
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map "[out_audio]" \
             -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
