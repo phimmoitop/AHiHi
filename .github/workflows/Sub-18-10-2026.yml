@@ -708,7 +708,7 @@ jobs:
 
                       for attempt in range(2):
                           try:
-                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+33%")
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+28%")
                               await tts.save(out)
                               if os.path.exists(out) and os.path.getsize(out) > 0:
                                   break
@@ -1023,7 +1023,6 @@ jobs:
           fi
           npx --yes wrangler@4 pages deploy output \
             --project-name "${CF_PAGES_PROJECT}" \
-            --account-id "${CLOUDFLARE_ACCOUNT_ID}" \
             --branch "${{ inputs.slug }}"
           echo "Cloudflare Pages deployment completed for ${CF_PAGES_PROJECT}."
 
