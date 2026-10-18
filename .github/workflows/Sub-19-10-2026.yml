@@ -62,7 +62,7 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 fonts-noto-core
+          sudo apt-get install -y ffmpeg aria2 fonts-noto-core fonts-oswald
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -1234,7 +1234,7 @@ jobs:
               "WrapStyle: 2", "ScaledBorderAndShadow: yes", "",
               "[V4+ Styles]",
               "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-              f"Style: Default,Noto Sans,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,0,1",
+              f"Style: Default,Oswald,{font_size},&H0000FFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,5,40,40,0,1",
               "", "[Events]", "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
           ]
           def ass_time(ms):
