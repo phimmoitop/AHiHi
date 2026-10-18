@@ -1,11 +1,11 @@
-name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 19-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 18-10-2026
 
 on:
   workflow_dispatch:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "https://www.bilibili.com/video/BV1s5gP61Egi"
+        description: "https://www.bilibili.com/video/BV1Fi3E6DEXj"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
@@ -38,7 +38,7 @@ jobs:
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
-      X264_PRESET: "medium"
+      X264_PRESET: "veryfast"
       X264_CRF: "21"
 
     steps:
@@ -171,7 +171,7 @@ jobs:
           OUT = Path("work/ocr")
           FPS = 3.0
           STEP = 1.0 / FPS
-          SPARSE_SAMPLES = 300
+          SPARSE_SAMPLES = 150
           MAX_REUSE = 2        # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
           SAME_IOU = 0.85      # nguong giong nhau cua mat na chu sang
 
@@ -252,10 +252,27 @@ jobs:
           # ------------------------------------------------------------
           # GIAI DOAN 1: mau thua -> dai mong
           # ------------------------------------------------------------
+          def norm_text(t):
+              return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
+
+
+          def rec_only(engine, img):
+              """Chi chay nhan dang (bo phat hien chu): nhanh hon rat nhieu, dung cho 1 dong sub."""
+              try:
+                  r, _ = engine(img, use_det=False, use_cls=False, use_rec=True)
+              except Exception:
+                  return "", 0.0
+              if not r:
+                  return "", 0.0
+              return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
+
+
           def find_strip(duration, width, height, x0, x1, y0):
+              """Tra ve (sy0, sy1, found, info). info co cy, th, fast_ok (co dung duoc che do nhanh khong)."""
               engine = make_engine()
               n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
+              kept = {}   # luu toi da 80 crop de tu kiem tra che do nhanh
               for i in range(n):
                   t = duration * (i + 0.5) / n
                   image = grab_frame(t, width, height)
@@ -265,18 +282,45 @@ jobs:
                   gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
-                  dets.extend(run_ocr(engine, crop, x0, y0, i))
+                  found_dets = run_ocr(engine, crop, x0, y0, i)
+                  dets.extend(found_dets)
+                  if found_dets and len(kept) < 80:
+                      kept[i] = crop.copy()
               band, tolerance = pick_band(dets, height)
               if not band:
-                  return y0, height, False
+                  return y0, height, False, None
               cy = float(np.median([d["cy"] for d in band]))
               th = float(np.percentile([d["y2"] - d["y1"] for d in band], 90))
               half = int(max(th * 1.6, tolerance * 1.1))
               sy0 = max(y0, int(cy - half))
               sy1 = min(height, int(cy + half))
               if sy1 - sy0 < 16:
-                  return y0, height, False
-              return sy0, sy1, True
+                  return y0, height, False, None
+
+              # ---- tu kiem tra: nhan dang-rieng tren dong sub co khop ket qua det+rec khong? ----
+              ty0 = max(y0, int(cy - th * 0.9))
+              ty1 = min(height, int(cy + th * 0.9))
+              by_frame = {}
+              for d in band:
+                  by_frame.setdefault(d["frame"], []).append(d)
+              sims = []
+              for fi, items in by_frame.items():
+                  if fi not in kept:
+                      continue
+                  items.sort(key=lambda d: d["x1"])
+                  ref = norm_text("".join(d["text"] for d in items))
+                  if len(ref) < 2:
+                      continue
+                  line = kept[fi][ty0 - y0:ty1 - y0]
+                  if line.shape[0] < 8:
+                      continue
+                  txt, _ = rec_only(engine, line)
+                  sims.append(SequenceMatcher(None, ref, norm_text(txt)).ratio())
+              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85
+              log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh "
+                  f"{(float(np.mean(sims)) if sims else 0):.2f} -> {'DUNG che do nhanh' if fast_ok else 'KHONG dung (dung det+rec)'}")
+              info = {"cy": cy, "th": th, "ty0": ty0, "ty1": ty1, "fast_ok": fast_ok}
+              return sy0, sy1, True, info
 
 
           # ------------------------------------------------------------
@@ -295,12 +339,17 @@ jobs:
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
               dets, last, last_mask, reuse, k, ocr_calls = [], None, None, 0, 0, 0
+              t_w = time.time()
               while True:
                   buf = proc.stdout.read(size)
                   if len(buf) < size:
                       break
                   fn = start_frame + k
                   k += 1
+                  if k % 40 == 0:
+                      el = time.time() - t_w
+                      log(f"[worker@{start_frame}] {k}/{n_frames} frames, ocr_calls={ocr_calls}, "
+                          f"{el:.0f}s, {el / k:.2f}s/frame")
                   frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
@@ -321,11 +370,52 @@ jobs:
                   ocr_calls += 1
                   last, last_mask, reuse = cur, mask, 0
                   dets.extend(cur)
-                  if k % 300 == 0:
-                      log(f"[worker@{start_frame}] frames {k}/{n_frames} ocr_calls={ocr_calls}")
               proc.stdout.close()
               proc.wait()
-              log(f"[worker@{start_frame}] done frames={k} ocr_calls={ocr_calls}")
+              log(f"[worker@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
+              return dets
+
+
+          def worker_fast(task):
+              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
+              start_frame, n_frames, x0, y0, x1, y1, cy, th = task
+              w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
+              engine = make_engine()
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
+                     "-ss", f"{start_frame * STEP:.3f}", "-i", VIDEO,
+                     "-t", f"{n_frames * STEP:.3f}", "-an",
+                     "-vf", f"fps={FPS},crop={w}:{h}:{x0}:{y0}",
+                     "-frames:v", str(n_frames),
+                     "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+              proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+              size = w * h * 3
+              dets, k, calls = [], 0, 0
+              t_w = time.time()
+              while True:
+                  buf = proc.stdout.read(size)
+                  if len(buf) < size:
+                      break
+                  fn = start_frame + k
+                  k += 1
+                  if k % 100 == 0:
+                      el = time.time() - t_w
+                      log(f"[fast@{start_frame}] {k}/{n_frames} frames, rec_calls={calls}, {el:.0f}s, {el / k:.2f}s/frame")
+                  frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
+                  gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                  if not has_text_edges(gray):
+                      continue
+                  text, score = rec_only(engine, frame)
+                  calls += 1
+                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+                  if cjk < 2 or score < .50:
+                      continue
+                  # Khong co box that: dung cy/chieu cao do tu buoc lay mau thua
+                  dets.append({"frame": fn, "time": fn * STEP, "text": text, "score": score,
+                               "x1": float(x0), "x2": float(x1),
+                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy})
+              proc.stdout.close()
+              proc.wait()
+              log(f"[fast@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
               return dets
 
 
@@ -348,7 +438,8 @@ jobs:
               x0, x1 = round(width * .175), round(width * .825)
               y0 = round(height * .65)
 
-              sy0, sy1, found = find_strip(duration, width, height, x0, x1, y0)
+              sy0, sy1, found, info = find_strip(duration, width, height, x0, x1, y0)
+              fast = bool(found and info and info["fast_ok"] and os.environ.get("OCR_FAST", "1") == "1")
               if found:
                   log(f"[STRIP] sub nam trong dai y={sy0}..{sy1} ({(sy1 - sy0) / (height - y0) * 100:.0f}% vung OCR cu)")
               else:
@@ -363,11 +454,15 @@ jobs:
                   s = i * per
                   n = min(per, total_frames - s)
                   if n > 0:
-                      tasks.append((s, n, x0, sy0, x1, sy1))
-              log(f"[OCR] {total_frames} frame, {len(tasks)} worker")
+                      if fast:
+                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cy"], info["th"]))
+                      else:
+                          tasks.append((s, n, x0, sy0, x1, sy1))
+              log(f"[OCR] mode={'FAST rec-only' if fast else 'det+rec'} | {total_frames} frame, "
+                  f"{len(tasks)} worker, cpu_count={os.cpu_count()}")
               ctx = mp.get_context("spawn")
               with ctx.Pool(len(tasks)) as pool:
-                  parts = pool.map(worker, tasks, chunksize=1)
+                  parts = pool.map(worker_fast if fast else worker, tasks, chunksize=1)
               detections = [d for p in parts for d in p]
               detections.sort(key=lambda d: (d["frame"], d["x1"]))
               log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
@@ -517,6 +612,7 @@ jobs:
         id: ocr
         env:
           OMP_NUM_THREADS: "1"
+          OCR_FAST: "1"   # 1 = tự thử chế độ nhanh (chỉ nhận dạng); 0 = luôn dùng det+rec như cũ
         run: |
           set -euo pipefail
           mkdir -p work/ocr
@@ -818,7 +914,7 @@ jobs:
                       last_err = None
                       for attempt in range(MAX_ATTEMPTS):
                           try:
-                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+30%")
+                              tts = edge_tts.Communicate(tts_text, voice="vi-VN-HoaiMyNeural", rate="+28%")
                               await tts.save(out)
                               if os.path.exists(out) and os.path.getsize(out) > 0:
                                   return
@@ -873,15 +969,18 @@ jobs:
           export AUDIO_RATE=$AUDIO_RATE
 
           python3 <<'EOF'
-          import os, wave
+          import os, wave, subprocess
           import numpy as np
           import av
           import webvtt
 
-          TTS_VOLUME = 3.5          # gain cho tiếng TTS
+          TTS_PEAK = 0.60           # mỗi đoạn TTS được chuẩn hóa về mức này (thay cho gain cố định 3.5 gây vỡ tiếng)
           BG_VOLUME = 0.1           # gain cho tiếng gốc (áp trong ffmpeg ở bước render)
           DELAY_MS = 500            # TTS bắt đầu sau cue 500 ms
-          SIL_THRESH = 10 ** (-50 / 20)   # -50 dB, cắt khoảng lặng đầu mỗi đoạn
+          GAP_MS = 80               # khoảng nghỉ tối thiểu giữa 2 đoạn TTS liền nhau
+          MAX_DRIFT_MS = 2500       # cho phép lùi tối đa so với mốc cue; quá mức này mới chấp nhận chồng
+          MAX_SPEEDUP = 1.35        # tăng tốc thêm tối đa cho đoạn không vừa khe trống (nhân với +28% sẵn có)
+          SIL_THRESH = 10 ** (-50 / 20)   # -50 dB, cắt khoảng lặng đầu và cuối mỗi đoạn
 
           rate = int(os.environ["AUDIO_RATE"])
           duration = float(os.environ["VIDEO_DURATION"])
@@ -906,11 +1005,27 @@ jobs:
               c.close()
               return np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
 
+          def atempo(x, speed):
+              try:
+                  p = subprocess.run(
+                      ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "f32le", "-ar", str(rate), "-ac", "1",
+                       "-i", "pipe:0", "-af", f"atempo={speed:.4f}", "-f", "f32le", "pipe:1"],
+                      input=x.astype("<f4").tobytes(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True)
+                  out = np.frombuffer(p.stdout, dtype="<f4").copy()
+                  return out if out.size else x
+              except Exception:
+                  return x
+
           total = int((duration + 10) * rate)
           buf = np.zeros(total, dtype=np.float32)
 
           vtt = webvtt.read("work/vietnamese.vtt")
-          placed = skipped = 0
+          starts = [int((to_ms(c.start) + DELAY_MS) * rate / 1000) for c in vtt]
+          gap = int(GAP_MS * rate / 1000)
+          max_drift = int(MAX_DRIFT_MS * rate / 1000)
+          cursor = 0
+          placed = skipped = sped = overlapped = 0
+          max_shift = 0
           for i, c in enumerate(vtt):
               path = f"chunks/c_{i}.mp3"
               if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -926,25 +1041,45 @@ jobs:
               if loud.size == 0:
                   skipped += 1
                   continue
-              x = x[loud[0]:]
-              pos = int((to_ms(c.start) + DELAY_MS) * rate / 1000)
+              x = x[loud[0]:loud[-1] + 1]            # cắt lặng đầu VÀ cuối
+
+              # Chuẩn hóa độ to từng đoạn (không dùng gain cố định nữa)
+              ref = float(np.percentile(np.abs(x), 99.5))
+              if ref > 1e-4:
+                  x = x * (TTS_PEAK / ref)
+
+              # Đặt tuần tự: đoạn sau không đè lên đoạn trước, tối đa lùi MAX_DRIFT
+              nxt = starts[i + 1] if i + 1 < len(vtt) else total
+              pos = max(starts[i], cursor + gap)
+              pos = min(pos, starts[i] + max_drift)
+              avail = nxt - pos
+              if avail > 0 and len(x) > avail:
+                  sp = min(MAX_SPEEDUP, len(x) / avail)
+                  if sp > 1.03:
+                      x = atempo(x, sp)
+                      sped += 1
+              if pos < cursor:
+                  overlapped += 1
               if pos >= total:
                   continue
               n = min(len(x), total - pos)
               buf[pos:pos + n] += x[:n]
+              cursor = pos + n
+              max_shift = max(max_shift, pos - starts[i])
               placed += 1
               if (i + 1) % 500 == 0:
                   print(f"Mixed {i + 1}/{len(vtt)}", flush=True)
-          print(f"TTS placed={placed} skipped={skipped}")
+          print(f"TTS placed={placed} skipped={skipped} sped_up={sped} overlapped={overlapped} "
+                f"max_shift={max_shift / rate:.2f}s")
 
-          # Ghi 1 file wav duy nhất (mono int16), áp gain + soft limiter chống vỡ tiếng
+          # Ghi 1 file wav duy nhất (mono int16), có soft limiter phòng khi vẫn còn đoạn chồng nhau
           BLOCK = 1 << 22
           with wave.open("work/tts_track.wav", "wb") as wf:
               wf.setnchannels(1)
               wf.setsampwidth(2)
               wf.setframerate(rate)
               for s in range(0, total, BLOCK):
-                  x = buf[s:s + BLOCK] * TTS_VOLUME
+                  x = buf[s:s + BLOCK].copy()
                   a = np.abs(x)
                   m = a > 0.9
                   if m.any():
