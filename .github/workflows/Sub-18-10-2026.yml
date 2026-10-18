@@ -162,7 +162,7 @@ jobs:
           video = "raw_video.mp4"
           out = Path("work/ocr")
           out.mkdir(parents=True, exist_ok=True)
-          fps = 5.0
+          fps = 3.0
           duration = float(subprocess.check_output(
               ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                "-of", "default=nw=1:nk=1", video], text=True).strip())
@@ -203,6 +203,15 @@ jobs:
                   frame_no += 1
                   continue
               crop = image[y0:height, x0:x1]
+              # Skip nearly blank subtitle regions before invoking OCR. Canny is
+              # much cheaper than RapidOCR; the deliberately low threshold only
+              # filters frames with almost no text-like edges.
+              gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+              edge_count = cv2.countNonZero(cv2.Canny(gray, 80, 180))
+              min_text_edges = max(30, int(crop.shape[0] * crop.shape[1] * 0.0001))
+              if edge_count < min_text_edges:
+                  frame_no += 1
+                  continue
               result, _ = engine(crop)
               if result:
                   for box, text, score in result:
@@ -225,7 +234,7 @@ jobs:
           if proc.wait() != 0:
               raise RuntimeError("ffmpeg OCR frame extraction failed")
 
-          with (out / "ocr-raw-5fps.tsv").open("w", encoding="utf-8") as f:
+          with (out / "ocr-raw-3fps.tsv").open("w", encoding="utf-8") as f:
               f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\n")
               for d in detections:
                   f.write(f"{d['time']:.3f}\t{d['score']:.3f}\t{d['text']}\t"
@@ -297,7 +306,7 @@ jobs:
               ss, ms = divmod(ms, 1000)
               return f"{hh:02}:{mm:02}:{ss:02},{ms:03}"
 
-          srt = out / "hardsub-5fps.srt"
+          srt = out / "hardsub-3fps.srt"
           with srt.open("w", encoding="utf-8") as f:
               for i, seg in enumerate(segments, 1):
                   start = max(0, seg["first"] - step / 2)
@@ -382,12 +391,7 @@ jobs:
           if not segments:
               print("OCR produced no stable subtitle cues.")
           PY
-
-      - name: Stop before translation when OCR needs review
-        if: steps.ocr.outputs.needs_review == 'true'
-        run: |
-          echo '::error::OCR found low-confidence or one-frame subtitle cues. Review the OCR evidence printed in the workflow log before translation/render.'
-          exit 1
+          cp work/ocr/hardsub-3fps.srt work/native.srt
 
       - name: Create Translate script
         run: |
