@@ -5,7 +5,7 @@ on:
     inputs:
       # ---------- SOURCE ----------
       url:
-        description: "https://www.bilibili.com/video/BV1PjgP65EhZ"
+        description: "https://www.bilibili.com/video/BV1s5gP61Egi"
         required: true
         type: string
       # ---------- CLOUDFLARE DEPLOY ----------
@@ -238,26 +238,34 @@ jobs:
               return band, tolerance
 
 
+          def grab_frame(t, width, height):
+              """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
+              cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
+                     "-i", VIDEO, "-frames:v", "1", "-an",
+                     "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+              if len(out) < width * height * 3:
+                  return None
+              return np.frombuffer(out, np.uint8)[:width * height * 3].reshape(height, width, 3).copy()
+
+
           # ------------------------------------------------------------
           # GIAI DOAN 1: mau thua -> dai mong
           # ------------------------------------------------------------
           def find_strip(duration, width, height, x0, x1, y0):
               engine = make_engine()
-              cap = cv2.VideoCapture(VIDEO)
               n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
               for i in range(n):
                   t = duration * (i + 0.5) / n
-                  cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                  ok, image = cap.read()
-                  if not ok:
+                  image = grab_frame(t, width, height)
+                  if image is None:
                       continue
                   crop = image[y0:height, x0:x1]
                   gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
                   dets.extend(run_ocr(engine, crop, x0, y0, i))
-              cap.release()
               band, tolerance = pick_band(dets, height)
               if not band:
                   return y0, height, False
@@ -477,11 +485,8 @@ jobs:
               # Anh kiem tra hinh hoc: box OCR (xanh) + vung blur do (do)
               if valid_geometry and frame_unions:
                   representative = frame_unions[len(frame_unions) // 2]
-                  cap = cv2.VideoCapture(VIDEO)
-                  cap.set(cv2.CAP_PROP_POS_MSEC, representative["frame"] * step * 1000)
-                  ok, image = cap.read()
-                  cap.release()
-                  if ok:
+                  image = grab_frame(representative["frame"] * step, width, height)
+                  if image is not None:
                       for d in frame_dets.get(representative["frame"], []):
                           cv2.rectangle(image, (int(d["x1"]), int(d["y1"])),
                                         (int(d["x2"]), int(d["y2"])), (0, 255, 0), 2)
