@@ -1,4 +1,4 @@
-name: Bilibili → Vietsub + Sub-CloneTTS-19-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) — Sub TM 19-10-2026
 
 on:
   workflow_dispatch:
@@ -186,6 +186,8 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Tránh lỗi "Illegal instruction" (exit 132) trên runner có CPU thiếu AVX2/AVX512
+          ATEN_CPU_CAPABILITY: "default"
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -1109,8 +1111,7 @@ jobs:
           MAX_SKIP_MISSING = 3
 
           # So tu tieng Viet toi da moi giay de TTS doc kip.
-          # TTS nay sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
-          # (giong noi tu nhien ~5 tu/giay -> 6 tu/giay la nguong hop ly)
+          # TTS sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
           MAX_SYL_PER_SEC = 6.0
 
           # ---- GEMINI ----
@@ -1619,10 +1620,10 @@ jobs:
           import webvtt
 
           # ---- Âm lượng / chất giọng TTS ----
-          TARGET_RMS = 0.28          # độ to TTS (RMS) trước khi nén. Cũ: 0.20. Muốn to hơn nữa: 0.30-0.32
-          TTS_BASS_DB = 4            # tăng trầm (dB) để giọng đầy, bớt mỏng. 0 = tắt, tối đa nên 6
-          TTS_COMP_MAKEUP = 2.0      # bù âm lượng sau bộ nén (hệ số tuyến tính, 2.0 ≈ +6dB)
-          TTS_VOLUME = 1.0           # nhân thêm âm lượng cuối cùng (1.0 = giữ nguyên)
+          TARGET_RMS = 0.28          # độ to TTS (RMS). Cũ: 0.20. Muốn to hơn nữa: 0.30-0.32
+          TTS_BASS_DB = 4            # tăng trầm (dB) cho giọng đầy, bớt mỏng. 0 = tắt, tối đa nên 6
+          TTS_COMP_MAKEUP = 2.0      # bù âm lượng sau bộ nén (2.0 ≈ +6dB)
+          TTS_VOLUME = 1.0           # nhân thêm âm lượng cuối (1.0 = giữ nguyên)
 
           # ---- Mix / tốc độ ----
           BG_OUT = 0.12              # tiếng gốc khi KHÔNG có thoại (nhạc nền, hiệu ứng)
