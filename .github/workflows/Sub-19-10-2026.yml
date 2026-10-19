@@ -62,7 +62,13 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 fonts-noto-core fonts-oswald
+          sudo apt-get install -y ffmpeg aria2 fonts-noto-core fontconfig unzip
+
+          # Cài font Oswald từ file zip có sẵn trong repo
+          sudo mkdir -p /usr/local/share/fonts/oswald
+          sudo unzip -o -j Oswald.zip '*.ttf' '*.otf' -d /usr/local/share/fonts/oswald
+          sudo fc-cache -f
+          fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
 
       - name: Cache pip packages
         uses: actions/cache@v4
