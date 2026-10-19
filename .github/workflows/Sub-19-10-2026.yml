@@ -66,7 +66,7 @@ jobs:
 
           # Cài font Oswald từ file zip có sẵn trong repo
           sudo mkdir -p /usr/local/share/fonts/oswald
-          sudo unzip -o -j Oswald.zip '*.ttf' '*.otf' -d /usr/local/share/fonts/oswald
+          sudo unzip -o -j Oswald.zip '*.ttf' -x '*VariableFont*' -d /usr/local/share/fonts/oswald
           sudo fc-cache -f
           fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
 
