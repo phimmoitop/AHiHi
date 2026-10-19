@@ -1207,22 +1207,20 @@ jobs:
           head -40 work/vietnamese.vtt || true
           wc -l work/vietnamese.vtt || true
 
-      - name: Cache V-TTS model
+      - name: Cache VieNeu-TTS models (Hugging Face)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/v_tts
-          key: vtts-model-v1
+          path: ~/.cache/huggingface
+          key: vieneu-models-v1
 
-      - name: Install V-TTS (zero-shot voice cloning, CPU)
+      - name: Install VieNeu-TTS (voice cloning, CPU / ONNX)
         run: |
           set -eux
-          sudo apt-get install -y libsndfile1 espeak-ng
-          # PyTorch bản CPU (nhẹ hơn nhiều so với bản CUDA mặc định)
-          python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install "git+https://github.com/tronghieuit/v-tts.git"
+          # Bản mặc định (v3 Turbo) chạy ONNX trên CPU, không cần PyTorch
+          python -m pip install vieneu
           python3 <<'PY'
-          from v_tts import ZeroShotTTS
-          print("v_tts import OK")
+          from vieneu import Vieneu
+          print("vieneu import OK")
           PY
 
       - name: Prepare voice reference (from 1.mp3 in repo root)
@@ -1295,19 +1293,27 @@ jobs:
           PY
           ls -lh work/voice_ref.wav
 
-      - name: TTS Generation (V-TTS voice clone from 1.mp3 + Vietnamese VTT)
+      - name: TTS Generation (VieNeu-TTS voice clone from 1.mp3 + Vietnamese VTT)
         env:
-          TTS_SPEEDUP: "1.25"    # tăng tốc giọng (tương đương +25% của edge-tts cũ). Muốn tự nhiên hơn: 1.0-1.1
-          EDGE_FALLBACK: "1"     # 1 = đoạn nào V-TTS lỗi thì dùng edge-tts thay thế; 0 = không dùng
+          TTS_SPEEDUP: "1.25"          # tăng tốc giọng (tương đương +25% của edge-tts cũ). Muốn tự nhiên hơn: 1.0-1.1
+          EDGE_FALLBACK: "1"           # 1 = đoạn nào VieNeu lỗi thì dùng edge-tts thay thế; 0 = không dùng
+          VIENEU_MODE: "v3turbo"       # v3turbo (chất lượng cao, 48kHz) | v3nano (nhẹ hơn, 24kHz, dùng khi Turbo quá chậm)
+          VIENEU_PRECISION: "fp32"     # chỉ cho v3turbo: fp32 (ổn định) | int8 (nhanh ~3x, cần CPU có VNNI, có thể méo tiếng)
+          VIENEU_THREADS: "0"          # 0 = tự chọn theo số nhân CPU
         run: |
           python3 <<'PY'
-          import os, re, sys, time, asyncio, subprocess
+          import os, re, sys, time, asyncio, subprocess, logging
           import numpy as np
           import webvtt
+
+          logging.basicConfig(level=logging.INFO, format="%(message)s")
 
           REF = "work/voice_ref.wav"
           TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.25"))
           EDGE_FALLBACK = os.environ.get("EDGE_FALLBACK", "1") == "1"
+          VIENEU_MODE = os.environ.get("VIENEU_MODE", "v3turbo")
+          VIENEU_PRECISION = os.environ.get("VIENEU_PRECISION", "fp32")
+          VIENEU_THREADS = int(os.environ.get("VIENEU_THREADS", "0"))
           EDGE_RATE = "+25%"
           EDGE_VOICE = "vi-VN-HoaiMyNeural"
           MAX_ATTEMPTS = 2
@@ -1373,16 +1379,15 @@ jobs:
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
 
-              try:
-                  import torch
-                  torch.set_num_threads(os.cpu_count() or 2)
-              except Exception:
-                  pass
-              from v_tts import ZeroShotTTS
+              from vieneu import Vieneu
+              kw = {"threads": VIENEU_THREADS}
+              if VIENEU_MODE == "v3turbo":
+                  kw["precision"] = VIENEU_PRECISION
               t_load = time.time()
-              tts = ZeroShotTTS()   # CPU mặc định, tự tải model lần đầu
-              print(f"[V-TTS] model loaded in {time.time() - t_load:.0f}s | ref={REF} | "
-                    f"speedup={TTS_SPEEDUP} | cues={total}", flush=True)
+              tts = Vieneu(mode=VIENEU_MODE, **kw)   # CPU/ONNX, tự tải model lần đầu
+              sr = int(getattr(tts, "sample_rate", 48000))
+              print(f"[VieNeu] mode={VIENEU_MODE} sr={sr} loaded in {time.time() - t_load:.0f}s | "
+                    f"ref={REF} | speedup={TTS_SPEEDUP} | cues={total}", flush=True)
 
               failed = []   # (index, text) can fallback
               t0 = time.time()
@@ -1396,16 +1401,16 @@ jobs:
                   ok = False
                   for attempt in range(MAX_ATTEMPTS):
                       try:
-                          audio, sr = tts.synthesize(text=text, reference_audio=REF)
+                          audio = tts.infer(text, ref_audio=REF)
                           a = to_float(audio)
                           if plausible(a, sr, text):
                               to_mp3(a, sr, out)
                               ok = True
                               break
-                          print(f"[V-TTS] doan {i} bat thuong (dur={len(a) / float(sr):.2f}s, "
+                          print(f"[VieNeu] doan {i} bat thuong (dur={len(a) / float(sr):.2f}s, "
                                 f"{n_words(text)} tu), lan {attempt + 1}/{MAX_ATTEMPTS}", flush=True)
                       except Exception as e:
-                          print(f"[V-TTS] loi doan {i} lan {attempt + 1}: {e}", flush=True)
+                          print(f"[VieNeu] loi doan {i} lan {attempt + 1}: {e}", flush=True)
                           if os.path.exists(out):
                               os.remove(out)
                   if ok:
@@ -1416,7 +1421,7 @@ jobs:
                       el = time.time() - t0
                       print(f"TTS {i + 1}/{total} | ok={made} | loi={len(failed)} | {el:.0f}s", flush=True)
 
-              # ---------- Dự phòng edge-tts cho các đoạn V-TTS lỗi ----------
+              # ---------- Dự phòng edge-tts cho các đoạn VieNeu lỗi ----------
               still_failed = []
               if failed and EDGE_FALLBACK:
                   import edge_tts
@@ -1457,7 +1462,7 @@ jobs:
                   sys.exit(1)
 
               with open("count.txt", "w") as f: f.write(str(total))
-              print(f"[DONE] Generated {total} TTS chunks (V-TTS ok={made}, edge-fallback={len(failed) - failed_count})")
+              print(f"[DONE] Generated {total} TTS chunks (VieNeu ok={made}, edge-fallback={len(failed) - failed_count})")
 
           main()
           PY
