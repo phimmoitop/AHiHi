@@ -1,4 +1,4 @@
-name: Bilibili → Vietsub + Sub-CloneTTS-19-10-2026
+name: Bilibili → Vietsub + Sub 19-10-2026
 
 on:
   workflow_dispatch:
