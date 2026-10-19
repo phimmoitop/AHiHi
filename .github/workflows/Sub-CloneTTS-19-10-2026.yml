@@ -282,7 +282,7 @@ jobs:
           PY
 
       # ============================================================
-      # TỪ ĐÂY TRỞ XUỐNG: PHẦN VIETSUB (GIỮ NGUYÊN)
+      # TỪ ĐÂY TRỞ XUỐNG: PHẦN VIETSUB
       # ============================================================
       - name: Prepare directories
         run: |
@@ -1105,8 +1105,13 @@ jobs:
 
           MIN_CUE_DURATION = 0.10
 
-          # So tu tieng Viet toi da moi giay de TTS doc kip (TTS +25% roi atempo toi da ~1.3x)
-          MAX_SYL_PER_SEC = 7.0
+          # Batch chi sot 1..N dong thi BO QUA (de trong), khong goi API retry
+          MAX_SKIP_MISSING = 3
+
+          # So tu tieng Viet toi da moi giay de TTS doc kip.
+          # TTS nay sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
+          # (giong noi tu nhien ~5 tu/giay -> 6 tu/giay la nguong hop ly)
+          MAX_SYL_PER_SEC = 6.0
 
           # ---- GEMINI ----
           GEMINI_MODEL = "gemini-3.5-flash-lite"
@@ -1238,6 +1243,54 @@ jobs:
               return out
 
 
+          def parse_pairs(response_text):
+              """Tra ve list (idx, val) dung THU TU AI tra ve, khong gop theo idx."""
+              pairs = []
+              for line in response_text.strip().split("\n"):
+                  if "]" in line:
+                      try:
+                          head, val = line.split("]", 1)
+                          idx = int(head.replace("[", "").split("|")[0].strip())
+                          pairs.append((idx, val.strip()))
+                      except Exception:
+                          pass
+              return pairs
+
+
+          def parse_batch(response_text, n):
+              """Parse ket qua 1 batch n dong, sua cac so thu tu AI ghi nham (vd [120] -> [20])."""
+              pairs = parse_pairs(response_text)
+              out = {}
+
+              # Du so dong -> tin vi tri, bo qua so thu tu AI ghi
+              if len(pairs) == n:
+                  bad = [(k, i) for k, (i, _) in enumerate(pairs) if i != k]
+                  if bad:
+                      log(f">> SUA SO THU TU: {len(bad)} dong AI ghi sai so, ghep theo vi tri: "
+                          + ", ".join(f"[{k}]<-[{i}]" for k, i in bad[:10]))
+                  for k, (_, val) in enumerate(pairs):
+                      out[k] = "" if val == "..." else val
+                  return out
+
+              # Thieu/thua dong -> sua tung so lech dua tren so truoc do
+              prev = -1
+              for i, val in pairs:
+                  expected = prev + 1
+                  if i == expected and i < n and i not in out:
+                      idx = i
+                  elif i > expected and i < n and i not in out:
+                      idx = i                      # AI nhay coc that (sot dong)
+                  elif expected < n and expected not in out:
+                      log(f">> SUA SO THU TU: AI ghi [{i}], dat vao [{expected}]")
+                      idx = expected               # so bi ghi nham -> dat vao cho ke tiep
+                  else:
+                      log(f">> BO QUA dong thua/trung so [{i}]: {val[:40]!r}")
+                      continue
+                  out[idx] = "" if val == "..." else val
+                  prev = idx
+              return out
+
+
           def translate_cues(cues):
               if not GEMINI_API_KEYS:
                   raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
@@ -1265,10 +1318,14 @@ jobs:
                   for line in response_text.strip().split("\n"):
                       log(f"   {line}")
 
-                  translated = parse_translated(response_text)
+                  translated = parse_batch(response_text, len(batch))
 
                   missing = [idx for idx in range(len(batch)) if not translated.get(idx)]
-                  if missing:
+                  skip_blank = 0 < len(missing) <= MAX_SKIP_MISSING
+                  if skip_blank:
+                      log(f">> AI bo sot {len(missing)} dong: {missing}. "
+                          f"<= {MAX_SKIP_MISSING} nen BO QUA, de trong, khong retry.")
+                  elif missing:
                       log(f">> CANH BAO: AI bo sot {len(missing)} dong: {missing}. Retry...")
                       rp = "You missed some lines in your previous translation. Please translate ONLY these missing lines:\n\n"
                       rp += "".join(f"[{idx}] {batch[idx]['text'].strip() or '...'}\n" for idx in missing)
@@ -1278,12 +1335,16 @@ jobs:
                           log(">> KET QUA RETRY:")
                           for line in rr.strip().split("\n"):
                               log(f"   {line}")
-                          translated.update(parse_translated(rr))
+                          retry_map = parse_translated(rr)
+                          translated.update({k: v for k, v in retry_map.items() if k in missing})
 
                   fallback = 0
                   for idx, cue in enumerate(batch):
                       if translated.get(idx):
                           vi = translated[idx]
+                      elif skip_blank:
+                          vi = ""
+                          log(f"   [{i + idx + 1:04d}] BO TRONG (AI sot): {cue['text']!r}")
                       else:
                           vi = cue["text"]
                           fallback += 1
@@ -1310,6 +1371,8 @@ jobs:
               for _round in range(2):
                   todo = []
                   for i, r in enumerate(results):
+                      if not r["vi"].strip():
+                          continue
                       nxt = results[i + 1]["start"] if i + 1 < len(results) else r["end"] + 2
                       budget = min(max(nxt - r["start"], 0.8), 10.0)
                       limit = max(2, int(budget * MAX_SYL_PER_SEC))
@@ -1356,9 +1419,11 @@ jobs:
           # ============================================================
           # LUU FILE SUB (SRT + VTT)
           # ============================================================
-          def save_sub(cues, path, field):
+          def save_sub(cues, path, field, skip_empty=False):
               subs = pysubs2.SSAFile()
               for c in cues:
+                  if skip_empty and not c[field].strip():
+                      continue
                   subs.events.append(pysubs2.SSAEvent(
                       start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c[field]))
               subs.save(str(path), encoding="utf-8")
@@ -1373,8 +1438,8 @@ jobs:
               translated = translate_cues(cues)
               translated = shorten_long(translated)
               write_debug(translated)
-              save_sub(translated, WORK / "vietnamese.srt", "vi")
-              save_sub(translated, WORK / "vietnamese.vtt", "vi")
+              save_sub(translated, WORK / "vietnamese.srt", "vi", skip_empty=True)
+              save_sub(translated, WORK / "vietnamese.vtt", "vi", skip_empty=True)
 
               log("NATIVE SUB + TRANSLATE COMPLETE")
               log(f"Chinese SRT   : {WORK / 'chinese.srt'}")
@@ -1402,8 +1467,9 @@ jobs:
 
       - name: TTS Generation (VieNeu-TTS voice profile + Vietnamese VTT)
         env:
-          TTS_SPEEDUP: "1.25"          # tăng tốc giọng. Muốn tự nhiên hơn: 1.0-1.1
+          TTS_SPEEDUP: "1.0"           # tốc độ lúc sinh giọng (1.0 = gốc, 0%). Việc tăng tốc để khớp thời gian làm ở bước mix
           VIENEU_WATERMARK: "1"        # 1 = apply_watermark=True (như bước test), 0 = tắt
+          TTS_ERROR_THRESHOLD: "5"     # quá số đoạn lỗi này thì dừng workflow
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -1415,10 +1481,9 @@ jobs:
 
           logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-          TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.25"))
+          TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.0"))
           WATERMARK = os.environ.get("VIENEU_WATERMARK", "1") == "1"
-          MAX_ATTEMPTS = 2
-          ERROR_THRESHOLD = 5   # Ngưỡng lỗi để dừng workflow
+          ERROR_THRESHOLD = int(os.environ.get("TTS_ERROR_THRESHOLD", "5"))
           TMP_WAV = "work/_vieneu_tmp.wav"
 
           def normalize_for_tts(text):
@@ -1445,7 +1510,7 @@ jobs:
               return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
 
           def to_mp3(a, sr, out):
-              """Ghi mp3 (de cac buoc sau giu nguyen: chunks/c_i.mp3) + tang toc giu cao do."""
+              """Ghi mp3 (de cac buoc sau giu nguyen: chunks/c_i.mp3). Chi tang toc neu TTS_SPEEDUP != 1.0."""
               cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                      "-f", "f32le", "-ar", str(int(sr)), "-ac", "1", "-i", "pipe:0"]
               if abs(TTS_SPEEDUP - 1.0) > 0.01:
@@ -1501,19 +1566,19 @@ jobs:
                       # cue rỗng: không tạo file, bước mix sẽ coi là im lặng
                       continue
                   ok = False
-                  for attempt in range(MAX_ATTEMPTS):
-                      try:
-                          a, sr = synth(text)
-                          if plausible(a, sr, text):
-                              to_mp3(a, sr, out)
-                              ok = True
-                              break
+                  # KHÔNG thử lại: lỗi là bỏ qua đoạn này (để im lặng)
+                  try:
+                      a, sr = synth(text)
+                      if plausible(a, sr, text):
+                          to_mp3(a, sr, out)
+                          ok = True
+                      else:
                           print(f"[VieNeu] doan {i} bat thuong (dur={len(a) / float(sr):.2f}s, "
-                                f"{n_words(text)} tu), lan {attempt + 1}/{MAX_ATTEMPTS}", flush=True)
-                      except Exception as e:
-                          print(f"[VieNeu] loi doan {i} lan {attempt + 1}: {e}", flush=True)
-                          if os.path.exists(out):
-                              os.remove(out)
+                                f"{n_words(text)} tu) -> bo qua", flush=True)
+                  except Exception as e:
+                      print(f"[VieNeu] loi doan {i}: {e} -> bo qua", flush=True)
+                      if os.path.exists(out):
+                          os.remove(out)
                   if ok:
                       made += 1
                   else:
@@ -1553,14 +1618,20 @@ jobs:
           import av
           import webvtt
 
-          TARGET_RMS = 0.20          # độ to TTS (RMS). Muốn to hơn: 0.23-0.25
+          # ---- Âm lượng / chất giọng TTS ----
+          TARGET_RMS = 0.28          # độ to TTS (RMS) trước khi nén. Cũ: 0.20. Muốn to hơn nữa: 0.30-0.32
+          TTS_BASS_DB = 4            # tăng trầm (dB) để giọng đầy, bớt mỏng. 0 = tắt, tối đa nên 6
+          TTS_COMP_MAKEUP = 2.0      # bù âm lượng sau bộ nén (hệ số tuyến tính, 2.0 ≈ +6dB)
+          TTS_VOLUME = 1.0           # nhân thêm âm lượng cuối cùng (1.0 = giữ nguyên)
+
+          # ---- Mix / tốc độ ----
           BG_OUT = 0.12              # tiếng gốc khi KHÔNG có thoại (nhạc nền, hiệu ứng)
           BG_IN = 0.01               # tiếng gốc khi có thoại TTS (gần như tắt hẳn)
           DELAY_MS = 0               # TTS bắt đầu đúng mốc cue
           GAP_MS = 60                # nghỉ tối thiểu giữa 2 câu
           MAX_DRIFT_MS = 1500        # được phép trễ tối đa so với mốc cue
           LOOKAHEAD_MS = 400         # được mượn tối đa 400ms của khe trước câu kế tiếp
-          MAX_SPEEDUP = 1.35         # tăng tốc thêm tối đa (nhân với +25% sẵn có)
+          MAX_SPEEDUP = 1.5          # tăng tốc tối đa so với giọng gốc (TTS sinh ở 1.0x). Câu vừa khe thì giữ 1.0x
           DUCK_PRE_MS = 500          # hạ tiếng gốc trước cue
           DUCK_POST_MS = 400         # và giữ thấp sau cue
           SIL_THRESH = 10 ** (-50 / 20)
@@ -1714,14 +1785,22 @@ jobs:
 
           # ---------- Filter mix: input 0 = video, 1 = tts, 3 = duck_env ----------
           fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
+          # Chất giọng TTS: tăng trầm cho đầy tiếng -> nén nhẹ cho đều -> bù âm lượng
+          tts_fx = ""
+          if TTS_BASS_DB:
+              tts_fx += f",bass=g={TTS_BASS_DB}:f=200"
+          tts_fx += f",acompressor=threshold=0.1:ratio=3:attack=10:release=120:makeup={TTS_COMP_MAKEUP}"
+          if abs(TTS_VOLUME - 1.0) > 0.01:
+              tts_fx += f",volume={TTS_VOLUME}"
           with open("final_mix.txt", "w") as f:
               f.write(f"[0:a]aresample={rate}:async=1,{fmt},asetpts=PTS-STARTPTS[bg0];")
               f.write(f"[3:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS[env];")
               f.write("[bg0][env]amultiply[bg];")
-              f.write(f"[1:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS[tts];")
+              f.write(f"[1:a]aresample={rate},{fmt},asetpts=PTS-STARTPTS{tts_fx}[tts];")
               f.write("[bg][tts]amix=inputs=2:normalize=0:duration=first,alimiter=limit=0.95:level=0[out_audio]")
           EOF
           ls -lh work/tts_track.wav work/duck_env.wav
+          cat final_mix.txt; echo
 
       - name: Render Vietnamese video and HLS with detected subtitle blur
         env:
