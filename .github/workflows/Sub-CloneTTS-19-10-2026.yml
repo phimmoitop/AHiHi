@@ -14,7 +14,7 @@ on:
         required: true
         type: string
       token:
-        description: "OvoE8GKMVcBD8mLH4C3hDXL1G40Gqdt_IX5Aujum"
+        description: "Cloudflare API Token"
         required: true
         type: string
       page:
@@ -78,19 +78,212 @@ jobs:
           restore-keys: |
             pip-${{ runner.os }}-
 
-      - name: Install Python packages
+      # ============================================================
+      # VIENEU: CÀI ĐẶT + DỰNG VOICE PROFILE + TEST — LÀM TRƯỚC TẤT CẢ
+      # Lỗi ở đây thì dừng ngay, chưa tải video / OCR / dịch gì cả.
+      # ============================================================
+      - name: Install VieNeu (pinned versions)
         run: |
           set -eux
           python -m pip install --upgrade pip
+
+          # Pin torch về bản mà torchao==0.12.0 hỗ trợ (2.7.1 / 2.6.0 / 2.5.0)
+          python -m pip install \
+            torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+
+          # Pin torchao: bản mới đã bỏ torchao.dtypes.nf4tensor mà torchtune (phụ thuộc của neucodec) vẫn import
+          python -m pip install "torchao==0.12.0"
+
+          python -m pip install \
+            "vieneu==2.7.0" \
+            neucodec \
+            numpy \
+            soundfile \
+            pydub \
+            onnxruntime \
+            "demucs-onnx" \
+            "huggingface_hub[cli]"
+
+          python3 <<'PY'
+          from vieneu import Vieneu
+          print("vieneu import OK")
+          PY
+
+      - name: Install other Python packages
+        run: |
+          set -eux
           python -m pip install \
             yt-dlp \
             rapidocr_onnxruntime \
             google-genai \
             pysubs2 \
             webvtt-py \
-            edge-tts \
             av
 
+          # Kiểm tra xung đột thư viện: tất cả phải import được cùng nhau
+          python3 <<'PY'
+          import cv2, av, webvtt, pysubs2, soundfile, numpy
+          from rapidocr_onnxruntime import RapidOCR
+          from google import genai
+          from vieneu import Vieneu
+          print("ALL IMPORTS OK")
+          PY
+
+      - name: Cache VieNeu models (Hugging Face)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: vieneu-models-v2-neucodec
+
+      - name: Verify 2.mp3
+        run: |
+          if [ ! -f "2.mp3" ]; then
+            echo "::error::Không tìm thấy 2.mp3 ở thư mục gốc repository."
+            exit 1
+          fi
+          ls -lh 2.mp3
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -show_entries stream=codec_name,sample_rate,channels \
+            -of default=noprint_wrappers=1 \
+            2.mp3
+
+      - name: Isolate vocals with demucs-onnx
+        run: |
+          set -eux
+          rm -rf voice_profile separated
+          mkdir -p voice_profile separated
+          demucs-onnx separate 2.mp3 separated/ --stem vocals
+          echo "Isolated vocal track:"
+          ls -lh separated/
+          test -f separated/vocals.wav
+
+      - name: Prepare reference audio + transcript
+        run: |
+          set -eux
+          ffmpeg \
+            -y \
+            -i "separated/vocals.wav" \
+            -vn \
+            -ac 1 \
+            -c:a pcm_s16le \
+            "voice_profile/reference.wav"
+
+          ls -lh voice_profile/reference.wav
+          ffprobe \
+            -v error \
+            -show_entries \
+            stream=codec_name,sample_rate,channels,duration \
+            -of default=noprint_wrappers=1 \
+            voice_profile/reference.wav
+
+          printf '%s\n' "mời các bạn xem phim miễn phí tu tiên, đô thị, sinh tồn, xuyên không, hệ thống đầy đủ nhất, thuyết minh giọng đọc hay" > voice_profile/reference.txt
+          echo "Reference transcript:"
+          cat voice_profile/reference.txt
+
+      - name: Encode voice profile (VieNeu)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import datetime
+          from pathlib import Path
+
+          import numpy as np
+
+          from vieneu import Vieneu
+
+          reference_audio = "voice_profile/reference.wav"
+          reference_text = Path("voice_profile/reference.txt").read_text(encoding="utf-8").strip()
+
+          print("Initializing VieNeu (full PyTorch codec for encoding)")
+
+          # Codec mặc định (neucodec-onnx-decoder-int8) chỉ DECODE được, không ENCODE.
+          # encode_reference() cần codec PyTorch đầy đủ "neuphonic/neucodec".
+          tts = Vieneu(codec_repo="neuphonic/neucodec")
+
+          print(f"Encoding reference voice: {reference_audio}")
+          print(f"Text: {reference_text}")
+
+          ref_codes = tts.encode_reference(reference_audio)
+
+          if hasattr(ref_codes, "detach"):
+              ref_codes = ref_codes.detach().cpu().numpy()
+          else:
+              ref_codes = np.asarray(ref_codes)
+
+          if ref_codes.size == 0:
+              raise RuntimeError("VieNeu returned an empty voice profile.")
+
+          if not np.issubdtype(ref_codes.dtype, np.integer):
+              ref_codes = ref_codes.astype(np.int64)
+
+          output_codes = "voice_profile/voice_codes.npy"
+          np.save(output_codes, ref_codes)
+
+          print(f"VOICE PROFILE CREATED | shape={ref_codes.shape} dtype={ref_codes.dtype} -> {output_codes}")
+
+          profile = {
+              "voice_name": "my_voice",
+              "model": {"package": "vieneu", "version": "2.7.0"},
+              "method": "zero-shot voice cloning",
+              "source_audio": "2.mp3",
+              "reference_audio": "voice_profile/reference.wav",
+              "reference_text": reference_text,
+              "voice_codes": "voice_profile/voice_codes.npy",
+              "codes_shape": list(ref_codes.shape),
+              "codes_dtype": str(ref_codes.dtype),
+              "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          }
+          with open("voice_profile/profile.json", "w", encoding="utf-8") as f:
+              json.dump(profile, f, ensure_ascii=False, indent=2)
+          print("profile.json created.")
+          PY
+
+      - name: Test cloned voice (smoke test, stop early if VieNeu fails)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import numpy as np
+          import soundfile as sf
+          from vieneu import Vieneu
+
+          reference_text = Path("voice_profile/reference.txt").read_text(encoding="utf-8").strip()
+          ref_codes = np.load("voice_profile/voice_codes.npy")
+          print(f"Voice codes shape: {ref_codes.shape}")
+
+          tts = Vieneu()
+          text = "Xin chào, đây là bài kiểm tra giọng nói của tôi."
+          audio = tts.infer(
+              text=text,
+              ref_codes=ref_codes,
+              ref_text=reference_text,
+              apply_watermark=True
+          )
+          out = "voice_profile/test_1.wav"
+          tts.save(audio, out)
+
+          data, sr = sf.read(out, dtype="float32")
+          if data.ndim > 1:
+              data = data.mean(axis=1)
+          dur = len(data) / float(sr)
+          peak = float(np.abs(data).max()) if data.size else 0.0
+          print(f"Test OK: sr={sr} dur={dur:.2f}s peak={peak:.3f}")
+          if data.size == 0 or not np.isfinite(data).all() or peak < 0.01 or dur < 0.5:
+              raise SystemExit("VieNeu test audio is empty/invalid -> stop workflow")
+          PY
+
+      # ============================================================
+      # TỪ ĐÂY TRỞ XUỐNG: PHẦN VIETSUB (GIỮ NGUYÊN)
+      # ============================================================
       - name: Prepare directories
         run: |
           set -eux
@@ -912,7 +1105,7 @@ jobs:
 
           MIN_CUE_DURATION = 0.10
 
-          # So tu tieng Viet toi da moi giay de TTS doc kip (edge-tts +25% roi atempo toi da ~1.3x)
+          # So tu tieng Viet toi da moi giay de TTS doc kip (TTS +25% roi atempo toi da ~1.3x)
           MAX_SYL_PER_SEC = 7.0
 
           # ---- GEMINI ----
@@ -1207,117 +1400,26 @@ jobs:
           head -40 work/vietnamese.vtt || true
           wc -l work/vietnamese.vtt || true
 
-      - name: Cache VieNeu-TTS models (Hugging Face)
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/huggingface
-          key: vieneu-models-v1
-
-      - name: Install VieNeu-TTS (voice cloning, CPU / ONNX)
-        run: |
-          set -eux
-          # Bản mặc định (v3 Turbo) chạy ONNX trên CPU, không cần PyTorch
-          python -m pip install vieneu
-          python3 <<'PY'
-          from vieneu import Vieneu
-          print("vieneu import OK")
-          PY
-
-      - name: Prepare voice reference (from 1.mp3 in repo root)
+      - name: TTS Generation (VieNeu-TTS voice profile + Vietnamese VTT)
         env:
-          VOICE_FILE: "1.mp3"     # file giọng mẫu nằm ở thư mục gốc repo (cùng chỗ Oswald.zip)
-          REF_SECONDS: "8"        # độ dài đoạn mẫu cắt ra (khuyến nghị 3-10 giây)
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import os, subprocess, sys, wave
-          import numpy as np
-
-          SRC = os.environ.get("VOICE_FILE", "1.mp3")
-          SECONDS = float(os.environ.get("REF_SECONDS", "8"))
-          SR = 24000
-          FR_SEC = 0.02
-
-          if not os.path.exists(SRC):
-              print(f"::error::Khong tim thay {SRC} o thu muc goc cua repo")
-              sys.exit(1)
-
-          raw = subprocess.run(
-              ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", SRC, "-vn",
-               "-ac", "1", "-ar", str(SR), "-f", "f32le", "pipe:1"],
-              stdout=subprocess.PIPE, check=True).stdout
-          x = np.frombuffer(raw, dtype="<f4").copy()
-          total = len(x) / SR
-          print(f"[REF] {SRC}: {total:.1f}s")
-          if total < 2.0:
-              print("::error::File giong mau qua ngan (<2s)")
-              sys.exit(1)
-
-          # Tim cua so SECONDS giay co nhieu tieng noi nhat (tranh doan lang / nhac / ngat quang)
-          FR = int(FR_SEC * SR)
-          n = len(x) // FR
-          rms = np.sqrt((x[:n * FR].reshape(n, FR) ** 2).mean(axis=1))
-          thr = max(0.008, 0.15 * float(np.percentile(rms, 95)))
-          speech = rms > thr
-          W = int(SECONDS / FR_SEC)
-          if n <= W:
-              start, end = 0, n
-          else:
-              csum = np.concatenate([[0], np.cumsum(speech.astype(np.int32))])
-              scores = csum[W:] - csum[:-W]
-              start = int(np.argmax(scores))
-              end = start + W
-          # cat bot lang dau/cuoi cua doan duoc chon (giu lai 0.1s dem)
-          idx = np.nonzero(speech[start:end])[0]
-          if idx.size:
-              pad = int(0.1 / FR_SEC)
-              start, end = start + max(0, int(idx[0]) - pad), start + min(end - start, int(idx[-1]) + pad + 1)
-          seg = x[start * FR:end * FR]
-          speech_sec = float(speech[start:end].sum()) * FR_SEC
-          print(f"[REF] chon doan {start * FR_SEC:.1f}s -> {end * FR_SEC:.1f}s "
-                f"({len(seg) / SR:.1f}s, tieng noi ~{speech_sec:.1f}s)")
-          if speech_sec < 3.0:
-              print("::warning::Doan mau co it tieng noi (<3s), giong nhan ban co the kem. "
-                    "Nen dung file sach, 1 nguoi noi, khong nhac nen.")
-          peak = float(np.abs(seg).max())
-          if peak > 0:
-              seg = seg * (0.9 / peak)
-
-          os.makedirs("work", exist_ok=True)
-          with wave.open("work/voice_ref.wav", "wb") as wf:
-              wf.setnchannels(1)
-              wf.setsampwidth(2)
-              wf.setframerate(SR)
-              wf.writeframes((np.clip(seg, -1.0, 1.0) * 32767).astype("<i2").tobytes())
-          print("[REF] da ghi work/voice_ref.wav")
-          PY
-          ls -lh work/voice_ref.wav
-
-      - name: TTS Generation (VieNeu-TTS voice clone from 1.mp3 + Vietnamese VTT)
-        env:
-          TTS_SPEEDUP: "1.25"          # tăng tốc giọng (tương đương +25% của edge-tts cũ). Muốn tự nhiên hơn: 1.0-1.1
-          EDGE_FALLBACK: "1"           # 1 = đoạn nào VieNeu lỗi thì dùng edge-tts thay thế; 0 = không dùng
-          VIENEU_MODE: "v3turbo"       # v3turbo (chất lượng cao, 48kHz) | v3nano (nhẹ hơn, 24kHz, dùng khi Turbo quá chậm)
-          VIENEU_PRECISION: "fp32"     # chỉ cho v3turbo: fp32 (ổn định) | int8 (nhanh ~3x, cần CPU có VNNI, có thể méo tiếng)
-          VIENEU_THREADS: "0"          # 0 = tự chọn theo số nhân CPU
+          TTS_SPEEDUP: "1.25"          # tăng tốc giọng. Muốn tự nhiên hơn: 1.0-1.1
+          VIENEU_WATERMARK: "1"        # 1 = apply_watermark=True (như bước test), 0 = tắt
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python3 <<'PY'
-          import os, re, sys, time, asyncio, subprocess, logging
+          import os, re, sys, time, subprocess, logging
           import numpy as np
+          import soundfile as sf
           import webvtt
 
           logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-          REF = "work/voice_ref.wav"
           TTS_SPEEDUP = float(os.environ.get("TTS_SPEEDUP", "1.25"))
-          EDGE_FALLBACK = os.environ.get("EDGE_FALLBACK", "1") == "1"
-          VIENEU_MODE = os.environ.get("VIENEU_MODE", "v3turbo")
-          VIENEU_PRECISION = os.environ.get("VIENEU_PRECISION", "fp32")
-          VIENEU_THREADS = int(os.environ.get("VIENEU_THREADS", "0"))
-          EDGE_RATE = "+25%"
-          EDGE_VOICE = "vi-VN-HoaiMyNeural"
+          WATERMARK = os.environ.get("VIENEU_WATERMARK", "1") == "1"
           MAX_ATTEMPTS = 2
           ERROR_THRESHOLD = 5   # Ngưỡng lỗi để dừng workflow
+          TMP_WAV = "work/_vieneu_tmp.wav"
 
           def normalize_for_tts(text):
               text = text.lower()
@@ -1331,21 +1433,6 @@ jobs:
 
           def n_words(text):
               return len(re.findall(r"\w+", text, re.UNICODE))
-
-          def to_float(audio):
-              if hasattr(audio, "detach"):
-                  audio = audio.detach().cpu().numpy()
-              a = np.asarray(audio)
-              if a.ndim > 1:
-                  a = a.squeeze()
-              if a.ndim > 1:
-                  a = a.mean(axis=0) if a.shape[0] < a.shape[-1] else a.mean(axis=-1)
-              if a.dtype.kind in "iu":
-                  a = a.astype(np.float32) / float(np.iinfo(a.dtype).max)
-              a = a.astype(np.float32).reshape(-1)
-              if a.size and float(np.abs(a).max()) > 1.5:
-                  a = a / 32768.0
-              return a
 
           def plausible(a, sr, text):
               """Loai bo audio rong / vo am / dai bat thuong (mo hinh nhan ban hay 'ao giac' o cau ngan)."""
@@ -1372,24 +1459,39 @@ jobs:
               vtt_path = "work/vietnamese.vtt"
               if not os.path.exists(vtt_path):
                   print(f"Missing {vtt_path}"); sys.exit(1)
-              if not os.path.exists(REF):
-                  print(f"Missing {REF}"); sys.exit(1)
+              for p in ("voice_profile/voice_codes.npy", "voice_profile/reference.txt"):
+                  if not os.path.exists(p):
+                      print(f"Missing {p}"); sys.exit(1)
+
+              ref_codes = np.load("voice_profile/voice_codes.npy")
+              with open("voice_profile/reference.txt", encoding="utf-8") as f:
+                  ref_text = f.read().strip()
 
               vtt = webvtt.read(vtt_path)
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
 
               from vieneu import Vieneu
-              kw = {"threads": VIENEU_THREADS}
-              if VIENEU_MODE == "v3turbo":
-                  kw["precision"] = VIENEU_PRECISION
               t_load = time.time()
-              tts = Vieneu(mode=VIENEU_MODE, **kw)   # CPU/ONNX, tự tải model lần đầu
-              sr = int(getattr(tts, "sample_rate", 48000))
-              print(f"[VieNeu] mode={VIENEU_MODE} sr={sr} loaded in {time.time() - t_load:.0f}s | "
-                    f"ref={REF} | speedup={TTS_SPEEDUP} | cues={total}", flush=True)
+              tts = Vieneu()   # CPU, tự tải model lần đầu
+              print(f"[VieNeu] loaded in {time.time() - t_load:.0f}s | ref_codes={ref_codes.shape} | "
+                    f"speedup={TTS_SPEEDUP} | watermark={WATERMARK} | cues={total}", flush=True)
 
-              failed = []   # (index, text) can fallback
+              def synth(text):
+                  audio = tts.infer(
+                      text=text,
+                      ref_codes=ref_codes,
+                      ref_text=ref_text,
+                      apply_watermark=WATERMARK
+                  )
+                  # Luu ra wav tam roi doc lai de lay dung sample rate that cua model
+                  tts.save(audio, TMP_WAV)
+                  data, sr = sf.read(TMP_WAV, dtype="float32")
+                  if data.ndim > 1:
+                      data = data.mean(axis=1)
+                  return data.astype(np.float32).reshape(-1), int(sr)
+
+              failed = []   # (index, text)
               t0 = time.time()
               made = 0
               for i, c in enumerate(vtt):
@@ -1401,8 +1503,7 @@ jobs:
                   ok = False
                   for attempt in range(MAX_ATTEMPTS):
                       try:
-                          audio = tts.infer(text, ref_audio=REF)
-                          a = to_float(audio)
+                          a, sr = synth(text)
                           if plausible(a, sr, text):
                               to_mp3(a, sr, out)
                               ok = True
@@ -1421,48 +1522,16 @@ jobs:
                       el = time.time() - t0
                       print(f"TTS {i + 1}/{total} | ok={made} | loi={len(failed)} | {el:.0f}s", flush=True)
 
-              # ---------- Dự phòng edge-tts cho các đoạn VieNeu lỗi ----------
-              still_failed = []
-              if failed and EDGE_FALLBACK:
-                  import edge_tts
-                  print(f"[FALLBACK] {len(failed)} doan -> edge-tts ({EDGE_VOICE})", flush=True)
-                  sem = asyncio.Semaphore(4)
-
-                  async def one(idx, text):
-                      out = f"chunks/c_{idx}.mp3"
-                      async with sem:
-                          last = None
-                          for attempt in range(3):
-                              try:
-                                  com = edge_tts.Communicate(text, voice=EDGE_VOICE, rate=EDGE_RATE)
-                                  await com.save(out)
-                                  if os.path.exists(out) and os.path.getsize(out) > 0:
-                                      return True
-                                  raise RuntimeError("Empty audio file")
-                              except Exception as e:
-                                  last = e
-                                  if os.path.exists(out):
-                                      os.remove(out)
-                                  await asyncio.sleep(1.5 * (attempt + 1))
-                          print(f"Lỗi đoạn {idx} (fallback): {last}", flush=True)
-                          return False
-
-                  async def run_all():
-                      return await asyncio.gather(*[one(i, t) for i, t in failed])
-
-                  results = asyncio.run(run_all())
-                  still_failed = [failed[k] for k, r in enumerate(results) if not r]
-              else:
-                  still_failed = failed
-
-              failed_count = len(still_failed)
+              failed_count = len(failed)
               print(f"Tổng số đoạn lỗi: {failed_count}")
+              for i, t in failed:
+                  print(f"  - doan {i}: {t!r}")
               if failed_count > ERROR_THRESHOLD:
                   print(f"Phát hiện {failed_count} đoạn lỗi (vượt ngưỡng {ERROR_THRESHOLD}). Dừng Workflow!")
                   sys.exit(1)
 
               with open("count.txt", "w") as f: f.write(str(total))
-              print(f"[DONE] Generated {total} TTS chunks (VieNeu ok={made}, edge-fallback={len(failed) - failed_count})")
+              print(f"[DONE] Generated {total} TTS chunks (VieNeu ok={made}, loi={failed_count})")
 
           main()
           PY
