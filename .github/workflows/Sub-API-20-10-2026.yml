@@ -1000,7 +1000,7 @@ jobs:
           MIN_CUE_DURATION = 0.10
 
           # Batch chi sot 1..N dong thi BO QUA (de trong), khong goi API retry
-          MAX_SKIP_MISSING = 3
+          MAX_SKIP_MISSING = 5
 
           # So tu tieng Viet toi da moi giay de TTS doc kip.
           # TTS sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
@@ -1030,7 +1030,10 @@ jobs:
               "SHORTER and more NEUTRAL — using no pronoun, an implied subject, or a generic/neutral phrasing — "
               "so the sentence still sounds natural in Vietnamese without committing to an incorrect relationship.\n"
               "8. The source subtitles come from automatic speech recognition and may contain small recognition "
-              "errors or homophone mistakes. Use the surrounding context to infer the intended meaning."
+              "errors or homophone mistakes. Use the surrounding context to infer the intended meaning.\n"
+              "9. CONCISENESS (VERY IMPORTANT): Make every Vietnamese line SHORT, concise and easy to understand at a "
+              "glance. Use simple, everyday spoken Vietnamese. Cut filler words, repeated phrases and unnecessary "
+              "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain."
           )
 
 
@@ -1151,34 +1154,32 @@ jobs:
 
 
           def parse_batch(response_text, n):
-              """Parse ket qua 1 batch n dong, sua cac so thu tu AI ghi nham (vd [120] -> [20])."""
+              """Ghep theo SO THU TU AI ghi. Dong sot -> de trong, KHONG bao gio day lech cac dong sau."""
               pairs = parse_pairs(response_text)
               out = {}
 
-              # Du so dong -> tin vi tri, bo qua so thu tu AI ghi
-              if len(pairs) == n:
-                  bad = [(k, i) for k, (i, _) in enumerate(pairs) if i != k]
-                  if bad:
-                      log(f">> SUA SO THU TU: {len(bad)} dong AI ghi sai so, ghep theo vi tri: "
-                          + ", ".join(f"[{k}]<-[{i}]" for k, i in bad[:10]))
+              # Truong hop AI danh so sai hang loat (vd deu +100) nhung du so dong -> ghep theo vi tri
+              in_range = sum(1 for i, _ in pairs if 0 <= i < n)
+              if len(pairs) == n and in_range < n * 0.5:
+                  log(">> SUA SO THU TU: AI ghi sai so hang loat, ghep theo vi tri")
                   for k, (_, val) in enumerate(pairs):
                       out[k] = "" if val == "..." else val
                   return out
 
-              # Thieu/thua dong -> sua tung so lech dua tren so truoc do
               prev = -1
-              for i, val in pairs:
-                  expected = prev + 1
-                  if i == expected and i < n and i not in out:
-                      idx = i
-                  elif i > expected and i < n and i not in out:
-                      idx = i                      # AI nhay coc that (sot dong)
-                  elif expected < n and expected not in out:
-                      log(f">> SUA SO THU TU: AI ghi [{i}], dat vao [{expected}]")
-                      idx = expected               # so bi ghi nham -> dat vao cho ke tiep
+              for k, (i, val) in enumerate(pairs):
+                  nxt_i = pairs[k + 1][0] if k + 1 < len(pairs) else None
+                  if prev < i < n:
+                      idx = i                                   # so hop le -> TIN so AI ghi
                   else:
-                      log(f">> BO QUA dong thua/trung so [{i}]: {val[:40]!r}")
-                      continue
+                      expected = prev + 1
+                      # chi sua so ghi nham khi dong KE TIEP xac nhan dung 1 khe nay
+                      if expected < n and expected not in out and (nxt_i is None or nxt_i == expected + 1):
+                          log(f">> SUA SO THU TU: AI ghi [{i}], dat vao [{expected}]")
+                          idx = expected
+                      else:
+                          log(f">> BO QUA dong thua/trung/sai so [{i}]: {val[:40]!r}")
+                          continue
                   out[idx] = "" if val == "..." else val
                   prev = idx
               return out
@@ -1776,8 +1777,8 @@ jobs:
 
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
-          font_size = max(20, int(sub_h * .90))
-          font_size = min(font_size, max(20, int(width * .75 / max(1, max_chars * .60))))
+          font_size = max(25, int(sub_h * .90))
+          font_size = min(font_size, max(25, int(width * .75 / max(1, max_chars * .60))))
           ass = [
               "[Script Info]", "Title: Vietnamese hard subtitles",
               "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
