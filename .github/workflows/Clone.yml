@@ -68,12 +68,12 @@ jobs:
       # ============================================================
       # 5. Verify source audio
       # ============================================================
-      - name: Verify 1.mp3
+      - name: Verify 2.mp3
         run: |
-          if [ ! -f "1.mp3" ]; then
-            echo "::error::Không tìm thấy 1.mp3 ở thư mục gốc repository."
+          if [ ! -f "2.mp3" ]; then
+            echo "::error::Không tìm thấy 2.mp3 ở thư mục gốc repository."
             echo "Hãy kiểm tra file phải nằm tại:"
-            echo "1.mp3"
+            echo "2.mp3"
             exit 1
           fi
 
@@ -81,7 +81,7 @@ jobs:
           echo "SOURCE AUDIO"
           echo "======================================"
 
-          ls -lh 1.mp3
+          ls -lh 2.mp3
 
           echo ""
           echo "FFmpeg audio information:"
@@ -90,7 +90,7 @@ jobs:
             -show_entries format=duration \
             -show_entries stream=codec_name,sample_rate,channels \
             -of default=noprint_wrappers=1 \
-            1.mp3
+            2.mp3
 
       # ============================================================
       # 6. Create voice_profile directory
@@ -102,7 +102,7 @@ jobs:
       - name: Isolate vocals with demucs-onnx
         run: |
           mkdir -p separated
-          demucs-onnx separate 1.mp3 separated/ --stem vocals
+          demucs-onnx separate 2.mp3 separated/ --stem vocals
 
           echo "Isolated vocal track:"
           ls -lh separated/
@@ -138,7 +138,7 @@ jobs:
       # ============================================================
       - name: Save reference transcript
         run: |
-          printf '%s\n' "cũng có những lời nói dối chỉ để người mình yêu thương được yên lòng" > voice_profile/reference.txt
+          printf '%s\n' "mời các bạn xem phim miễn phí tu tiên, đô thị, sinh tồn, xuyên không, hệ thống đầy đủ nhất, thuyết minh giọng đọc hay" > voice_profile/reference.txt
 
           echo "Reference transcript:"
           cat voice_profile/reference.txt
@@ -244,7 +244,7 @@ jobs:
 
               "method": "zero-shot voice cloning",
 
-              "source_audio": "1.mp3",
+              "source_audio": "2.mp3",
 
               "reference_audio": (
                   "voice_profile/reference.wav"
