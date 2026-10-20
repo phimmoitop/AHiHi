@@ -38,11 +38,8 @@ jobs:
       LC_ALL: "C.UTF-8"
       LANG: "C.UTF-8"
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
-      X264_PRESET: "medium"
+      X264_PRESET: "fast"
       X264_CRF: "24"
-      # Giới hạn bitrate video (CRF có trần): đỉnh ~3.5 Mbps
-      X264_MAXRATE: "3500k"
-      X264_BUFSIZE: "7000k"
 
     steps:
       - name: Checkout repository
@@ -55,7 +52,6 @@ jobs:
           VIDEO_URL: ${{ inputs.url }}
         run: |
           [[ "$VIDEO_URL" =~ ^https?://([[:alnum:]-]+\.)?bilibili\.com/video/BV[0-9A-Za-z]+ ]] || { echo '::error::url must be a Bilibili video URL'; exit 1; }
-
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -66,13 +62,11 @@ jobs:
           set -eux
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 fonts-noto-core fontconfig unzip
-
           # Cài font Oswald từ file zip có sẵn trong repo (bỏ variable font, chỉ dùng static)
           sudo mkdir -p /usr/local/share/fonts/oswald
           sudo unzip -o -j Oswald.zip '*.ttf' -x '*VariableFont*' -d /usr/local/share/fonts/oswald
           sudo fc-cache -f
           fc-list | grep -i oswald || { echo '::error::Không cài được font Oswald'; exit 1; }
-
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -80,7 +74,6 @@ jobs:
           key: pip-${{ runner.os }}-${{ hashFiles('.github/workflows/*.yml') }}
           restore-keys: |
             pip-${{ runner.os }}-
-
       - name: Install Python packages
         run: |
           set -eux
@@ -94,7 +87,6 @@ jobs:
             av \
             numpy \
             requests
-
           # Kiểm tra xung đột thư viện: tất cả phải import được cùng nhau
           python3 <<'PY'
           import cv2, av, webvtt, pysubs2, numpy, requests
@@ -102,7 +94,6 @@ jobs:
           from google import genai
           print("ALL IMPORTS OK")
           PY
-
       # ============================================================
       # REVID TTS API: TEST TRƯỚC TẤT CẢ
       # Lỗi ở đây thì dừng ngay, chưa tải video / OCR / dịch gì cả.
@@ -121,12 +112,10 @@ jobs:
           from urllib.parse import urlparse
           import numpy as np
           import requests
-
           API_URL = "https://tts.revidapi.com/api/v1/tts"
           key = os.environ.get("REVID_API_KEY", "").strip()
           if not key:
               raise SystemExit("Missing GitHub secret REVID_API_KEY")
-
           payload = {
               "text": "Xin chào, đây là bài kiểm tra giọng nói của tôi.",
               "voice_id": int(os.environ["REVID_VOICE_ID"]),
@@ -148,7 +137,6 @@ jobs:
               raise SystemExit(f"Revid API trả về không phải JSON: {r.text[:300]}")
           if r.status_code != 200 or not data.get("success"):
               raise SystemExit(f"Revid API lỗi: {data.get('error')} | {str(data)[:300]}")
-
           audio = None
           b64 = data.get("audio_base64")
           if b64:
@@ -164,7 +152,6 @@ jobs:
               audio = rr.content
           if not audio:
               raise SystemExit("API không trả về dữ liệu MP3")
-
           open("work/test_1.mp3", "wb").write(audio)
           p = subprocess.run(
               ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "work/test_1.mp3",
@@ -177,7 +164,6 @@ jobs:
           if a.size == 0 or not np.isfinite(a).all() or peak < 0.01 or dur < 0.5:
               raise SystemExit("Revid test audio is empty/invalid -> stop workflow")
           PY
-
       # ============================================================
       # TỪ ĐÂY TRỞ XUỐNG: PHẦN VIETSUB
       # ============================================================
@@ -185,7 +171,6 @@ jobs:
         run: |
           set -eux
           mkdir -p work output chunks
-
       - name: Prepare Bilibili cookies (inline Python)
         env:
           BILIBILI_COOKIES: ${{ secrets.BILIBILI_COOKIES }}
@@ -219,7 +204,6 @@ jobs:
           os.chmod(out, 0o600)
           print("Cookie file prepared (values hidden).")
           PY
-
       - name: Download Bilibili video
         env:
           VIDEO_URL: ${{ inputs.url }}
@@ -239,33 +223,28 @@ jobs:
             --merge-output-format mp4 \
             -o "raw_video.mp4" \
             "$BILIBILI_URL"
-
           if [ ! -f raw_video.mp4 ]; then
             echo "::error::raw_video.mp4 khong ton tai."
             find . -maxdepth 2 -type f -ls
             exit 1
           fi
           ls -lh raw_video.mp4
-
       - name: Create OCR script
         run: |
           cat > ocr_run.py <<'PY'
           """
           OCR sub cung (hardsub) 2 giai doan:
-            1) Lay mau thua (~150 frame) tren vung rong -> tim cac dai (band) chua sub.
+            1) Lay mau thua (~300 frame) tren vung rong -> tim dai (band) chua sub.
                TRUOC khi chon dai, loai bo chu TINH (watermark/logo xuat hien suot video).
-               Neu sub doi cho (cao/thap hon o doan khac) -> mo rong dai OCR phu ca 2 vi tri.
             2) OCR toan video 3fps CHI tren dai mong do, doc rawvideo tu ffmpeg (khong JPEG),
                bo qua frame khi chu khong doi, chay song song nhieu process.
-          Sau do gom cue, chia video thanh cac ZONE (khoang thoi gian co cung vi tri sub)
-          va do hinh hoc blur cho tung zone.
+          Sau do gom cue + do hinh hoc blur nhu ban cu.
           """
           import cv2, json, math, os, re, subprocess, sys, time
           import multiprocessing as mp
           import numpy as np
           from pathlib import Path
           from difflib import SequenceMatcher
-
           VIDEO = "raw_video.mp4"
           OUT = Path("work/ocr")
           FPS = 3.0
@@ -273,12 +252,8 @@ jobs:
           SPARSE_SAMPLES = 150
           MAX_REUSE = 2        # so frame lien tiep toi da dung lai ket qua OCR khi chu khong doi
           SAME_IOU = 0.85      # nguong giong nhau cua mat na chu sang
-
-
           def log(msg):
               print(msg, flush=True)
-
-
           def make_engine():
               from rapidocr_onnxruntime import RapidOCR
               try:
@@ -286,14 +261,10 @@ jobs:
                   return RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
               except Exception:
                   return RapidOCR()
-
-
           def has_text_edges(gray):
               h, w = gray.shape
               need = max(30, int(h * w * 0.0001))
               return cv2.countNonZero(cv2.Canny(gray, 80, 180)) >= need
-
-
           def run_ocr(engine, crop, x_off, y_off, frame_no):
               dets = []
               result, _ = engine(crop)
@@ -313,8 +284,6 @@ jobs:
                       "cy": (min(ys) + max(ys)) / 2.0
                   })
               return dets
-
-
           def drop_static(dets):
               """Loai watermark/logo: chu co cung vi tri+kich thuoc, xuat hien suot video.
               Sub that thi doi chu lien tuc nen khong bi loai."""
@@ -359,11 +328,8 @@ jobs:
               log(f"[STATIC] loai {len(dets) - len(keep)}/{len(dets)} detection (watermark): "
                   f"{sorted(static_txt)[:5]}")
               return keep
-
-
-          def pick_bands(dets, height, min_extra_frames=5, max_overlap=0.25):
-              """Tra ve (danh sach dai, tolerance). dai[0] = dai chinh; cac dai sau = sub doi cho,
-              xuat hien o thoi diem KHAC dai chinh (it trung frame)."""
+          def pick_band(dets, height):
+              """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance."""
               tolerance = max(18.0, height * .065)
               bands = []
               for d in sorted(dets, key=lambda v: v["cy"]):
@@ -377,25 +343,11 @@ jobs:
               bands = [b for b in bands if len({d["frame"] for d in b}) >= 3]
               if not bands:
                   return [], tolerance
-              key = lambda b: (len({d["frame"] for d in b}),
-                               sum(d["score"] for d in b),
-                               sum(len(d["text"]) for d in b))
-              bands.sort(key=key, reverse=True)
-              chosen = [bands[0]]
-              used = {d["frame"] for d in bands[0]}
-              for b in bands[1:]:
-                  fr = {d["frame"] for d in b}
-                  if len(fr) >= min_extra_frames and len(fr & used) / len(fr) <= max_overlap:
-                      chosen.append(b)
-                      used |= fr
-              return chosen, tolerance
-
-
-          def pick_band(dets, height):
-              bands, tol = pick_bands(dets, height)
-              return (bands[0] if bands else []), tol
-
-
+              band = max(bands, key=lambda b: (
+                  len({d["frame"] for d in b}),
+                  sum(d["score"] for d in b),
+                  sum(len(d["text"]) for d in b)))
+              return band, tolerance
           def grab_frame(t, width, height):
               """Lay 1 frame tai thoi diem t bang ffmpeg CLI (seek on dinh, khong dung cv2 seek)."""
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
@@ -405,15 +357,11 @@ jobs:
               if len(out) < width * height * 3:
                   return None
               return np.frombuffer(out, np.uint8)[:width * height * 3].reshape(height, width, 3).copy()
-
-
           # ------------------------------------------------------------
           # GIAI DOAN 1: mau thua -> dai mong
           # ------------------------------------------------------------
           def norm_text(t):
               return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", t)
-
-
           def rec_only(engine, img):
               """Chi chay nhan dang (bo phat hien chu): nhanh hon rat nhieu, dung cho 1 dong sub."""
               try:
@@ -423,24 +371,8 @@ jobs:
               if not r:
                   return "", 0.0
               return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
-
-
-          def cluster_positions(cys, tol, min_n):
-              """Gom cy cac mau thua thanh vai vi tri (chuoi lien tiep cach nhau <= tol thi chung 1 vi tri).
-              Tra ve danh sach tam, bo nhom qua it mau (nhieu OCR)."""
-              groups = []
-              for c in sorted(cys):
-                  if groups and c - groups[-1][-1] <= tol:
-                      groups[-1].append(c)
-                  else:
-                      groups.append([c])
-              keep = [g for g in groups if len(g) >= min_n]
-              return [float(np.median(g)) for g in keep] or [float(np.median(cys))]
-
-
           def find_strip(duration, width, height, x0, x1, y0):
-              """Tra ve (sy0, sy1, found, info). Vi tri sub (cao/thap theo thoi gian) chi do tu MAU THUA
-              (khong ton them frame OCR nao). Do chinh xac ~ duration/150 giay, doi lai khong cham them."""
+              """Tra ve (sy0, sy1, found, info). info co cy, th, fast_ok (co dung duoc che do nhanh khong)."""
               engine = make_engine()
               n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
@@ -459,31 +391,17 @@ jobs:
                   if found_dets and len(kept) < 80:
                       kept[i] = crop.copy()
               dets = drop_static(dets)
-              bands, tolerance = pick_bands(dets, height)
-              if not bands:
+              band, tolerance = pick_band(dets, height)
+              if not band:
                   return y0, height, False, None
-              band = bands[0]
-              all_dets = [d for b in bands for d in b]
               cy = float(np.median([d["cy"] for d in band]))
-              th = float(np.percentile([d["y2"] - d["y1"] for d in all_dets], 90))
-              cys = np.array([d["cy"] for d in all_dets])
+              th = float(np.percentile([d["y2"] - d["y1"] for d in band], 90))
               half = int(max(th * 1.6, tolerance * 1.1))
-              sy0 = max(y0, int(np.percentile(cys, 2) - half))
-              sy1 = min(height, int(np.percentile(cys, 98) + half))
+              sy0 = max(y0, int(cy - half))
+              sy1 = min(height, int(cy + half))
               if sy1 - sy0 < 16:
                   return y0, height, False, None
-
-              # ---- vi tri sub theo tung mau thua (thoi diem t, cy trung vi cua frame do) ----
-              by_f = {}
-              for d in all_dets:
-                  by_f.setdefault(d["frame"], []).append(d["cy"])
-              samples = sorted((duration * (i + 0.5) / n, float(np.median(v))) for i, v in by_f.items())
-              tol = max(12.0, th * 0.45)
-              centers = cluster_positions([c for _, c in samples], tol, max(3, int(0.05 * len(samples))))
-              log(f"[POS-CHECK] {len(samples)} mau co sub -> {len(centers)} vi tri: "
-                  + ", ".join(f"{c:.0f}" for c in centers))
-
-              # ---- tu kiem tra che do FAST tren dai chinh ----
+              # ---- tu kiem tra: nhan dang-rieng tren dong sub co khop ket qua det+rec khong? ----
               ty0 = max(y0, int(cy - th * 0.9))
               ty1 = min(height, int(cy + th * 0.9))
               by_frame = {}
@@ -505,13 +423,8 @@ jobs:
               fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85
               log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh "
                   f"{(float(np.mean(sims)) if sims else 0):.2f} -> {'DUNG che do nhanh' if fast_ok else 'KHONG dung (dung det+rec)'}")
-              fy0 = max(y0, int(min(centers) - th * 0.9))
-              fy1 = min(height, int(max(centers) + th * 0.9))
-              info = {"cy": cy, "th": th, "ty0": fy0, "ty1": fy1, "cys": centers,
-                      "samples": samples, "fast_ok": fast_ok}
+              info = {"cy": cy, "th": th, "ty0": ty0, "ty1": ty1, "fast_ok": fast_ok}
               return sy0, sy1, True, info
-
-
           # ------------------------------------------------------------
           # GIAI DOAN 2: OCR toan video tren dai mong (song song)
           # ------------------------------------------------------------
@@ -563,12 +476,9 @@ jobs:
               proc.wait()
               log(f"[worker@{start_frame}] done frames={k} ocr_calls={ocr_calls} in {time.time() - t_w:.0f}s")
               return dets
-
-
           def worker_fast(task):
-              """Che do nhanh: chi nhan dang (rec) tren 1 dong sub, khong phat hien chu.
-              Co the co nhieu vi tri sub: thu vi tri dung gan nhat truoc, chi thu vi tri khac khi ket qua yeu."""
-              start_frame, n_frames, x0, y0, x1, y1, cys, th = task
+              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
+              start_frame, n_frames, x0, y0, x1, y1, cy, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
@@ -579,7 +489,6 @@ jobs:
                      "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
-              order = list(cys)
               dets, k, calls = [], 0, 0
               t_w = time.time()
               while True:
@@ -595,64 +504,19 @@ jobs:
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
-                  best = None
-                  for c in order:
-                      a = max(0, int(c - th * 0.9) - y0)
-                      b = min(h, int(c + th * 0.9) - y0)
-                      if b - a < 8:
-                          continue
-                      line = frame[a:b]
-                      if not has_text_edges(cv2.cvtColor(line, cv2.COLOR_BGR2GRAY)):
-                          continue
-                      text, score = rec_only(engine, line)
-                      calls += 1
-                      cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
-                      if cjk >= 2 and score >= .50:
-                          best = (text, score, c)
-                          break
-                  if best is None:
+                  text, score = rec_only(engine, frame)
+                  calls += 1
+                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+                  if cjk < 2 or score < .50:
                       continue
-                  text, score, c = best
-                  if c != order[0]:
-                      order.remove(c)
-                      order.insert(0, c)
                   # Khong co box that: dung cy/chieu cao do tu buoc lay mau thua
                   dets.append({"frame": fn, "time": fn * STEP, "text": text, "score": score,
                                "x1": float(x0), "x2": float(x1),
-                               "y1": c - th / 2.0, "y2": c + th / 2.0, "cy": c})
+                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy})
               proc.stdout.close()
               proc.wait()
               log(f"[fast@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
               return dets
-
-
-          def build_zones(samples, centers, duration, blur_h, height):
-              """Chia video thanh cac khoang thoi gian lien tiep, moi khoang 1 vi tri sub, chi dua tren
-              cac mau thua (t, cy). Ranh gioi nam giua 2 mau khac vi tri (sai so ~ duration/150 giay).
-              Tra ve [{t0, t1, center_y, blur_y}]."""
-              if not samples or not centers:
-                  return []
-              a = [min(range(len(centers)), key=lambda k: abs(centers[k] - c)) for _, c in samples]
-              for i in range(1, len(a) - 1):          # mau le loi 1 diem -> gop vao hai ben
-                  if a[i - 1] == a[i + 1] != a[i]:
-                      a[i] = a[i - 1]
-              runs = []                                # [zone, first_t, last_t]
-              for (t, _), z in zip(samples, a):
-                  if runs and runs[-1][0] == z:
-                      runs[-1][2] = t
-                  else:
-                      runs.append([z, t, t])
-              zones = []
-              for i, (z, f, l) in enumerate(runs):
-                  t0 = 0.0 if i == 0 else (runs[i - 1][2] + f) / 2.0
-                  t1 = duration + 1.0 if i == len(runs) - 1 else (l + runs[i + 1][1]) / 2.0
-                  c = centers[z]
-                  by = int(min(max(0, c - blur_h // 2), height - blur_h)) // 2 * 2
-                  zones.append({"t0": round(t0, 3), "t1": round(t1, 3),
-                                "center_y": int(round(c)), "blur_y": by})
-              return zones
-
-
           def main():
               OUT.mkdir(parents=True, exist_ok=True)
               t_start = time.time()
@@ -667,11 +531,9 @@ jobs:
                   raise SystemExit("Cannot read source video dimensions")
               fps = FPS
               step = STEP
-
               # Vung tim kiem: giua 65% ngang, 35% duoi (tranh chu AI o goc phai duoi)
               x0, x1 = round(width * .175), round(width * .825)
               y0 = round(height * .65)
-
               sy0, sy1, found, info = find_strip(duration, width, height, x0, x1, y0)
               fast = bool(found and info and info["fast_ok"] and os.environ.get("OCR_FAST", "1") == "1")
               if found:
@@ -679,7 +541,6 @@ jobs:
               else:
                   log("[STRIP] Khong tim thay dai sub tu mau thua -> OCR toan vung nhu cu")
               log(f"[STRIP] mau thua xong sau {time.time() - t_start:.0f}s")
-
               total_frames = int(duration * FPS)
               nw = max(1, min(4, os.cpu_count() or 2))
               per = math.ceil(total_frames / nw)
@@ -689,7 +550,7 @@ jobs:
                   n = min(per, total_frames - s)
                   if n > 0:
                       if fast:
-                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cys"], info["th"]))
+                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cy"], info["th"]))
                       else:
                           tasks.append((s, n, x0, sy0, x1, sy1))
               log(f"[OCR] mode={'FAST rec-only' if fast else 'det+rec'} | {total_frames} frame, "
@@ -700,19 +561,15 @@ jobs:
               detections = [d for p in parts for d in p]
               detections.sort(key=lambda d: (d["frame"], d["x1"]))
               log(f"[OCR] xong sau {time.time() - t_start:.0f}s, detections={len(detections)}")
-
               with (OUT / "ocr-raw-3fps.tsv").open("w", encoding="utf-8") as f:
                   f.write("time\tconfidence\ttext\tx1\ty1\tx2\ty2\n")
                   for d in detections:
                       f.write(f"{d['time']:.3f}\t{d['score']:.3f}\t{d['text']}\t"
                               f"{d['x1']:.1f}\t{d['y1']:.1f}\t{d['x2']:.1f}\t{d['y2']:.1f}\n")
-
               # Che do fast: moi detection dung chung 1 box co dinh nen khong loc tinh theo vi tri
               if not fast:
                   detections = drop_static(detections)
-              bands, _ = pick_bands(detections, height)
-              band = [d for b in bands for d in b]
-
+              band, _ = pick_band(detections, height)
               frame_dets = {}
               for d in band:
                   frame_dets.setdefault(d["frame"], []).append(d)
@@ -729,38 +586,30 @@ jobs:
                       "y2": max(d["y2"] for d in items),
                       "cy": (min(d["y1"] for d in items) + max(d["y2"] for d in items)) / 2.0
                   })
-
               def comparable(a, b):
                   a = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", a)
                   b = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", b)
                   return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
-
-              cy_by_fn = {u["frame"]: u["cy"] for u in frame_unions}
               segments = []
               for t, text, score, fn in frame_lines:
-                  cy_f = cy_by_fn.get(fn, 0.0)
                   if segments and t - segments[-1]["last"] <= step * 1.51 and comparable(segments[-1]["text"], text):
                       seg = segments[-1]
                       seg["last"] = t
                       seg["frames"] += 1
                       seg["scores"].append(score)
-                      seg["cys"].append(cy_f)
                       seg["variants"][text] = seg["variants"].get(text, 0) + 1
                       seg["text"] = max(seg["variants"], key=seg["variants"].get)
                   else:
                       segments.append({"text": text, "first": t, "last": t, "frames": 1,
-                                       "scores": [score], "cys": [cy_f], "variants": {text: 1}})
-
+                                       "scores": [score], "variants": {text: 1}})
               segments = [x for x in segments if x["frames"] >= 2 or
                           (sum("\u4e00" <= ch <= "\u9fff" for ch in x["text"]) >= 2 and max(x["scores"]) >= .55)]
-
               def stamp(seconds):
                   ms = max(0, round(seconds * 1000))
                   hh, ms = divmod(ms, 3600000)
                   mm, ms = divmod(ms, 60000)
                   ss, ms = divmod(ms, 1000)
                   return f"{hh:02}:{mm:02}:{ss:02},{ms:03}"
-
               srt = OUT / "hardsub-3fps.srt"
               with srt.open("w", encoding="utf-8") as f:
                   for i, seg in enumerate(segments, 1):
@@ -768,7 +617,6 @@ jobs:
                       end = min(duration, seg["last"] + step / 2)
                       if end > start:
                           f.write(f"{i}\n{stamp(start)} --> {stamp(end)}\n{seg['text']}\n\n")
-
               review_rows = []
               for seg in segments:
                   mean = sum(seg["scores"]) / len(seg["scores"])
@@ -784,7 +632,6 @@ jobs:
                   for seg, mean, reason in review_rows:
                       f.write(f"{seg['first']:.3f}\t{seg['last']:.3f}\t{mean:.3f}\t"
                               f"{seg['frames']}\t{seg['text']}\t{reason}\n")
-
               valid_geometry = False
               geometry = {
                   "video_width": width, "video_height": height, "duration_seconds": duration,
@@ -819,16 +666,8 @@ jobs:
                                "width_ratio": .80, "center_y": center_y},
                       "blur_validated": bool(valid_geometry), "valid": bool(valid_geometry)
                   })
-                  # Cac ZONE: moi khoang thoi gian co 1 vi tri sub rieng (sub doi cho giua video)
-                  geometry["zones"] = (build_zones(info["samples"], info["cys"], duration, blur_h, height)
-                                       if (found and info) else [])
-                  for z in geometry["zones"]:
-                      log(f"[ZONE] {z['t0']:.1f}s -> {z['t1']:.1f}s | sub cy={z['center_y']} blur_y={z['blur_y']}")
-                  log(f"[ZONE] tong {len(geometry['zones'])} vi tri sub")
-
               Path("work/subtitle_geometry.json").write_text(
                   json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
               # Anh kiem tra hinh hoc: box OCR (xanh) + vung blur do (do)
               if valid_geometry and frame_unions:
                   representative = frame_unions[len(frame_unions) // 2]
@@ -842,7 +681,6 @@ jobs:
                                     (blur["x"] + blur["width"], blur["y"] + blur["height"]),
                                     (0, 0, 255), 3)
                       cv2.imwrite("work/subtitle-geometry-preview.jpg", image)
-
               needs_review = bool(review_rows) or not valid_geometry or not segments
               gh = os.environ.get("GITHUB_OUTPUT")
               if gh:
@@ -854,12 +692,9 @@ jobs:
               print(json.dumps(geometry, ensure_ascii=False))
               if not segments:
                   print("OCR produced no stable subtitle cues.")
-
-
           if __name__ == "__main__":
               main()
           PY
-
       - name: OCR subtitles and detect per-video subtitle geometry
         id: ocr
         env:
@@ -870,7 +705,6 @@ jobs:
           mkdir -p work/ocr
           python3 ocr_run.py
           cp work/ocr/hardsub-3fps.srt work/native.srt
-
       - name: Create static overlay detection script
         run: |
           cat > static_detect.py <<'PY'
@@ -884,7 +718,6 @@ jobs:
           import cv2, json, math, os, random, subprocess
           import numpy as np
           from pathlib import Path
-
           VIDEO = "raw_video.mp4"
           WORK = Path("work")
           W_SMALL = 640            # chieu rong anh de phan tich (nhanh)
@@ -894,12 +727,8 @@ jobs:
           ZONE_BOTTOM = 0.78       # dai duoi bat dau tu day
           ZONE_SIDE = 0.175        # dai 2 ben (ty le chieu rong)
           MAX_REGIONS = 8
-
-
           def log(msg):
               print(msg, flush=True)
-
-
           def grab_frame(t, width, height):
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}",
                      "-i", VIDEO, "-frames:v", "1", "-an",
@@ -908,8 +737,6 @@ jobs:
               if len(out) < width * height * 3:
                   return None
               return np.frombuffer(out, np.uint8)[:width * height * 3].reshape(height, width, 3).copy()
-
-
           def merge_boxes(boxes, gap):
               boxes = [list(b) for b in boxes]
               changed = True
@@ -929,8 +756,6 @@ jobs:
                           out.append(a)
                   boxes = out
               return boxes
-
-
           def detect():
               if os.environ.get("STATIC_DETECT", "1") != "1":
                   log("[STATIC-OVERLAY] tat (STATIC_DETECT != 1)")
@@ -944,7 +769,6 @@ jobs:
               cap.release()
               if width <= 0 or height <= 0 or duration < 3:
                   return []
-
               n = max(5, min(10, int(duration // 15)))
               rng = random.Random()
               times = []
@@ -953,7 +777,6 @@ jobs:
                   hi = duration * (0.03 + 0.94 * (i + 1) / n)
                   times.append(rng.uniform(lo, hi))
               log(f"[STATIC-OVERLAY] lay {n} frame ngau nhien: " + ", ".join(f"{t:.1f}s" for t in times))
-
               scale = W_SMALL / float(width)
               sh = max(2, int(round(height * scale)))
               grays, edges, first_img = [], [], None
@@ -972,7 +795,6 @@ jobs:
               if m < 4:
                   log("[STATIC-OVERLAY] khong du frame de phan tich")
                   return []
-
               stack = np.stack(grays)
               std = stack.std(axis=0)
               if float(std.mean()) < 2.0:
@@ -980,7 +802,6 @@ jobs:
                   return []
               count = np.sum(np.stack(edges), axis=0)
               static = (count >= int(math.ceil(EDGE_PRESENT * m))) & (std < STD_MAX)
-
               ys = np.arange(sh)[:, None]
               xs = np.arange(W_SMALL)[None, :]
               zone = (ys < ZONE_TOP * sh) | (ys > ZONE_BOTTOM * sh) | \
@@ -991,11 +812,9 @@ jobs:
               if ratio > 0.25:
                   log("[STATIC-OVERLAY] ty le tinh qua cao (canh quay co dinh?) -> bo qua")
                   return []
-
               k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, int(W_SMALL * 0.03)), 5))
               closed = cv2.morphologyEx(static.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k)
               nlab, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
-
               boxes = []
               for i in range(1, nlab):
                   x, y, w, h, _a = stats[i]
@@ -1013,7 +832,6 @@ jobs:
                       continue
                   boxes.append([x - 4, y - 4, x + w + 4, y + h + 4])
               boxes = merge_boxes(boxes, gap=6)
-
               # vung blur sub (da duoc lam mo roi) -> bo qua box nam gon trong do
               sub_rect = None
               gp = WORK / "subtitle_geometry.json"
@@ -1022,7 +840,6 @@ jobs:
                   b = geo.get("blur")
                   if geo.get("valid") and b:
                       sub_rect = (b["x"], b["y"], b["x"] + b["width"], b["y"] + b["height"])
-
               inv = 1.0 / scale
               regions = []
               for b in boxes:
@@ -1043,13 +860,11 @@ jobs:
                           log(f"[STATIC-OVERLAY] bo qua vung ({x1},{y1},{w},{h}): nam trong vung blur sub")
                           continue
                   regions.append({"x": x1, "y": y1, "w": w, "h": h})
-
               regions.sort(key=lambda r: r["w"] * r["h"], reverse=True)
               regions = regions[:MAX_REGIONS]
               if sum(r["w"] * r["h"] for r in regions) > 0.30 * width * height:
                   log("[STATIC-OVERLAY] tong dien tich qua lon -> bo qua")
                   return []
-
               if regions and first_img is not None:
                   for r in regions:
                       cv2.rectangle(first_img, (r["x"], r["y"]), (r["x"] + r["w"], r["y"] + r["h"]),
@@ -1060,8 +875,6 @@ jobs:
               if not regions:
                   log("[STATIC-OVERLAY] khong tim thay lop phu co dinh nao")
               return regions
-
-
           def main():
               regions = []
               try:
@@ -1071,12 +884,9 @@ jobs:
                   regions = []
               Path("work/static_regions.json").write_text(
                   json.dumps({"regions": regions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
           if __name__ == "__main__":
               main()
           PY
-
       - name: Detect static overlays (corners / sides / watermark)
         env:
           STATIC_DETECT: "1"   # 1 = bật, 0 = tắt phần che watermark/quảng cáo cố định
@@ -1084,7 +894,6 @@ jobs:
           set -euo pipefail
           python3 static_detect.py
           cat work/static_regions.json
-
       - name: Create Translate script
         run: |
           cat > translate_native.py <<'PY'
@@ -1094,33 +903,25 @@ jobs:
           work/vietnamese.vtt (input cho buoc TTS) cung voi cac file .srt de doi chieu.
           Sau khi dich co them buoc RUT GON cac cau qua dai so voi thoi luong cue.
           """
-
           import os, re, time, random
           from pathlib import Path
-
           import pysubs2
           from google import genai
           from google.genai import types
-
           WORK = Path("work")
           NATIVE_SRT = WORK / "native.srt"
-
           MIN_CUE_DURATION = 0.10
-
           # Batch chi sot 1..N dong thi BO QUA (de trong), khong goi API retry
           MAX_SKIP_MISSING = 5
-
           # So tu tieng Viet toi da moi giay de TTS doc kip.
           # TTS sinh o toc do 1.0x, buoc mix se tang toc toi da ~1.5x
           MAX_SYL_PER_SEC = 6.0
-
           # ---- GEMINI ----
           GEMINI_MODEL = "gemini-3.5-flash-lite"
           GEMINI_BATCH_SIZE = 150
           GEMINI_MAX_RETRIES = 10
           RAW_GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "")
           GEMINI_API_KEYS = [k.strip() for k in RAW_GEMINI_KEYS.strip().splitlines() if k.strip()]
-
           SYSTEM_INSTRUCTION = (
               "You are a professional video subtitle translator. Translate the text into natural, fluent Vietnamese.\n"
               "CRITICAL RULES:\n"
@@ -1143,12 +944,8 @@ jobs:
               "glance. Use simple, everyday spoken Vietnamese. Cut filler words, repeated phrases and unnecessary "
               "modifiers, and prefer short sentences. Keep the core meaning and the tone, but never pad or explain."
           )
-
-
           def log(msg):
               print(msg, flush=True)
-
-
           # ============================================================
           # DOC SUB GOC -> CUE TIENG TRUNG
           # ============================================================
@@ -1158,12 +955,9 @@ jobs:
               t = re.sub(r"<[^>]+>", "", t)         # tag HTML <i>...
               t = re.sub(r"\s+", " ", t).strip()
               return t
-
-
           def load_native_cues():
               if not NATIVE_SRT.exists():
                   raise RuntimeError(f"Khong tim thay {NATIVE_SRT}")
-
               subs = pysubs2.load(str(NATIVE_SRT), encoding="utf-8")
               raw = []
               for ev in subs.events:
@@ -1171,9 +965,7 @@ jobs:
                   if not text:
                       continue
                   raw.append({"start": ev.start / 1000.0, "end": ev.end / 1000.0, "text": text})
-
               raw.sort(key=lambda c: (c["start"], c["end"]))
-
               final = []
               for c in raw:
                   st, en = c["start"], c["end"]
@@ -1188,21 +980,16 @@ jobs:
                   if en - st < MIN_CUE_DURATION:
                       continue
                   final.append({"start": st, "end": en, "text": c["text"]})
-
               log(f"CHINESE CUES (native sub) = {len(final)}")
               if not final:
                   raise RuntimeError("Sub goc khong co cue nao hop le.")
               return final
-
-
           # ============================================================
           # DICH
           # ============================================================
           def get_random_gemini_client():
               key = random.choice(GEMINI_API_KEYS)
               return genai.Client(api_key=key), key
-
-
           def call_gemini_with_retry(prompt_text, max_retries=GEMINI_MAX_RETRIES):
               for attempt in range(max_retries):
                   wait = 6 * (2 ** attempt)
@@ -1230,8 +1017,6 @@ jobs:
                           log("   Loi khong the retry. Dung thu lai.")
                           break
               return None
-
-
           def parse_translated(response_text):
               out = {}
               for line in response_text.strip().split("\n"):
@@ -1245,8 +1030,6 @@ jobs:
                       except Exception:
                           pass
               return out
-
-
           def parse_pairs(response_text):
               """Tra ve list (idx, val) dung THU TU AI tra ve, khong gop theo idx."""
               pairs = []
@@ -1259,13 +1042,10 @@ jobs:
                       except Exception:
                           pass
               return pairs
-
-
           def parse_batch(response_text, n):
               """Ghep theo SO THU TU AI ghi. Dong sot -> de trong, KHONG bao gio day lech cac dong sau."""
               pairs = parse_pairs(response_text)
               out = {}
-
               # Truong hop AI danh so sai hang loat (vd deu +100) nhung du so dong -> ghep theo vi tri
               in_range = sum(1 for i, _ in pairs if 0 <= i < n)
               if len(pairs) == n and in_range < n * 0.5:
@@ -1273,7 +1053,6 @@ jobs:
                   for k, (_, val) in enumerate(pairs):
                       out[k] = "" if val == "..." else val
                   return out
-
               prev = -1
               for k, (i, val) in enumerate(pairs):
                   nxt_i = pairs[k + 1][0] if k + 1 < len(pairs) else None
@@ -1291,37 +1070,28 @@ jobs:
                   out[idx] = "" if val == "..." else val
                   prev = idx
               return out
-
-
           def translate_cues(cues):
               if not GEMINI_API_KEYS:
                   raise RuntimeError("Chua cau hinh GEMINI_API_KEYS trong GitHub Secrets.")
-
               total = len(cues)
               total_batches = (total + GEMINI_BATCH_SIZE - 1) // GEMINI_BATCH_SIZE
               log(f"BAT DAU DICH - {total} dong / {total_batches} batch")
-
               results = []
               for i in range(0, total, GEMINI_BATCH_SIZE):
                   batch = cues[i:i + GEMINI_BATCH_SIZE]
                   bn = i // GEMINI_BATCH_SIZE + 1
                   log(f"[BATCH {bn}/{total_batches}] Dong {i + 1}-{min(i + GEMINI_BATCH_SIZE, total)}")
-
                   prompt_text = "".join(f"[{idx}] {c['text'].strip() or '...'}\n" for idx, c in enumerate(batch))
                   log(">> NOI DUNG GUI LEN API:")
                   for line in prompt_text.strip().split("\n"):
                       log(f"   {line}")
-
                   response_text = call_gemini_with_retry(prompt_text)
                   if response_text is None:
                       raise RuntimeError(f"[THAT BAI] Khong the dich batch {bn}.")
-
                   log(">> KET QUA DICH TU AI:")
                   for line in response_text.strip().split("\n"):
                       log(f"   {line}")
-
                   translated = parse_batch(response_text, len(batch))
-
                   missing = [idx for idx in range(len(batch)) if not translated.get(idx)]
                   skip_blank = 0 < len(missing) <= MAX_SKIP_MISSING
                   if skip_blank:
@@ -1339,7 +1109,6 @@ jobs:
                               log(f"   {line}")
                           retry_map = parse_translated(rr)
                           translated.update({k: v for k, v in retry_map.items() if k in missing})
-
                   fallback = 0
                   for idx, cue in enumerate(batch):
                       if translated.get(idx):
@@ -1353,22 +1122,16 @@ jobs:
                           log(f"   [{i + idx + 1:04d}] FALLBACK (giu nguyen goc): {cue['text']!r}")
                       results.append({"start": cue["start"], "end": cue["end"],
                                       "text": cue["text"], "vi": vi})
-
                   if fallback:
                       log(f">> Batch {bn}: {fallback} dong giu nguyen tieng Trung.")
                   log(f"[BATCH {bn}/{total_batches}] Hoan thanh")
                   time.sleep(3)
-
               return results
-
-
           # ============================================================
           # RUT GON CAU QUA DAI (de TTS doc kip trong thoi luong cue)
           # ============================================================
           def count_syl(t):
               return len(re.findall(r"\w+", t, re.UNICODE))
-
-
           def shorten_long(results):
               for _round in range(2):
                   todo = []
@@ -1405,8 +1168,6 @@ jobs:
                               results[i]["vi"] = txt
                       time.sleep(2)
               return results
-
-
           def write_debug(results):
               with open(WORK / "translation_debug.txt", "w", encoding="utf-8") as f:
                   for idx, r in enumerate(results):
@@ -1416,8 +1177,6 @@ jobs:
                       f.write(f"[{idx:03d}] {r['start']:.2f}s -> {r['end']:.2f}s ({dur:.2f}s){flag}\n")
                       f.write(f"  ZH ({zh}): {r['text']}\n")
                       f.write(f"  VI ({vi}, {count_syl(r['vi'])} tu): {r['vi']}\n\n")
-
-
           # ============================================================
           # LUU FILE SUB (SRT + VTT)
           # ============================================================
@@ -1429,44 +1188,35 @@ jobs:
                   subs.events.append(pysubs2.SSAEvent(
                       start=int(c["start"] * 1000), end=int(c["end"] * 1000), text=c[field]))
               subs.save(str(path), encoding="utf-8")
-
-
           def main():
               cues = load_native_cues()
               save_sub(cues, WORK / "chinese.srt", "text")
               for i, c in enumerate(cues, 1):
                   log("[%04d] %.3f -> %.3f | %s" % (i, c["start"], c["end"], c["text"]))
-
               translated = translate_cues(cues)
               translated = shorten_long(translated)
               write_debug(translated)
               save_sub(translated, WORK / "vietnamese.srt", "vi", skip_empty=True)
               save_sub(translated, WORK / "vietnamese.vtt", "vi", skip_empty=True)
-
               log("NATIVE SUB + TRANSLATE COMPLETE")
               log(f"Chinese SRT   : {WORK / 'chinese.srt'}")
               log(f"Vietnamese SRT: {WORK / 'vietnamese.srt'}")
               log(f"Vietnamese VTT: {WORK / 'vietnamese.vtt'} (dung cho buoc TTS)")
-
-
           if __name__ == "__main__":
               main()
           PY
-
       - name: Run Translate (native sub → Vietnamese)
         env:
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
         run: |
           set -euo pipefail
           python translate_native.py
-
       - name: Check Translate output
         run: |
           set -e
           echo "===== VIETNAMESE VTT (head) ====="
           head -40 work/vietnamese.vtt || true
           wc -l work/vietnamese.vtt || true
-
       - name: TTS Generation (Revid TTS API + Vietnamese VTT)
         env:
           REVID_API_KEY: ${{ secrets.REVID_API_KEY }}
@@ -1485,9 +1235,7 @@ jobs:
           import numpy as np
           import requests
           import webvtt
-
           logging.basicConfig(level=logging.INFO, format="%(message)s")
-
           API_URL = "https://tts.revidapi.com/api/v1/tts"
           API_KEY = os.environ.get("REVID_API_KEY", "").strip()
           VOICE_ID = int(os.environ.get("REVID_VOICE_ID", "3001"))
@@ -1497,14 +1245,12 @@ jobs:
           WORKERS = max(1, int(os.environ.get("TTS_WORKERS", "4")))
           MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
           ERROR_THRESHOLD = int(os.environ.get("TTS_ERROR_THRESHOLD", "5"))
-
           HEADERS = {
               "Content-Type": "application/json",
               "Accept": "application/json",
               "x-api-key": API_KEY,
               "x-revidapi-client": "tts-studio",
           }
-
           def normalize_for_tts(text):
               text = text.lower()
               text = re.sub(r'<[^>]+>', '', text)
@@ -1514,17 +1260,14 @@ jobs:
               text = text.replace(",", ", ").replace(".", ". ")
               if not text.endswith((".", "!", "?", "...")): text += "."
               return text
-
           def n_words(text):
               return len(re.findall(r"\w+", text, re.UNICODE))
-
           def decode_mp3(mp3_bytes, sr=24000):
               p = subprocess.run(
                   ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
                    "-f", "f32le", "-ar", str(sr), "-ac", "1", "pipe:1"],
                   input=mp3_bytes, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
               return np.frombuffer(p.stdout, dtype="<f4").copy(), sr
-
           def plausible(a, sr, text):
               """Loai bo audio rong / vo am / dai bat thuong."""
               if a.size == 0 or not np.isfinite(a).all():
@@ -1534,7 +1277,6 @@ jobs:
               dur = len(a) / float(sr)
               w = max(1, n_words(text))
               return max(0.15, 0.08 * w) <= dur <= 0.9 * w + 2.5
-
           def fetch_mp3(text):
               """Goi Revid TTS API, tra ve bytes mp3. Retry khi 429/5xx/loi mang."""
               payload = {
@@ -1575,7 +1317,6 @@ jobs:
                       last = repr(e)
                       time.sleep(3 * (attempt + 1))
               raise RuntimeError(f"het {MAX_RETRIES} lan thu: {last}")
-
           def save_mp3(mp3_bytes, out):
               """Ghi chunks/c_i.mp3. Chi re-encode (atempo) neu TTS_SPEEDUP != 1.0."""
               if abs(TTS_SPEEDUP - 1.0) > 0.01:
@@ -1588,7 +1329,6 @@ jobs:
                       f.write(mp3_bytes)
               if not os.path.exists(out) or os.path.getsize(out) == 0:
                   raise RuntimeError("Empty mp3")
-
           def process(i, text):
               out = f"chunks/c_{i}.mp3"
               try:
@@ -1602,20 +1342,17 @@ jobs:
                   if os.path.exists(out):
                       os.remove(out)
                   return i, text, False, str(e)
-
           def main():
               if not API_KEY:
                   print("Missing GitHub secret REVID_API_KEY"); sys.exit(1)
               vtt_path = "work/vietnamese.vtt"
               if not os.path.exists(vtt_path):
                   print(f"Missing {vtt_path}"); sys.exit(1)
-
               vtt = webvtt.read(vtt_path)
               os.makedirs("chunks", exist_ok=True)
               total = len(vtt)
               print(f"[Revid] voice_id={VOICE_ID} lang={LANGUAGE} rate={RATE} | "
                     f"speedup={TTS_SPEEDUP} | workers={WORKERS} | cues={total}", flush=True)
-
               jobs = []
               for i, c in enumerate(vtt):
                   text = normalize_for_tts(c.text)
@@ -1623,7 +1360,6 @@ jobs:
                       # cue rỗng: không tạo file, bước mix sẽ coi là im lặng
                       continue
                   jobs.append((i, text))
-
               failed = []   # (index, text)
               made = 0
               done = 0
@@ -1641,7 +1377,6 @@ jobs:
                       if done % 20 == 0 or done == len(jobs):
                           el = time.time() - t0
                           print(f"TTS {done}/{len(jobs)} | ok={made} | loi={len(failed)} | {el:.0f}s", flush=True)
-
               failed.sort()
               failed_count = len(failed)
               print(f"Tổng số đoạn lỗi: {failed_count}")
@@ -1650,13 +1385,10 @@ jobs:
               if failed_count > ERROR_THRESHOLD:
                   print(f"Phát hiện {failed_count} đoạn lỗi (vượt ngưỡng {ERROR_THRESHOLD}). Dừng Workflow!")
                   sys.exit(1)
-
               with open("count.txt", "w") as f: f.write(str(total))
               print(f"[DONE] Generated {total} TTS chunks (Revid ok={made}, loi={failed_count})")
-
           main()
           PY
-
       - name: Build TTS track (numpy, one pass) & final mix filter
         run: |
           set -euo pipefail
@@ -1664,22 +1396,18 @@ jobs:
           AUDIO_RATE=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of default=noprint_wrappers=1:nokey=1 raw_video.mp4)
           if [ -z "$AUDIO_RATE" ]; then AUDIO_RATE=44100; fi
           echo "audio_rate=$AUDIO_RATE" >> $GITHUB_ENV
-
           export VIDEO_DURATION=$VIDEO_DURATION
           export AUDIO_RATE=$AUDIO_RATE
-
           python3 <<'EOF'
           import os, wave, subprocess
           import numpy as np
           import av
           import webvtt
-
           # ---- Âm lượng / chất giọng TTS ----
           TARGET_RMS = 0.28          # độ to TTS (RMS). Cũ: 0.20. Muốn to hơn nữa: 0.30-0.32
           TTS_BASS_DB = 4            # tăng trầm (dB) cho giọng đầy, bớt mỏng. 0 = tắt, tối đa nên 6
           TTS_COMP_MAKEUP = 2.0      # bù âm lượng sau bộ nén (2.0 ≈ +6dB)
           TTS_VOLUME = 1.0           # nhân thêm âm lượng cuối (1.0 = giữ nguyên)
-
           # ---- Mix / tốc độ ----
           BG_OUT = 0.12              # tiếng gốc khi KHÔNG có thoại (nhạc nền, hiệu ứng)
           BG_IN = 0.01               # tiếng gốc khi có thoại TTS (gần như tắt hẳn)
@@ -1691,18 +1419,14 @@ jobs:
           DUCK_PRE_MS = 500          # hạ tiếng gốc trước cue
           DUCK_POST_MS = 400         # và giữ thấp sau cue
           SIL_THRESH = 10 ** (-50 / 20)
-
           rate = int(os.environ["AUDIO_RATE"])
           duration = float(os.environ["VIDEO_DURATION"])
-
           def to_ms(s):
               h, m, sec = s.replace(',', '.').split(':')
               return int(float(h) * 3600000 + float(m) * 60000 + float(sec) * 1000)
-
           def as_list(x):
               if x is None: return []
               return x if isinstance(x, list) else [x]
-
           def decode_mono(path):
               c = av.open(path)
               rs = av.AudioResampler(format="flt", layout="mono", rate=rate)
@@ -1714,7 +1438,6 @@ jobs:
                   parts.append(f.to_ndarray().reshape(-1))
               c.close()
               return np.concatenate(parts).astype(np.float32) if parts else np.zeros(0, np.float32)
-
           def atempo(x, speed):
               try:
                   p = subprocess.run(
@@ -1725,17 +1448,14 @@ jobs:
                   return out if out.size else x
               except Exception:
                   return x
-
           total = int((duration + 10) * rate)
           buf = np.zeros(total, dtype=np.float32)
-
           vtt = webvtt.read("work/vietnamese.vtt")
           n_cues = len(vtt)
           starts = [max(0, int((to_ms(c.start) + DELAY_MS) * rate / 1000)) for c in vtt]
           gap = int(GAP_MS * rate / 1000)
           max_drift = int(MAX_DRIFT_MS * rate / 1000)
           lookahead = int(LOOKAHEAD_MS * rate / 1000)
-
           # ---------- Pass 1: đọc, cắt lặng, chuẩn hóa RMS ----------
           clips = [None] * n_cues
           skipped = 0
@@ -1761,7 +1481,6 @@ jobs:
                   if rms > 1e-4:
                       x = x * min(8.0, TARGET_RMS / rms)
               clips[i] = x
-
           # ---------- Pass 2: tốc độ mục tiêu mỗi câu, làm mượt để tăng đều ----------
           need = np.ones(n_cues)
           for i, x in enumerate(clips):
@@ -1775,7 +1494,6 @@ jobs:
               l = target[i - 1] if i > 0 else target[i]
               r = target[i + 1] if i + 1 < n_cues else target[i]
               smooth[i] = max(target[i], 0.5 * target[i] + 0.25 * (l + r))
-
           # ---------- Pass 3: đặt tuần tự ----------
           cursor = 0
           placed = sped = overlapped = 0
@@ -1808,7 +1526,6 @@ jobs:
               placed += 1
           print(f"TTS placed={placed} skipped={skipped} sped_up={sped} overlapped={overlapped} "
                 f"max_shift={max_shift / rate:.2f}s")
-
           # ---------- Ghi tts_track.wav (soft limiter) ----------
           BLOCK = 1 << 22
           with wave.open("work/tts_track.wav", "wb") as wf:
@@ -1820,7 +1537,6 @@ jobs:
                   if m.any():
                       x[m] = np.sign(x[m]) * (0.85 + 0.15 * np.tanh((a[m] - 0.85) / 0.15))
                   wf.writeframes((np.clip(x, -1.0, 1.0) * 32767).astype("<i2").tobytes())
-
           # ---------- Đường cong hạ tiếng gốc (ducking) theo cue ----------
           ENV_HZ = 1000
           env = np.full(int((duration + 10) * ENV_HZ), BG_OUT, dtype=np.float32)
@@ -1838,7 +1554,6 @@ jobs:
                   t = np.arange(s, e, dtype=np.float64) * 1000.0 / rate * (ENV_HZ / 1000.0)
                   g = np.interp(t, idx, env)
                   wf.writeframes((np.clip(g, 0, 1) * 32767).astype("<i2").tobytes())
-
           # ---------- Filter mix: input 0 = video, 1 = tts, 3 = duck_env ----------
           fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
           # Chất giọng TTS: tăng trầm cho đầy tiếng -> nén nhẹ cho đều -> bù âm lượng
@@ -1857,7 +1572,6 @@ jobs:
           EOF
           ls -lh work/tts_track.wav work/duck_env.wav
           cat final_mix.txt; echo
-
       - name: Render Vietnamese video and HLS with detected subtitle blur
         env:
           SLUG: ${{ inputs.slug }}
@@ -1869,7 +1583,6 @@ jobs:
           import cv2
           import numpy as np
           import pysubs2
-
           geo = json.loads(Path("work/subtitle_geometry.json").read_text(encoding="utf-8"))
           if not geo.get("valid") or not geo.get("blur"):
               raise SystemExit("Subtitle geometry was not validated; refusing to render.")
@@ -1882,18 +1595,6 @@ jobs:
           sigma = max(24, int(round(sub_h * .80)))
           feather_x = max(8, int(round(blur_h * .27)))
           feather_y = max(3, int(round(blur_h * .09)))
-
-          # ---- Các ZONE vị trí sub (mỗi zone: khoảng thời gian + tâm sub + vị trí blur) ----
-          zones = geo.get("zones") or []
-          if not zones:
-              zones = [{"t0": 0.0, "t1": 1e6, "center_y": center_y, "blur_y": blur_y}]
-          def zone_at(ms):
-              t = ms / 1000.0
-              for z in zones:
-                  if z["t0"] <= t < z["t1"]:
-                      return z
-              return zones[-1]
-
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
           FONT_SCALE = 1.25
@@ -1917,13 +1618,11 @@ jobs:
           for ev in vi.events:
               text = ev.text.replace("\\N", "\\N").replace("\n", "\\N")
               text = text.replace("{", "\\{").replace("}", "\\}")
-              zc = zone_at((ev.start + ev.end) / 2)["center_y"]
               ass.append(
                   f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
-                  f"{{\\an5\\pos({center_x},{zc})}}{text}"
+                  f"{{\\an5\\pos({center_x},{center_y})}}{text}"
               )
           Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
-
           def feather_mask(w, h, fx, fy, path):
               """Mặt nạ alpha feather 4 cạnh: dựng MỘT LẦN bằng numpy thành ảnh PNG xám tĩnh,
               thay cho geq (tính lại từng pixel của từng frame)."""
@@ -1934,9 +1633,7 @@ jobs:
                                  np.minimum(ys / fy, (h - 1 - ys) / fy))
               alpha = np.clip(alpha, 0.0, 1.0)
               cv2.imwrite(str(path), (alpha * 255).astype(np.uint8))
-
           feather_mask(blur_w, blur_h, feather_x, feather_y, "work/blur_mask.png")
-
           # ---- Vùng che cố định (watermark / quảng cáo 2 bên / 4 góc) từ bước static_detect ----
           regions = []
           sp = Path("work/static_regions.json")
@@ -1959,13 +1656,10 @@ jobs:
           for k, (x, y, w, h) in enumerate(regions):
               fx = max(4, int(round(min(w, h) * .18)))
               feather_mask(w, h, fx, fx, f"work/static_mask_{k}.png")
-
           # Input: 0 = raw_video.mp4, 1 = work/tts_track.wav, 2 = work/blur_mask.png (lặp),
           #        3 = work/duck_env.wav, 4.. = work/static_mask_k.png (lặp)
-          nz = len(zones)
-          n_split = 1 + nz + len(regions)
-          graph = ["[0:v]split=%d[vbase]" % n_split
-                   + "".join(f"[zs{j}]" for j in range(nz))
+          n_split = 2 + len(regions)
+          graph = ["[0:v]split=%d[vbase][vpatchsrc]" % n_split
                    + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
           cur = "vbase"
           for k, (x, y, w, h) in enumerate(regions):
@@ -1977,42 +1671,30 @@ jobs:
                   f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
               )
               cur = f"sv{k}"
-          # mặt nạ feather dùng chung cho mọi zone (cùng kích thước blur_w x blur_h)
-          if nz == 1:
-              graph.append("[2:v]format=gray[zm0];")
-          else:
-              graph.append(f"[2:v]format=gray,split={nz}" + "".join(f"[zm{j}]" for j in range(nz)) + ";")
-          for j, z in enumerate(zones):
-              zy = int(z["blur_y"]); t0 = float(z["t0"]); t1 = float(z["t1"])
-              graph.append(
-                  f"[zs{j}]crop={blur_w}:{blur_h}:{blur_x}:{zy},gblur=sigma={sigma},format=rgb24[zb{j}];"
-                  f"[zb{j}][zm{j}]alphamerge[zp{j}];"
-                  f"[{cur}][zp{j}]overlay=x={blur_x}:y={zy}:shortest=1:"
-                  f"enable='between(t,{t0:.3f},{t1:.3f})'[zv{j}];"
-              )
-              cur = f"zv{j}"
-          graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
+          graph.append(
+              f"[vpatchsrc]crop={blur_w}:{blur_h}:{blur_x}:{blur_y},"
+              f"gblur=sigma={sigma},format=rgb24[vblur];"
+              f"[2:v]format=gray[vmask];"
+              f"[vblur][vmask]alphamerge[vpatch];"
+              f"[{cur}][vpatch]overlay=x={blur_x}:y={blur_y}:shortest=1,"
+              f"subtitles=work/vietnamese-overlay.ass[v]"
+          )
           video_graph = "".join(graph)
           audio_graph = Path("final_mix.txt").read_text(encoding="utf-8").strip()
           Path("work/render-filter.txt").write_text(audio_graph + ";" + video_graph + "\n", encoding="utf-8")
           print(f"Subtitle text bbox: center_y={center_y}, height={sub_h}px")
-          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}.")
-          print(f"Subtitle zones: {len(zones)} -> " + ", ".join(
-              f"{z['t0']:.0f}-{min(z['t1'], 99999):.0f}s@y{z['center_y']}" for z in zones))
+          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}; fixed for full video.")
           print(f"Static overlay blur regions: {len(regions)}")
           for k, (x, y, w, h) in enumerate(regions):
               print(f"  [{k}] x={x} y={y} w={w} h={h}")
-          print(f"Vietnamese overlay: centered at x={center_x}, font={font_size}px.")
+          print(f"Vietnamese overlay: centered at ({center_x},{center_y}), font={font_size}px.")
           PY
-
           DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
-
           # Mỗi vùng che cố định cần 1 input mặt nạ lặp (input 4, 5, ...)
           EXTRA=()
           for m in $(ls work/static_mask_*.png 2>/dev/null | sort -V); do
             EXTRA+=(-loop 1 -framerate 30 -t "$DUR" -i "$m")
           done
-
           ffmpeg -y -i raw_video.mp4 -i work/tts_track.wav \
             -loop 1 -framerate 30 -t "$DUR" -i work/blur_mask.png \
             -i work/duck_env.wav \
@@ -2020,10 +1702,8 @@ jobs:
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map "[out_audio]" \
             -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
-            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" \
-            -maxrate "${X264_MAXRATE}" -bufsize "${X264_BUFSIZE}" -pix_fmt yuv420p \
+            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -pix_fmt yuv420p \
             -c:a aac -ar ${{ env.audio_rate }} -b:a 128k final.mp4
-
           mkdir -p output
           ffmpeg -y -i final.mp4 -c copy -f hls \
             -hls_time 5 -hls_list_size 0 -start_number 10001 -hls_playlist_type vod \
@@ -2031,13 +1711,11 @@ jobs:
             -hls_fmp4_init_filename "${{ inputs.slug }}-index.png" \
             -hls_segment_filename "output/${{ inputs.slug }}-index%d.png" \
             "output/${{ inputs.slug }}.m3u8"
-
       - name: Copy subtitle file into output folder
         run: |
           set -eux
           cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
           ls -lh output/
-
       - name: Deploy video output to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ inputs.token }}
@@ -2061,7 +1739,6 @@ jobs:
             --project-name "${CF_PAGES_PROJECT}" \
             --branch "${{ inputs.slug }}"
           echo "Cloudflare Pages deployment completed for ${CF_PAGES_PROJECT}."
-
       - name: Cleanup cookies
         if: always()
         run: |
