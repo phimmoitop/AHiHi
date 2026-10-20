@@ -1,4 +1,4 @@
-name: Bilibili → Vietsub + Thuyết Minh (TTS) API 19-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) API 20-10-2026
 
 on:
   workflow_dispatch:
@@ -700,11 +700,16 @@ jobs:
                   heights = [v["y2"] - v["y1"] for v in frame_unions]
                   center_y = int(round(float(np.median(centers))))
                   text_height = int(round(float(np.percentile(heights, 90))))
-                  blur_h = max(24, int(math.ceil(text_height * 1.5 / 2.0) * 2))
+                  blur_h = max(24, int(math.ceil(text_height * 1.1 / 2.0) * 2))
                   blur_h = min(blur_h, int(height * .18) // 2 * 2)
                   blur_w = max(2, int(width * .80) // 2 * 2)
                   blur_x = (width - blur_w) // 2
-                  blur_y = max(0, min(height - blur_h, center_y - blur_h // 2))
+                  
+                  # Giữ tâm blur đúng tại center_y; nếu vượt đáy/đỉnh thì cắt bớt, KHÔNG dịch
+                  top = max(0, center_y - blur_h // 2)
+                  bottom = min(height, center_y + blur_h // 2)
+                  blur_y = top // 2 * 2
+                  blur_h = max(2, (bottom - blur_y) // 2 * 2)
                   valid_geometry = (
                       len(frame_unions) >= 3 and text_height >= max(8, int(height * .012))
                       and text_height <= int(height * .12)
@@ -1778,8 +1783,8 @@ jobs:
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
           FONT_SCALE = 1.25
-          font_size = max(30, int(sub_h * .90 * FONT_SCALE))
-          font_size = min(font_size, max(20, int(width * .75 / max(1, max_chars * .60))))
+          font_size = max(40, int(sub_h * .90 * FONT_SCALE))
+          font_size = min(font_size, max(40, int(width * .80 / max(1, max_chars * .50))))
           ass = [
               "[Script Info]", "Title: Vietnamese hard subtitles",
               "ScriptType: v4.00+", f"PlayResX: {width}", f"PlayResY: {height}",
