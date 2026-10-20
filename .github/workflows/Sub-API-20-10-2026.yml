@@ -40,6 +40,9 @@ jobs:
       # Muốn render nhanh hơn: đổi X264_PRESET thành veryfast / faster (file to hơn một chút)
       X264_PRESET: "medium"
       X264_CRF: "24"
+      # Giới hạn bitrate video (CRF có trần): đỉnh ~3.5 Mbps
+      X264_MAXRATE: "3500k"
+      X264_BUFSIZE: "7000k"
 
     steps:
       - name: Checkout repository
@@ -249,11 +252,13 @@ jobs:
           cat > ocr_run.py <<'PY'
           """
           OCR sub cung (hardsub) 2 giai doan:
-            1) Lay mau thua (~300 frame) tren vung rong -> tim dai (band) chua sub.
+            1) Lay mau thua (~150 frame) tren vung rong -> tim cac dai (band) chua sub.
                TRUOC khi chon dai, loai bo chu TINH (watermark/logo xuat hien suot video).
+               Neu sub doi cho (cao/thap hon o doan khac) -> mo rong dai OCR phu ca 2 vi tri.
             2) OCR toan video 3fps CHI tren dai mong do, doc rawvideo tu ffmpeg (khong JPEG),
                bo qua frame khi chu khong doi, chay song song nhieu process.
-          Sau do gom cue + do hinh hoc blur nhu ban cu.
+          Sau do gom cue, chia video thanh cac ZONE (khoang thoi gian co cung vi tri sub)
+          va do hinh hoc blur cho tung zone.
           """
           import cv2, json, math, os, re, subprocess, sys, time
           import multiprocessing as mp
@@ -356,8 +361,9 @@ jobs:
               return keep
 
 
-          def pick_band(dets, height):
-              """Gom box theo vi tri doc, tra ve dai on dinh nhat + tolerance."""
+          def pick_bands(dets, height, min_extra_frames=5, max_overlap=0.25):
+              """Tra ve (danh sach dai, tolerance). dai[0] = dai chinh; cac dai sau = sub doi cho,
+              xuat hien o thoi diem KHAC dai chinh (it trung frame)."""
               tolerance = max(18.0, height * .065)
               bands = []
               for d in sorted(dets, key=lambda v: v["cy"]):
@@ -371,11 +377,23 @@ jobs:
               bands = [b for b in bands if len({d["frame"] for d in b}) >= 3]
               if not bands:
                   return [], tolerance
-              band = max(bands, key=lambda b: (
-                  len({d["frame"] for d in b}),
-                  sum(d["score"] for d in b),
-                  sum(len(d["text"]) for d in b)))
-              return band, tolerance
+              key = lambda b: (len({d["frame"] for d in b}),
+                               sum(d["score"] for d in b),
+                               sum(len(d["text"]) for d in b))
+              bands.sort(key=key, reverse=True)
+              chosen = [bands[0]]
+              used = {d["frame"] for d in bands[0]}
+              for b in bands[1:]:
+                  fr = {d["frame"] for d in b}
+                  if len(fr) >= min_extra_frames and len(fr & used) / len(fr) <= max_overlap:
+                      chosen.append(b)
+                      used |= fr
+              return chosen, tolerance
+
+
+          def pick_band(dets, height):
+              bands, tol = pick_bands(dets, height)
+              return (bands[0] if bands else []), tol
 
 
           def grab_frame(t, width, height):
@@ -408,7 +426,7 @@ jobs:
 
 
           def find_strip(duration, width, height, x0, x1, y0):
-              """Tra ve (sy0, sy1, found, info). info co cy, th, fast_ok (co dung duoc che do nhanh khong)."""
+              """Tra ve (sy0, sy1, found, info). Dai OCR phu TAT CA vi tri sub tim thay."""
               engine = make_engine()
               n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
@@ -427,18 +445,26 @@ jobs:
                   if found_dets and len(kept) < 80:
                       kept[i] = crop.copy()
               dets = drop_static(dets)
-              band, tolerance = pick_band(dets, height)
-              if not band:
+              bands, tolerance = pick_bands(dets, height)
+              if not bands:
                   return y0, height, False, None
+              band = bands[0]
+              all_dets = [d for b in bands for d in b]
               cy = float(np.median([d["cy"] for d in band]))
-              th = float(np.percentile([d["y2"] - d["y1"] for d in band], 90))
+              th = float(np.percentile([d["y2"] - d["y1"] for d in all_dets], 90))
+              cys = np.array([d["cy"] for d in all_dets])
               half = int(max(th * 1.6, tolerance * 1.1))
-              sy0 = max(y0, int(cy - half))
-              sy1 = min(height, int(cy + half))
+              sy0 = max(y0, int(np.percentile(cys, 2) - half))
+              sy1 = min(height, int(np.percentile(cys, 98) + half))
               if sy1 - sy0 < 16:
                   return y0, height, False, None
 
-              # ---- tu kiem tra: nhan dang-rieng tren dong sub co khop ket qua det+rec khong? ----
+              # sub co doi cho khong? (cac mau thua cho thay >1 vi tri)
+              moved = float(np.percentile(cys, 95) - np.percentile(cys, 5)) > max(8.0, th * 0.4)
+              log(f"[POS-CHECK] {len(bands)} dai, cy {cys.min():.0f}..{cys.max():.0f} -> "
+                  f"{'SUB DOI CHO (tat FAST, mo rong dai OCR)' if moved else 'sub co dinh'}")
+
+              # ---- tu kiem tra che do FAST tren dai chinh ----
               ty0 = max(y0, int(cy - th * 0.9))
               ty1 = min(height, int(cy + th * 0.9))
               by_frame = {}
@@ -457,7 +483,7 @@ jobs:
                       continue
                   txt, _ = rec_only(engine, line)
                   sims.append(SequenceMatcher(None, ref, norm_text(txt)).ratio())
-              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85
+              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85 and not moved
               log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh "
                   f"{(float(np.mean(sims)) if sims else 0):.2f} -> {'DUNG che do nhanh' if fast_ok else 'KHONG dung (dung det+rec)'}")
               info = {"cy": cy, "th": th, "ty0": ty0, "ty1": ty1, "fast_ok": fast_ok}
@@ -560,6 +586,49 @@ jobs:
               return dets
 
 
+          def build_zones(segments, duration, blur_h, height, tol_ratio=0.30, min_segs=2):
+              """Chia video thanh cac khoang thoi gian lien tiep, moi khoang 1 vi tri sub.
+              Tra ve [{t0, t1, center_y, blur_y}]."""
+              if not segments:
+                  return []
+              tol = max(8.0, blur_h * tol_ratio)
+              seg_cy = [float(np.median(s["cys"])) for s in segments]
+
+              def assign(centers):
+                  return [min(range(len(centers)), key=lambda k: abs(centers[k] - c)) for c in seg_cy]
+
+              centers = [seg_cy[0]]
+              for c in seg_cy[1:]:
+                  if min(abs(k - c) for k in centers) > tol:
+                      centers.append(c)
+              for _ in range(3):                       # tinh chinh tam, bo zone qua it cue (nhieu OCR)
+                  a = assign(centers)
+                  new = []
+                  for k in range(len(centers)):
+                      m = [seg_cy[i] for i, z in enumerate(a) if z == k]
+                      if len(m) >= min_segs:
+                          new.append(float(np.median(m)))
+                  centers = new or [float(np.median(seg_cy))]
+              a = assign(centers)
+
+              runs = []                                # [zone, first, last]
+              for s, z in zip(segments, a):
+                  if runs and runs[-1][0] == z:
+                      runs[-1][2] = s["last"]
+                  else:
+                      runs.append([z, s["first"], s["last"]])
+
+              zones = []
+              for i, (z, f, l) in enumerate(runs):
+                  t0 = 0.0 if i == 0 else (runs[i - 1][2] + f) / 2.0
+                  t1 = duration + 1.0 if i == len(runs) - 1 else (l + runs[i + 1][1]) / 2.0
+                  c = centers[z]
+                  by = int(min(max(0, c - blur_h // 2), height - blur_h)) // 2 * 2
+                  zones.append({"t0": round(t0, 3), "t1": round(t1, 3),
+                                "center_y": int(round(c)), "blur_y": by})
+              return zones
+
+
           def main():
               OUT.mkdir(parents=True, exist_ok=True)
               t_start = time.time()
@@ -617,7 +686,8 @@ jobs:
               # Che do fast: moi detection dung chung 1 box co dinh nen khong loc tinh theo vi tri
               if not fast:
                   detections = drop_static(detections)
-              band, _ = pick_band(detections, height)
+              bands, _ = pick_bands(detections, height)
+              band = [d for b in bands for d in b]
 
               frame_dets = {}
               for d in band:
@@ -641,18 +711,21 @@ jobs:
                   b = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", b)
                   return bool(a and b and (a in b or b in a or SequenceMatcher(None, a, b).ratio() >= .68))
 
+              cy_by_fn = {u["frame"]: u["cy"] for u in frame_unions}
               segments = []
               for t, text, score, fn in frame_lines:
+                  cy_f = cy_by_fn.get(fn, 0.0)
                   if segments and t - segments[-1]["last"] <= step * 1.51 and comparable(segments[-1]["text"], text):
                       seg = segments[-1]
                       seg["last"] = t
                       seg["frames"] += 1
                       seg["scores"].append(score)
+                      seg["cys"].append(cy_f)
                       seg["variants"][text] = seg["variants"].get(text, 0) + 1
                       seg["text"] = max(seg["variants"], key=seg["variants"].get)
                   else:
                       segments.append({"text": text, "first": t, "last": t, "frames": 1,
-                                       "scores": [score], "variants": {text: 1}})
+                                       "scores": [score], "cys": [cy_f], "variants": {text: 1}})
 
               segments = [x for x in segments if x["frames"] >= 2 or
                           (sum("\u4e00" <= ch <= "\u9fff" for ch in x["text"]) >= 2 and max(x["scores"]) >= .55)]
@@ -722,6 +795,11 @@ jobs:
                                "width_ratio": .80, "center_y": center_y},
                       "blur_validated": bool(valid_geometry), "valid": bool(valid_geometry)
                   })
+                  # Cac ZONE: moi khoang thoi gian co 1 vi tri sub rieng (sub doi cho giua video)
+                  geometry["zones"] = build_zones(segments, duration, blur_h, height)
+                  for z in geometry["zones"]:
+                      log(f"[ZONE] {z['t0']:.1f}s -> {z['t1']:.1f}s | sub cy={z['center_y']} blur_y={z['blur_y']}")
+                  log(f"[ZONE] tong {len(geometry['zones'])} vi tri sub")
 
               Path("work/subtitle_geometry.json").write_text(
                   json.dumps(geometry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1780,6 +1858,17 @@ jobs:
           feather_x = max(8, int(round(blur_h * .27)))
           feather_y = max(3, int(round(blur_h * .09)))
 
+          # ---- Các ZONE vị trí sub (mỗi zone: khoảng thời gian + tâm sub + vị trí blur) ----
+          zones = geo.get("zones") or []
+          if not zones:
+              zones = [{"t0": 0.0, "t1": 1e6, "center_y": center_y, "blur_y": blur_y}]
+          def zone_at(ms):
+              t = ms / 1000.0
+              for z in zones:
+                  if z["t0"] <= t < z["t1"]:
+                      return z
+              return zones[-1]
+
           vi = pysubs2.load("work/vietnamese.srt", encoding="utf-8")
           max_chars = max((len(re.sub(r"\s+", "", ev.text)) for ev in vi.events), default=20)
           FONT_SCALE = 1.25
@@ -1803,9 +1892,10 @@ jobs:
           for ev in vi.events:
               text = ev.text.replace("\\N", "\\N").replace("\n", "\\N")
               text = text.replace("{", "\\{").replace("}", "\\}")
+              zc = zone_at((ev.start + ev.end) / 2)["center_y"]
               ass.append(
                   f"Dialogue: 0,{ass_time(ev.start)},{ass_time(ev.end)},Default,,0,0,0,,"
-                  f"{{\\an5\\pos({center_x},{center_y})}}{text}"
+                  f"{{\\an5\\pos({center_x},{zc})}}{text}"
               )
           Path("work/vietnamese-overlay.ass").write_text("\n".join(ass) + "\n", encoding="utf-8")
 
@@ -1847,8 +1937,10 @@ jobs:
 
           # Input: 0 = raw_video.mp4, 1 = work/tts_track.wav, 2 = work/blur_mask.png (lặp),
           #        3 = work/duck_env.wav, 4.. = work/static_mask_k.png (lặp)
-          n_split = 2 + len(regions)
-          graph = ["[0:v]split=%d[vbase][vpatchsrc]" % n_split
+          nz = len(zones)
+          n_split = 1 + nz + len(regions)
+          graph = ["[0:v]split=%d[vbase]" % n_split
+                   + "".join(f"[zs{j}]" for j in range(nz))
                    + "".join(f"[sp{k}]" for k in range(len(regions))) + ";"]
           cur = "vbase"
           for k, (x, y, w, h) in enumerate(regions):
@@ -1860,23 +1952,32 @@ jobs:
                   f"[{cur}][sq{k}]overlay=x={x}:y={y}:shortest=1[sv{k}];"
               )
               cur = f"sv{k}"
-          graph.append(
-              f"[vpatchsrc]crop={blur_w}:{blur_h}:{blur_x}:{blur_y},"
-              f"gblur=sigma={sigma},format=rgb24[vblur];"
-              f"[2:v]format=gray[vmask];"
-              f"[vblur][vmask]alphamerge[vpatch];"
-              f"[{cur}][vpatch]overlay=x={blur_x}:y={blur_y}:shortest=1,"
-              f"subtitles=work/vietnamese-overlay.ass[v]"
-          )
+          # mặt nạ feather dùng chung cho mọi zone (cùng kích thước blur_w x blur_h)
+          if nz == 1:
+              graph.append("[2:v]format=gray[zm0];")
+          else:
+              graph.append(f"[2:v]format=gray,split={nz}" + "".join(f"[zm{j}]" for j in range(nz)) + ";")
+          for j, z in enumerate(zones):
+              zy = int(z["blur_y"]); t0 = float(z["t0"]); t1 = float(z["t1"])
+              graph.append(
+                  f"[zs{j}]crop={blur_w}:{blur_h}:{blur_x}:{zy},gblur=sigma={sigma},format=rgb24[zb{j}];"
+                  f"[zb{j}][zm{j}]alphamerge[zp{j}];"
+                  f"[{cur}][zp{j}]overlay=x={blur_x}:y={zy}:shortest=1:"
+                  f"enable='between(t,{t0:.3f},{t1:.3f})'[zv{j}];"
+              )
+              cur = f"zv{j}"
+          graph.append(f"[{cur}]subtitles=work/vietnamese-overlay.ass[v]")
           video_graph = "".join(graph)
           audio_graph = Path("final_mix.txt").read_text(encoding="utf-8").strip()
           Path("work/render-filter.txt").write_text(audio_graph + ";" + video_graph + "\n", encoding="utf-8")
           print(f"Subtitle text bbox: center_y={center_y}, height={sub_h}px")
-          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}; fixed for full video.")
+          print(f"Blur: x={blur_x}, y={blur_y}, w={blur_w}, h={blur_h}, sigma={sigma}.")
+          print(f"Subtitle zones: {len(zones)} -> " + ", ".join(
+              f"{z['t0']:.0f}-{min(z['t1'], 99999):.0f}s@y{z['center_y']}" for z in zones))
           print(f"Static overlay blur regions: {len(regions)}")
           for k, (x, y, w, h) in enumerate(regions):
               print(f"  [{k}] x={x} y={y} w={w} h={h}")
-          print(f"Vietnamese overlay: centered at ({center_x},{center_y}), font={font_size}px.")
+          print(f"Vietnamese overlay: centered at x={center_x}, font={font_size}px.")
           PY
 
           DUR=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 raw_video.mp4)
@@ -1894,7 +1995,8 @@ jobs:
             -filter_complex_script work/render-filter.txt \
             -map "[v]" -map "[out_audio]" \
             -force_key_frames "expr:gte(t,n_forced*5)" -sc_threshold 0 \
-            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" -pix_fmt yuv420p \
+            -c:v libx264 -preset "${X264_PRESET}" -crf "${X264_CRF}" \
+            -maxrate "${X264_MAXRATE}" -bufsize "${X264_BUFSIZE}" -pix_fmt yuv420p \
             -c:a aac -ar ${{ env.audio_rate }} -b:a 128k final.mp4
 
           mkdir -p output
