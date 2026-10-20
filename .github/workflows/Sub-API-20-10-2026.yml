@@ -1911,24 +1911,6 @@ jobs:
           cp work/vietnamese.vtt "output/${{ inputs.slug }}.vtt"
           ls -lh output/
 
-      - name: Prepare Cloudflare Pages directory
-        env:
-          SLUG: ${{ inputs.slug }}
-        run: |
-          set -euo pipefail
-          cat > output/index.html <<EOF
-          <!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-          <title>Video ${SLUG} — Vietsub</title>
-          <style>body{font:16px system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;background:#111;color:#eee}video{width:100%;background:#000}a{color:#8cf}</style>
-          <h1>${SLUG} — Vietsub + thuyết minh</h1>
-          <video id="v" controls playsinline></video>
-          <p><a href="${SLUG}.m3u8">Tải playlist HLS</a> · <a href="${SLUG}.vtt">Tải phụ đề VTT</a></p>
-          <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-          <script>const v=document.getElementById('v'),u='${SLUG}.m3u8';if(v.canPlayType('application/vnd.apple.mpegurl'))v.src=u;else if(Hls.isSupported()){const h=new Hls();h.loadSource(u);h.attachMedia(v)}</script>
-          </html>
-          EOF
-          ls -lh output/
-
       - name: Deploy video output to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ inputs.token }}
