@@ -425,8 +425,22 @@ jobs:
               return re.sub(r"\s+", "", str(r[0][0])), float(r[0][1])
 
 
+          def cluster_positions(cys, tol, min_n):
+              """Gom cy cac mau thua thanh vai vi tri (chuoi lien tiep cach nhau <= tol thi chung 1 vi tri).
+              Tra ve danh sach tam, bo nhom qua it mau (nhieu OCR)."""
+              groups = []
+              for c in sorted(cys):
+                  if groups and c - groups[-1][-1] <= tol:
+                      groups[-1].append(c)
+                  else:
+                      groups.append([c])
+              keep = [g for g in groups if len(g) >= min_n]
+              return [float(np.median(g)) for g in keep] or [float(np.median(cys))]
+
+
           def find_strip(duration, width, height, x0, x1, y0):
-              """Tra ve (sy0, sy1, found, info). Dai OCR phu TAT CA vi tri sub tim thay."""
+              """Tra ve (sy0, sy1, found, info). Vi tri sub (cao/thap theo thoi gian) chi do tu MAU THUA
+              (khong ton them frame OCR nao). Do chinh xac ~ duration/150 giay, doi lai khong cham them."""
               engine = make_engine()
               n = int(min(SPARSE_SAMPLES, max(30, duration / 5)))
               dets = []
@@ -459,10 +473,15 @@ jobs:
               if sy1 - sy0 < 16:
                   return y0, height, False, None
 
-              # sub co doi cho khong? (cac mau thua cho thay >1 vi tri)
-              moved = float(np.percentile(cys, 95) - np.percentile(cys, 5)) > max(8.0, th * 0.4)
-              log(f"[POS-CHECK] {len(bands)} dai, cy {cys.min():.0f}..{cys.max():.0f} -> "
-                  f"{'SUB DOI CHO (tat FAST, mo rong dai OCR)' if moved else 'sub co dinh'}")
+              # ---- vi tri sub theo tung mau thua (thoi diem t, cy trung vi cua frame do) ----
+              by_f = {}
+              for d in all_dets:
+                  by_f.setdefault(d["frame"], []).append(d["cy"])
+              samples = sorted((duration * (i + 0.5) / n, float(np.median(v))) for i, v in by_f.items())
+              tol = max(12.0, th * 0.45)
+              centers = cluster_positions([c for _, c in samples], tol, max(3, int(0.05 * len(samples))))
+              log(f"[POS-CHECK] {len(samples)} mau co sub -> {len(centers)} vi tri: "
+                  + ", ".join(f"{c:.0f}" for c in centers))
 
               # ---- tu kiem tra che do FAST tren dai chinh ----
               ty0 = max(y0, int(cy - th * 0.9))
@@ -483,10 +502,13 @@ jobs:
                       continue
                   txt, _ = rec_only(engine, line)
                   sims.append(SequenceMatcher(None, ref, norm_text(txt)).ratio())
-              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85 and not moved
+              fast_ok = len(sims) >= 8 and float(np.mean(sims)) >= 0.85
               log(f"[FAST-CHECK] {len(sims)} mau, do khop trung binh "
                   f"{(float(np.mean(sims)) if sims else 0):.2f} -> {'DUNG che do nhanh' if fast_ok else 'KHONG dung (dung det+rec)'}")
-              info = {"cy": cy, "th": th, "ty0": ty0, "ty1": ty1, "fast_ok": fast_ok}
+              fy0 = max(y0, int(min(centers) - th * 0.9))
+              fy1 = min(height, int(max(centers) + th * 0.9))
+              info = {"cy": cy, "th": th, "ty0": fy0, "ty1": fy1, "cys": centers,
+                      "samples": samples, "fast_ok": fast_ok}
               return sy0, sy1, True, info
 
 
@@ -544,8 +566,9 @@ jobs:
 
 
           def worker_fast(task):
-              """Che do nhanh: chi nhan dang tren dung 1 dong sub, khong phat hien chu."""
-              start_frame, n_frames, x0, y0, x1, y1, cy, th = task
+              """Che do nhanh: chi nhan dang (rec) tren 1 dong sub, khong phat hien chu.
+              Co the co nhieu vi tri sub: thu vi tri dung gan nhat truoc, chi thu vi tri khac khi ket qua yeu."""
+              start_frame, n_frames, x0, y0, x1, y1, cys, th = task
               w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2
               engine = make_engine()
               cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1",
@@ -556,6 +579,7 @@ jobs:
                      "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
               proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
               size = w * h * 3
+              order = list(cys)
               dets, k, calls = [], 0, 0
               t_w = time.time()
               while True:
@@ -571,53 +595,53 @@ jobs:
                   gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                   if not has_text_edges(gray):
                       continue
-                  text, score = rec_only(engine, frame)
-                  calls += 1
-                  cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
-                  if cjk < 2 or score < .50:
+                  best = None
+                  for c in order:
+                      a = max(0, int(c - th * 0.9) - y0)
+                      b = min(h, int(c + th * 0.9) - y0)
+                      if b - a < 8:
+                          continue
+                      line = frame[a:b]
+                      if not has_text_edges(cv2.cvtColor(line, cv2.COLOR_BGR2GRAY)):
+                          continue
+                      text, score = rec_only(engine, line)
+                      calls += 1
+                      cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in text)
+                      if cjk >= 2 and score >= .50:
+                          best = (text, score, c)
+                          break
+                  if best is None:
                       continue
+                  text, score, c = best
+                  if c != order[0]:
+                      order.remove(c)
+                      order.insert(0, c)
                   # Khong co box that: dung cy/chieu cao do tu buoc lay mau thua
                   dets.append({"frame": fn, "time": fn * STEP, "text": text, "score": score,
                                "x1": float(x0), "x2": float(x1),
-                               "y1": cy - th / 2.0, "y2": cy + th / 2.0, "cy": cy})
+                               "y1": c - th / 2.0, "y2": c + th / 2.0, "cy": c})
               proc.stdout.close()
               proc.wait()
               log(f"[fast@{start_frame}] done frames={k} rec_calls={calls} in {time.time() - t_w:.0f}s")
               return dets
 
 
-          def build_zones(segments, duration, blur_h, height, tol_ratio=0.30, min_segs=2):
-              """Chia video thanh cac khoang thoi gian lien tiep, moi khoang 1 vi tri sub.
+          def build_zones(samples, centers, duration, blur_h, height):
+              """Chia video thanh cac khoang thoi gian lien tiep, moi khoang 1 vi tri sub, chi dua tren
+              cac mau thua (t, cy). Ranh gioi nam giua 2 mau khac vi tri (sai so ~ duration/150 giay).
               Tra ve [{t0, t1, center_y, blur_y}]."""
-              if not segments:
+              if not samples or not centers:
                   return []
-              tol = max(8.0, blur_h * tol_ratio)
-              seg_cy = [float(np.median(s["cys"])) for s in segments]
-
-              def assign(centers):
-                  return [min(range(len(centers)), key=lambda k: abs(centers[k] - c)) for c in seg_cy]
-
-              centers = [seg_cy[0]]
-              for c in seg_cy[1:]:
-                  if min(abs(k - c) for k in centers) > tol:
-                      centers.append(c)
-              for _ in range(3):                       # tinh chinh tam, bo zone qua it cue (nhieu OCR)
-                  a = assign(centers)
-                  new = []
-                  for k in range(len(centers)):
-                      m = [seg_cy[i] for i, z in enumerate(a) if z == k]
-                      if len(m) >= min_segs:
-                          new.append(float(np.median(m)))
-                  centers = new or [float(np.median(seg_cy))]
-              a = assign(centers)
-
-              runs = []                                # [zone, first, last]
-              for s, z in zip(segments, a):
+              a = [min(range(len(centers)), key=lambda k: abs(centers[k] - c)) for _, c in samples]
+              for i in range(1, len(a) - 1):          # mau le loi 1 diem -> gop vao hai ben
+                  if a[i - 1] == a[i + 1] != a[i]:
+                      a[i] = a[i - 1]
+              runs = []                                # [zone, first_t, last_t]
+              for (t, _), z in zip(samples, a):
                   if runs and runs[-1][0] == z:
-                      runs[-1][2] = s["last"]
+                      runs[-1][2] = t
                   else:
-                      runs.append([z, s["first"], s["last"]])
-
+                      runs.append([z, t, t])
               zones = []
               for i, (z, f, l) in enumerate(runs):
                   t0 = 0.0 if i == 0 else (runs[i - 1][2] + f) / 2.0
@@ -665,7 +689,7 @@ jobs:
                   n = min(per, total_frames - s)
                   if n > 0:
                       if fast:
-                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cy"], info["th"]))
+                          tasks.append((s, n, x0, info["ty0"], x1, info["ty1"], info["cys"], info["th"]))
                       else:
                           tasks.append((s, n, x0, sy0, x1, sy1))
               log(f"[OCR] mode={'FAST rec-only' if fast else 'det+rec'} | {total_frames} frame, "
@@ -796,7 +820,8 @@ jobs:
                       "blur_validated": bool(valid_geometry), "valid": bool(valid_geometry)
                   })
                   # Cac ZONE: moi khoang thoi gian co 1 vi tri sub rieng (sub doi cho giua video)
-                  geometry["zones"] = build_zones(segments, duration, blur_h, height)
+                  geometry["zones"] = (build_zones(info["samples"], info["cys"], duration, blur_h, height)
+                                       if (found and info) else [])
                   for z in geometry["zones"]:
                       log(f"[ZONE] {z['t0']:.1f}s -> {z['t1']:.1f}s | sub cy={z['center_y']} blur_y={z['blur_y']}")
                   log(f"[ZONE] tong {len(geometry['zones'])} vi tri sub")
