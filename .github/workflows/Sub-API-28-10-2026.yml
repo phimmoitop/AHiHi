@@ -1,4 +1,4 @@
-name: Bilibili → Vietsub + Thuyết Minh (TTS) API 20-10-2026
+name: Bilibili → Vietsub + Thuyết Minh (TTS) API 28-10-2026
 
 on:
   workflow_dispatch:
