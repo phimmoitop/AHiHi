@@ -214,7 +214,7 @@ jobs:
 
           COMMON=(
             --cookies work/cookies.txt --no-playlist
-            --extractor-retries 5 --fragment-retries 10 --retries 10 --socket-timeout 30
+            --extractor-retries 3 --fragment-retries 3 --retries 2 --socket-timeout 30
             --add-header "User-Agent: $UA"
             --add-header "Referer: https://www.bilibili.com/"
             --add-header "Origin: https://www.bilibili.com"
@@ -225,32 +225,24 @@ jobs:
           )
 
           ok=0
-          # Cách 1: aria2c, ít kết nối hơn (tránh bị CDN trả 567), tự thử lại + resume
-          for attempt in 1 2 3; do
-            echo "=== aria2c attempt $attempt ==="
-            if yt-dlp "${COMMON[@]}" \
-                 --downloader aria2c \
-                 --downloader-args "aria2c:-x 4 -s 4 -k 1M --max-connection-per-server=4 --min-split-size=5M --max-tries=5 --retry-wait=3 --user-agent=$UA" \
-                 "$BILIBILI_URL"; then
+          for attempt in 1 2 3 4 5 6; do
+            # Lần lẻ: aria2c (ít kết nối). Lần chẵn: bộ tải gốc của yt-dlp.
+            # Mỗi lần chạy lại yt-dlp sẽ lấy link mới, có thể trúng mirror CDN khác.
+            if [ $((attempt % 2)) -eq 1 ]; then
+              echo "=== attempt $attempt: aria2c ==="
+              DL=(--downloader aria2c --downloader-args "aria2c:-x 4 -s 4 -k 1M --min-split-size=5M --max-tries=2 --retry-wait=3")
+            else
+              echo "=== attempt $attempt: native ==="
+              DL=()
+            fi
+            if yt-dlp "${COMMON[@]}" "${DL[@]}" "$BILIBILI_URL"; then
               ok=1; break
             fi
-            sleep $((attempt * 5))
+            sleep $((attempt * 8))
           done
 
-          # Cách 2: bỏ aria2c, dùng bộ tải gốc của yt-dlp
-          if [ "$ok" -ne 1 ]; then
-            echo "=== aria2c that bai, chuyen sang native downloader ==="
-            rm -f raw_video.f*.mp4 raw_video.f*.m4a raw_video.f*.aria2 raw_video*.part raw_video*.aria2
-            for attempt in 1 2 3; do
-              if yt-dlp "${COMMON[@]}" "$BILIBILI_URL"; then
-                ok=1; break
-              fi
-              sleep $((attempt * 5))
-            done
-          fi
-
           if [ "$ok" -ne 1 ] || [ ! -f raw_video.mp4 ]; then
-            echo "::error::Khong tai duoc video Bilibili."
+            echo "::error::Khong tai duoc video Bilibili (CDN tu choi IP runner)."
             find . -maxdepth 2 -type f -ls
             exit 1
           fi
