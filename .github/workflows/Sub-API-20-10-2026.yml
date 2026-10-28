@@ -208,23 +208,49 @@ jobs:
         env:
           VIDEO_URL: ${{ inputs.url }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           BILIBILI_URL="$VIDEO_URL"
-          yt-dlp --cookies work/cookies.txt --no-playlist \
-            --extractor-retries 5 --fragment-retries 5 --retries 5 --socket-timeout 30 \
-            --add-header "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36" \
-            --add-header "Referer: https://www.bilibili.com/" \
-            --add-header "Origin: https://www.bilibili.com" \
-            --downloader aria2c \
-            --downloader-args "aria2c:-x 16 -s 16 -k 1M --max-connection-per-server=16 --min-split-size=1M" \
-            --concurrent-fragments 16 \
-            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b" \
-            -S "res,codec:avc1:h264,ext:mp4:m4a" \
-            --merge-output-format mp4 \
-            -o "raw_video.mp4" \
-            "$BILIBILI_URL"
-          if [ ! -f raw_video.mp4 ]; then
-            echo "::error::raw_video.mp4 khong ton tai."
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+
+          COMMON=(
+            --cookies work/cookies.txt --no-playlist
+            --extractor-retries 5 --fragment-retries 10 --retries 10 --socket-timeout 30
+            --add-header "User-Agent: $UA"
+            --add-header "Referer: https://www.bilibili.com/"
+            --add-header "Origin: https://www.bilibili.com"
+            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+            -S "res,codec:avc1:h264,ext:mp4:m4a"
+            --merge-output-format mp4
+            -o "raw_video.mp4"
+          )
+
+          ok=0
+          # Cách 1: aria2c, ít kết nối hơn (tránh bị CDN trả 567), tự thử lại + resume
+          for attempt in 1 2 3; do
+            echo "=== aria2c attempt $attempt ==="
+            if yt-dlp "${COMMON[@]}" \
+                 --downloader aria2c \
+                 --downloader-args "aria2c:-x 4 -s 4 -k 1M --max-connection-per-server=4 --min-split-size=5M --max-tries=5 --retry-wait=3 --user-agent=$UA" \
+                 "$BILIBILI_URL"; then
+              ok=1; break
+            fi
+            sleep $((attempt * 5))
+          done
+
+          # Cách 2: bỏ aria2c, dùng bộ tải gốc của yt-dlp
+          if [ "$ok" -ne 1 ]; then
+            echo "=== aria2c that bai, chuyen sang native downloader ==="
+            rm -f raw_video.f*.mp4 raw_video.f*.m4a raw_video.f*.aria2 raw_video*.part raw_video*.aria2
+            for attempt in 1 2 3; do
+              if yt-dlp "${COMMON[@]}" "$BILIBILI_URL"; then
+                ok=1; break
+              fi
+              sleep $((attempt * 5))
+            done
+          fi
+
+          if [ "$ok" -ne 1 ] || [ ! -f raw_video.mp4 ]; then
+            echo "::error::Khong tai duoc video Bilibili."
             find . -maxdepth 2 -type f -ls
             exit 1
           fi
