@@ -33,144 +33,73 @@ jobs:
           sudo apt-get install -y ffmpeg aria2 curl jq
           python3 -m pip install -U yt-dlp
 
-      - name: Download + Verify M3U8 Video
+      - name: Download Pixeldrain Video
         shell: bash
+        env:
+          INPUT_LINK: ${{ github.event.inputs.link }}
         run: |
           set -e
 
-          URL="${{ github.event.inputs.link }}"
           UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-          echo "Getting real m3u8..."
-          # Fix 1: Thêm impersonate để vượt Cloudflare
-          M3U8=$(yt-dlp --impersonate chrome -g "$URL" | head -n 1)
-          
-          if [ -z "$M3U8" ]; then
-            echo "Error: Could not retrieve M3U8 URL"
+          # Lấy ID từ link dạng https://pixeldrain.com/u/SBZTN7os
+          PD_ID=$(echo "$INPUT_LINK" | sed -E 's#^.*/(u|api/file)/##; s#[?\#/].*$##' | tr -d '[:space:]')
+
+          if [ -z "$PD_ID" ]; then
+            echo "Error: Could not extract Pixeldrain ID from link: $INPUT_LINK"
             exit 1
           fi
 
-          # Lấy Base URL
-          BASE_URL=$(echo "$M3U8" | sed 's/\/[^\/]*$/\//')
+          API_URL="https://pixeldrain.com/api/file/${PD_ID}"
+          echo "Pixeldrain ID: $PD_ID"
+          echo "Download URL: $API_URL"
 
-          # Fix 2: Thêm User-Agent cho curl
-          curl -sL -A "$UA" "$M3U8" -o playlist.m3u8
+          # Tải file gốc (retry nhiều lần, tự resume nếu đứt)
+          ATTEMPT=0
+          MAX_RETRIES=10
+          OK=0
 
-          grep -v '^#' playlist.m3u8 | grep -v '^[[:space:]]*$' > segments.txt
-          grep "#EXTINF" playlist.m3u8 | awk -F: '{print $2}' | sed 's/,//' > durations.txt
+          while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "Download attempt $ATTEMPT/$MAX_RETRIES..."
 
-          TOTAL=$(wc -l < segments.txt)
-          echo "Total segments: $TOTAL"
-
-          mkdir -p segments
-          mapfile -t SEGS < segments.txt
-          mapfile -t DURS < durations.txt
-
-          download_segment() {
-            IDX=$1
-            SEG="${SEGS[$IDX]}"
-            EXPECT="${DURS[$IDX]}"
-            UA_INTERNAL="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-            FILE=$(printf "segments/seg_%05d.ts" "$IDX")
-
-            if [[ "$SEG" == http* ]]; then
-              FULL="$SEG"
+            if [ $ATTEMPT -le 5 ]; then
+              aria2c --user-agent="$UA" --file-allocation=none \
+                --max-connection-per-server=8 --split=8 --min-split-size=5M \
+                --continue=true --allow-overwrite=true \
+                -d . -o source_video "$API_URL" || true
             else
-              SEG_CLEAN=$(echo "$SEG" | sed 's/^\///')
-              FULL="${BASE_URL}${SEG_CLEAN}"
+              curl -L --fail -C - -A "$UA" "$API_URL" -o source_video || true
             fi
 
-            ATTEMPT=0
-            MAX_RETRIES=15
-
-            while [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; do
-              RAND=$RANDOM
-              if [[ "$FULL" == *\?* ]]; then
-                FINAL_URL="${FULL}&v=$RAND"
-              else
-                FINAL_URL="${FULL}?v=$RAND"
+            if [ -f source_video ]; then
+              SIZE=$(stat -c%s source_video)
+              if [ "$SIZE" -gt 100000 ] && ffprobe -v error source_video >/dev/null 2>&1; then
+                OK=1
+                break
               fi
+              echo "File invalid (size=$SIZE), retrying..."
+              rm -f source_video source_video.aria2
+            fi
 
-              # Fix 3: Thêm User-Agent vào tất cả các công cụ tải
-              if [ $ATTEMPT -lt 5 ]; then
-                aria2c --quiet=true --user-agent="$UA_INTERNAL" --file-allocation=none -o "$FILE.tmp" "$FINAL_URL" || true
-              elif [ $ATTEMPT -lt 10 ]; then
-                curl -L -A "$UA_INTERNAL" "$FINAL_URL" -o "$FILE.tmp" || true
-              else
-                yt-dlp --impersonate chrome -o "$FILE.tmp" "$FINAL_URL" || true
-              fi
-
-              if [ ! -f "$FILE.tmp" ]; then
-                ATTEMPT=$((ATTEMPT+1))
-                sleep 2
-                continue
-              fi
-
-              SIZE=$(stat -c%s "$FILE.tmp")
-              if [ "$SIZE" -lt 1000 ]; then
-                rm -f "$FILE.tmp"
-                ATTEMPT=$((ATTEMPT+1))
-                continue
-              fi
-
-              ffprobe -v error "$FILE.tmp" >/dev/null 2>&1 || {
-                rm -f "$FILE.tmp"
-                ATTEMPT=$((ATTEMPT+1))
-                continue
-              }
-
-              mv "$FILE.tmp" "$FILE"
-              return 0
-            done
-
-            echo "[ERROR] segment $IDX failed"
-            touch segments/FAILED_CRITICAL
-            return 1
-          }
-
-          export -f download_segment
-          # Lưu ý: Vì dùng export function nên các biến SEGS, DURS cần được truyền vào hoặc xử lý lại. 
-          # Để đơn giản và giữ nguyên logic cũ của bạn, tôi giữ nguyên vòng lặp for:
-
-          echo "Starting parallel download..."
-          for ((i=0;i<TOTAL;i++)); do
-            download_segment "$i" &
-            while [ "$(jobs -p | wc -l)" -ge 16 ]; do
-              sleep 1
-            done
+            sleep 5
           done
 
-          wait
-
-          if [ -f segments/FAILED_CRITICAL ]; then
-            echo "Critical failure detected."
+          if [ "$OK" -ne 1 ]; then
+            echo "[ERROR] Could not download a valid video from Pixeldrain"
             exit 1
           fi
 
-          # --- Các bước gộp video phía sau giữ nguyên ---
-          echo "Merging and Verifying..."
-          cat segments/seg_*.ts > combined.ts
-          
-          ffmpeg -loglevel error -y -i combined.ts -c:v copy -c:a aac -af aresample=async=1 input_video.mp4
+          echo "Downloaded: $(du -h source_video | cut -f1)"
 
-          echo "Final duration..."
-          ACTUAL=$(ffprobe -v error \
-            -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 \
-            input_video.mp4)
+          # Chuẩn hoá về input_video.mp4 (copy video, encode audio AAC)
+          echo "Remuxing to input_video.mp4..."
+          ffmpeg -loglevel error -y -i source_video \
+            -map 0:v:0 -map 0:a? \
+            -c:v copy -c:a aac -af aresample=async=1 \
+            input_video.mp4
 
-          ACTUAL=${ACTUAL%.*}
-          DIFF=$(echo "$EXPECTED $ACTUAL" | awk '{print ($1>$2)?$1-$2:$2-$1}')
-
-          echo "Expected: $EXPECTED"
-          echo "Actual: $ACTUAL"
-          echo "Diff: $DIFF"
-
-          if [ "$DIFF" -gt 10 ]; then
-            echo "[ERROR] duration mismatch too large"
-            exit 1
-          fi
+          rm -f source_video
 
           echo "Video verified successfully"
           echo "Collecting video information..."
